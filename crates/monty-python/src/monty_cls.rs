@@ -463,7 +463,6 @@ enum EitherProgress {
 }
 
 impl EitherProgress {
-    #[expect(clippy::too_many_arguments)]
     fn handle_progress<T>(
         py: Python<'_>,
         progress: RunProgress<T>,

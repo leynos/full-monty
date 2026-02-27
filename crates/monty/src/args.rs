@@ -34,6 +34,9 @@ pub(crate) struct HostCallArgs {
     pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
 }
 
+type HostKwarg = (MontyObject, MontyObject);
+type HostKwargRuntimeIds = (RuntimeValueId, RuntimeValueId);
+
 impl HostCallArgs {
     #[inline]
     fn empty() -> Self {
@@ -503,7 +506,7 @@ impl KwargsValues {
         self,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> (Vec<(MontyObject, MontyObject)>, Vec<(RuntimeValueId, RuntimeValueId)>) {
+    ) -> (Vec<HostKwarg>, Vec<HostKwargRuntimeIds>) {
         match self {
             Self::Empty => (vec![], vec![]),
             Self::Inline(kvs) => kvs

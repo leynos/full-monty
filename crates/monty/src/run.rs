@@ -703,7 +703,6 @@ fn build_function_call_progress<T: ResourceTracker>(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 fn build_os_call_progress<T: ResourceTracker>(
     function: OsFunction,
     args: crate::args::ArgValues,

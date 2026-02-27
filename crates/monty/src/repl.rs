@@ -873,7 +873,6 @@ impl HostArgs {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn into_function_call_progress<T: ResourceTracker>(
         self,
         function_name: String,

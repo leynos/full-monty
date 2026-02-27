@@ -808,10 +808,16 @@ struct FunctionCallProgressInput<T: ResourceTracker> {
     namespaces: Namespaces,
 }
 
+fn missing_snapshot_error(context: &str) -> MontyException {
+    MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
+}
+
 /// Handles a FrameExit result and converts it to RunProgress for FutureSnapshot.
 ///
 /// This is a standalone function to avoid partial move issues when destructuring FutureSnapshot.
-fn build_function_call_progress<T: ResourceTracker>(input: FunctionCallProgressInput<T>) -> RunProgress<T> {
+fn build_function_call_progress<T: ResourceTracker>(
+    input: FunctionCallProgressInput<T>,
+) -> Result<RunProgress<T>, MontyException> {
     let FunctionCallProgressInput {
         function_name,
         args,
@@ -825,15 +831,16 @@ fn build_function_call_progress<T: ResourceTracker>(input: FunctionCallProgressI
 
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
+    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("function call"))?;
     let state = Snapshot {
         executor,
-        vm_state: vm_state.expect("snapshot should exist for function call"),
+        vm_state,
         heap,
         namespaces,
         pending_call_id,
     };
 
-    RunProgress::FunctionCall {
+    Ok(RunProgress::FunctionCall {
         function_name,
         args: host_args.args,
         arg_runtime_ids: host_args.arg_runtime_ids,
@@ -842,7 +849,7 @@ fn build_function_call_progress<T: ResourceTracker>(input: FunctionCallProgressI
         call_id: pending_call_id,
         method_call,
         state,
-    }
+    })
 }
 
 fn build_os_call_progress<T: ResourceTracker>(
@@ -853,18 +860,19 @@ fn build_os_call_progress<T: ResourceTracker>(
     vm_state: Option<VMSnapshot>,
     mut heap: Heap<T>,
     namespaces: Namespaces,
-) -> RunProgress<T> {
+) -> Result<RunProgress<T>, MontyException> {
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
+    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
     let state = Snapshot {
         executor,
-        vm_state: vm_state.expect("snapshot should exist for os call"),
+        vm_state,
         heap,
         namespaces,
         pending_call_id,
     };
 
-    RunProgress::OsCall {
+    Ok(RunProgress::OsCall {
         function,
         args: host_args.args,
         arg_runtime_ids: host_args.arg_runtime_ids,
@@ -872,7 +880,7 @@ fn build_os_call_progress<T: ResourceTracker>(
         kwarg_runtime_ids: host_args.kwarg_runtime_ids,
         call_id: pending_call_id,
         state,
-    }
+    })
 }
 
 #[cfg_attr(
@@ -903,7 +911,7 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
-            Ok(build_function_call_progress(FunctionCallProgressInput {
+            build_function_call_progress(FunctionCallProgressInput {
                 function_name,
                 args,
                 call_id,
@@ -912,22 +920,20 @@ fn handle_vm_result<T: ResourceTracker>(
                 vm_state,
                 heap,
                 namespaces,
-            }))
+            })
         }
         Ok(FrameExit::OsCall {
             function,
             args,
             call_id,
-        }) => Ok(build_os_call_progress(
-            function, args, call_id, executor, vm_state, heap, namespaces,
-        )),
+        }) => build_os_call_progress(function, args, call_id, executor, vm_state, heap, namespaces),
         Ok(FrameExit::MethodCall {
             method_name,
             args,
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            Ok(build_function_call_progress(FunctionCallProgressInput {
+            build_function_call_progress(FunctionCallProgressInput {
                 function_name,
                 args,
                 call_id,
@@ -936,13 +942,14 @@ fn handle_vm_result<T: ResourceTracker>(
                 vm_state,
                 heap,
                 namespaces,
-            }))
+            })
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
             let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();
+            let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("ResolveFutures"))?;
             Ok(RunProgress::ResolveFutures(FutureSnapshot {
                 executor,
-                vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
+                vm_state,
                 heap,
                 namespaces,
                 pending_call_ids,

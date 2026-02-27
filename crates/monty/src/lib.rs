@@ -22,6 +22,7 @@ mod prepare;
 mod repl;
 mod resource;
 mod run;
+mod runtime_id;
 mod signature;
 mod sorting;
 mod types;
@@ -43,4 +44,5 @@ pub use crate::{
         DEFAULT_MAX_RECURSION_DEPTH, LimitedTracker, NoLimitTracker, ResourceError, ResourceLimits, ResourceTracker,
     },
     run::{ExternalResult, FutureSnapshot, MontyFuture, MontyRun, RunProgress, Snapshot},
+    runtime_id::RuntimeValueId,
 };

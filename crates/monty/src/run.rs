@@ -15,6 +15,7 @@ use crate::{
     parse::parse,
     prepare::prepare,
     resource::{NoLimitTracker, ResourceTracker},
+    runtime_id::RuntimeValueId,
     value::Value,
 };
 
@@ -198,8 +199,14 @@ pub enum RunProgress<T: ResourceTracker> {
         function_name: String,
         /// The positional arguments passed to the function.
         args: Vec<MontyObject>,
+        /// Stable runtime IDs for `args`, preserving positional order.
+        #[serde(default)]
+        arg_runtime_ids: Vec<RuntimeValueId>,
         /// The keyword arguments passed to the function (key, value pairs).
         kwargs: Vec<(MontyObject, MontyObject)>,
+        /// Stable runtime IDs for keyword `(key, value)` pairs, preserving order.
+        #[serde(default)]
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
         /// Unique identifier for this call (used for async correlation).
         call_id: u32,
         /// Whether this is a dataclass method call (first arg is `self`).
@@ -218,8 +225,14 @@ pub enum RunProgress<T: ResourceTracker> {
         function: OsFunction,
         /// The positional arguments for the OS function.
         args: Vec<MontyObject>,
+        /// Stable runtime IDs for `args`, preserving positional order.
+        #[serde(default)]
+        arg_runtime_ids: Vec<RuntimeValueId>,
         /// The keyword arguments passed to the function (key, value pairs).
         kwargs: Vec<(MontyObject, MontyObject)>,
+        /// Stable runtime IDs for keyword `(key, value)` pairs, preserving order.
+        #[serde(default)]
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
         /// Unique identifier for this call (used for async correlation).
         call_id: u32,
         /// The execution state that can be resumed with a return value.
@@ -256,7 +269,9 @@ impl<T: ResourceTracker> RunProgress<T> {
             Self::FunctionCall {
                 function_name,
                 args,
+                arg_runtime_ids: _,
                 kwargs,
+                kwarg_runtime_ids: _,
                 call_id,
                 method_call,
                 state,
@@ -281,6 +296,27 @@ impl<T: ResourceTracker> RunProgress<T> {
     pub fn into_resolve_futures(self) -> Option<FutureSnapshot<T>> {
         match self {
             Self::ResolveFutures(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Returns runtime IDs for function-call or OS-call arguments.
+    ///
+    /// The first slice maps to positional args, and the second maps to keyword
+    /// `(key, value)` pairs in the same order as the exposed host payload.
+    #[must_use]
+    pub fn runtime_ids(&self) -> Option<(&[RuntimeValueId], &[(RuntimeValueId, RuntimeValueId)])> {
+        match self {
+            Self::FunctionCall {
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                ..
+            }
+            | Self::OsCall {
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                ..
+            } => Some((arg_runtime_ids, kwarg_runtime_ids)),
             _ => None,
         }
     }
@@ -658,12 +694,15 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
-            let (args_py, kwargs_py) = args.into_py_objects(&mut heap, &executor.interns);
+            let (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids) =
+                args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
 
             Ok(RunProgress::FunctionCall {
                 function_name,
                 args: args_py,
+                arg_runtime_ids,
                 kwargs: kwargs_py,
+                kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: false,
                 state: new_snapshot!(call_id),
@@ -674,12 +713,15 @@ fn handle_vm_result<T: ResourceTracker>(
             args,
             call_id,
         }) => {
-            let (args_py, kwargs_py) = args.into_py_objects(&mut heap, &executor.interns);
+            let (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids) =
+                args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
 
             Ok(RunProgress::OsCall {
                 function,
                 args: args_py,
+                arg_runtime_ids,
                 kwargs: kwargs_py,
+                kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 state: new_snapshot!(call_id),
             })
@@ -690,12 +732,15 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(&mut heap, &executor.interns);
+            let (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids) =
+                args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
 
             Ok(RunProgress::FunctionCall {
                 function_name,
                 args: args_py,
+                arg_runtime_ids,
                 kwargs: kwargs_py,
+                kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: true,
                 state: new_snapshot!(call_id),

@@ -504,6 +504,7 @@ impl EitherProgress {
                     kwargs,
                     call_id,
                     state,
+                    ..
                 } => Self::os_function_snapshot(
                     py,
                     function,
@@ -549,6 +550,7 @@ impl EitherProgress {
                     kwargs,
                     call_id,
                     state,
+                    ..
                 } => Self::os_function_snapshot(
                     py,
                     function,

@@ -19,6 +19,7 @@ mod object;
 mod os;
 mod parse;
 mod prepare;
+mod progress_runtime_ids;
 mod repl;
 mod resource;
 mod run;

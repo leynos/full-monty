@@ -14,6 +14,7 @@ use crate::{
     os::OsFunction,
     parse::parse,
     prepare::prepare,
+    progress_runtime_ids::RuntimeIdSlices,
     resource::{NoLimitTracker, ResourceTracker},
     runtime_id::RuntimeValueId,
     value::Value,
@@ -305,20 +306,8 @@ impl<T: ResourceTracker> RunProgress<T> {
     /// The first slice maps to positional args, and the second maps to keyword
     /// `(key, value)` pairs in the same order as the exposed host payload.
     #[must_use]
-    pub fn runtime_ids(&self) -> Option<(&[RuntimeValueId], &[(RuntimeValueId, RuntimeValueId)])> {
-        match self {
-            Self::FunctionCall {
-                arg_runtime_ids,
-                kwarg_runtime_ids,
-                ..
-            }
-            | Self::OsCall {
-                arg_runtime_ids,
-                kwarg_runtime_ids,
-                ..
-            } => Some((arg_runtime_ids, kwarg_runtime_ids)),
-            _ => None,
-        }
+    pub fn runtime_ids(&self) -> Option<RuntimeIdSlices<'_>> {
+        crate::progress_runtime_ids::progress_runtime_ids!(self)
     }
 }
 
@@ -694,15 +683,14 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
-            let (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids) =
-                args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
 
             Ok(RunProgress::FunctionCall {
                 function_name,
-                args: args_py,
-                arg_runtime_ids,
-                kwargs: kwargs_py,
-                kwarg_runtime_ids,
+                args: host_args.args,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwargs: host_args.kwargs,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: false,
                 state: new_snapshot!(call_id),
@@ -713,15 +701,14 @@ fn handle_vm_result<T: ResourceTracker>(
             args,
             call_id,
         }) => {
-            let (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids) =
-                args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
 
             Ok(RunProgress::OsCall {
                 function,
-                args: args_py,
-                arg_runtime_ids,
-                kwargs: kwargs_py,
-                kwarg_runtime_ids,
+                args: host_args.args,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwargs: host_args.kwargs,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 state: new_snapshot!(call_id),
             })
@@ -732,15 +719,14 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            let (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids) =
-                args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
 
             Ok(RunProgress::FunctionCall {
                 function_name,
-                args: args_py,
-                arg_runtime_ids,
-                kwargs: kwargs_py,
-                kwarg_runtime_ids,
+                args: host_args.args,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwargs: host_args.kwargs,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: true,
                 state: new_snapshot!(call_id),

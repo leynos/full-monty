@@ -26,6 +26,26 @@ pub(crate) enum ArgValues {
     ArgsKargs { args: Vec<Value>, kwargs: KwargsValues },
 }
 
+/// Host-facing external call arguments plus stable runtime IDs.
+pub(crate) struct HostCallArgs {
+    pub args: Vec<MontyObject>,
+    pub kwargs: Vec<(MontyObject, MontyObject)>,
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+}
+
+impl HostCallArgs {
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            args: vec![],
+            kwargs: vec![],
+            arg_runtime_ids: vec![],
+            kwarg_runtime_ids: vec![],
+        }
+    }
+}
+
 impl ArgValues {
     /// Checks that zero arguments were passed.
     ///
@@ -271,44 +291,45 @@ impl ArgValues {
         self,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> (
-        Vec<MontyObject>,
-        Vec<(MontyObject, MontyObject)>,
-        Vec<RuntimeValueId>,
-        Vec<(RuntimeValueId, RuntimeValueId)>,
-    ) {
+    ) -> HostCallArgs {
         match self {
-            Self::Empty => (vec![], vec![], vec![], vec![]),
+            Self::Empty => HostCallArgs::empty(),
             Self::One(a) => {
-                let runtime_id = RuntimeValueId::new(a.id());
-                (
-                    vec![MontyObject::new(a, heap, interns)],
-                    vec![],
-                    vec![runtime_id],
-                    vec![],
-                )
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a], heap, interns);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
             }
             Self::Two(a1, a2) => {
-                let arg_runtime_ids = vec![RuntimeValueId::new(a1.id()), RuntimeValueId::new(a2.id())];
-                (
-                    vec![MontyObject::new(a1, heap, interns), MontyObject::new(a2, heap, interns)],
-                    vec![],
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a1, a2], heap, interns);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
                     arg_runtime_ids,
-                    vec![],
-                )
+                    kwarg_runtime_ids: vec![],
+                }
             }
             Self::Kwargs(kwargs) => {
-                let (kwargs_py, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
-                (vec![], kwargs_py, vec![], kwarg_runtime_ids)
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
+                HostCallArgs {
+                    args: vec![],
+                    kwargs,
+                    arg_runtime_ids: vec![],
+                    kwarg_runtime_ids,
+                }
             }
             Self::ArgsKargs { args, kwargs } => {
-                let arg_runtime_ids = args.iter().map(|value| RuntimeValueId::new(value.id())).collect();
-                let args_py = args
-                    .into_iter()
-                    .map(|value| MontyObject::new(value, heap, interns))
-                    .collect();
-                let (kwargs_py, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
-                (args_py, kwargs_py, arg_runtime_ids, kwarg_runtime_ids)
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids(args, heap, interns);
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
+                HostCallArgs {
+                    args,
+                    kwargs,
+                    arg_runtime_ids,
+                    kwarg_runtime_ids,
+                }
             }
         }
     }
@@ -460,24 +481,11 @@ impl KwargsValues {
             Self::Empty => (vec![], vec![]),
             Self::Inline(kvs) => kvs
                 .into_iter()
-                .map(|(k, v)| {
-                    let key = MontyObject::String(interns.get_str(k).to_owned());
-                    let key_runtime_id = RuntimeValueId::new(Value::InternString(k).id());
-                    let value_runtime_id = RuntimeValueId::new(v.id());
-                    let value = MontyObject::new(v, heap, interns);
-                    ((key, value), (key_runtime_id, value_runtime_id))
-                })
+                .map(|(k, v)| build_kwarg_pair(Value::InternString(k), v, heap, interns))
                 .unzip(),
             Self::Dict(dict) => dict
                 .into_iter()
-                .map(|(k, v)| {
-                    let key_runtime_id = RuntimeValueId::new(k.id());
-                    let value_runtime_id = RuntimeValueId::new(v.id());
-                    (
-                        (MontyObject::new(k, heap, interns), MontyObject::new(v, heap, interns)),
-                        (key_runtime_id, value_runtime_id),
-                    )
-                })
+                .map(|(k, v)| build_kwarg_pair(k, v, heap, interns))
                 .unzip(),
         }
     }
@@ -528,6 +536,39 @@ impl IntoIterator for KwargsValues {
             Self::Dict(dict) => KwargsValuesIter::Dict(dict.into_iter()),
         }
     }
+}
+
+fn build_args_with_runtime_ids(
+    values: impl IntoIterator<Item = Value>,
+    heap: &mut Heap<impl ResourceTracker>,
+    interns: &Interns,
+) -> (Vec<MontyObject>, Vec<RuntimeValueId>) {
+    values
+        .into_iter()
+        .map(|value| {
+            let runtime_id = runtime_value_id(&value);
+            let py_object = MontyObject::new(value, heap, interns);
+            (py_object, runtime_id)
+        })
+        .unzip()
+}
+
+fn build_kwarg_pair(
+    key: Value,
+    value: Value,
+    heap: &mut Heap<impl ResourceTracker>,
+    interns: &Interns,
+) -> ((MontyObject, MontyObject), (RuntimeValueId, RuntimeValueId)) {
+    let key_runtime_id = runtime_value_id(&key);
+    let value_runtime_id = runtime_value_id(&value);
+    let key_py = MontyObject::new(key, heap, interns);
+    let value_py = MontyObject::new(value, heap, interns);
+    ((key_py, value_py), (key_runtime_id, value_runtime_id))
+}
+
+#[inline]
+fn runtime_value_id(value: &Value) -> RuntimeValueId {
+    RuntimeValueId::new(value.id())
 }
 
 /// Iterator over keyword argument (key, value) pairs.

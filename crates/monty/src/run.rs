@@ -253,7 +253,17 @@ pub enum RunProgress<T: ResourceTracker> {
 impl<T: ResourceTracker> RunProgress<T> {
     /// Consumes the `RunProgress` and returns external function call info and state.
     ///
-    /// Returns (function_name, positional_args, keyword_args, call_id, method_call, state).
+    /// Returns:
+    /// (
+    ///   function_name,
+    ///   positional_args,
+    ///   keyword_args,
+    ///   positional_arg_runtime_ids,
+    ///   keyword_arg_runtime_ids,
+    ///   call_id,
+    ///   method_call,
+    ///   state,
+    /// ).
     #[must_use]
     #[expect(clippy::type_complexity)]
     pub fn into_function_call(
@@ -262,6 +272,8 @@ impl<T: ResourceTracker> RunProgress<T> {
         String,
         Vec<MontyObject>,
         Vec<(MontyObject, MontyObject)>,
+        Vec<RuntimeValueId>,
+        Vec<(RuntimeValueId, RuntimeValueId)>,
         u32,
         bool,
         Snapshot<T>,
@@ -270,13 +282,22 @@ impl<T: ResourceTracker> RunProgress<T> {
             Self::FunctionCall {
                 function_name,
                 args,
-                arg_runtime_ids: _,
+                arg_runtime_ids,
                 kwargs,
-                kwarg_runtime_ids: _,
+                kwarg_runtime_ids,
                 call_id,
                 method_call,
                 state,
-            } => Some((function_name, args, kwargs, call_id, method_call, state)),
+            } => Some((
+                function_name,
+                args,
+                kwargs,
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                call_id,
+                method_call,
+                state,
+            )),
             _ => None,
         }
     }

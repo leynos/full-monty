@@ -205,6 +205,36 @@ fn runtime_ids_round_trip_with_run_progress_dump_load() {
 }
 
 #[test]
+fn into_function_call_includes_runtime_ids() {
+    let runner = MontyRun::new(
+        "ext_fn(a=1, b=2)".to_owned(),
+        "test.py",
+        vec![],
+        vec!["ext_fn".to_owned()],
+    )
+    .expect("runner creation should succeed");
+
+    let progress = runner
+        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
+        .expect("run should pause at external call");
+    let bytes = progress.dump().expect("run progress dump should succeed");
+    let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
+
+    let (expected_arg_runtime_ids, expected_kwarg_runtime_ids) =
+        loaded.runtime_ids().expect("function call should expose runtime IDs");
+    let expected_arg_runtime_ids = expected_arg_runtime_ids.to_vec();
+    let expected_kwarg_runtime_ids = expected_kwarg_runtime_ids.to_vec();
+
+    let (_name, args, kwargs, arg_runtime_ids, kwarg_runtime_ids, _call_id, _method_call, _state) =
+        loaded.into_function_call().expect("expected function call");
+
+    assert_eq!(arg_runtime_ids, expected_arg_runtime_ids);
+    assert_eq!(kwarg_runtime_ids, expected_kwarg_runtime_ids);
+    assert_eq!(args.len(), arg_runtime_ids.len());
+    assert_eq!(kwargs.len(), kwarg_runtime_ids.len());
+}
+
+#[test]
 fn runtime_ids_are_unavailable_for_non_call_progress() {
     let progress = RunProgress::<NoLimitTracker>::Complete(MontyObject::None);
     assert!(progress.runtime_ids().is_none());

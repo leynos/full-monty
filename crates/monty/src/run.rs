@@ -250,6 +250,17 @@ pub enum RunProgress<T: ResourceTracker> {
     Complete(MontyObject),
 }
 
+type FunctionCallPayload<T> = (
+    String,
+    Vec<MontyObject>,
+    Vec<(MontyObject, MontyObject)>,
+    Vec<RuntimeValueId>,
+    Vec<(RuntimeValueId, RuntimeValueId)>,
+    u32,
+    bool,
+    Snapshot<T>,
+);
+
 impl<T: ResourceTracker> RunProgress<T> {
     /// Consumes the `RunProgress` and returns external function call info and state.
     ///
@@ -265,19 +276,7 @@ impl<T: ResourceTracker> RunProgress<T> {
     ///   state,
     /// ).
     #[must_use]
-    #[expect(clippy::type_complexity)]
-    pub fn into_function_call(
-        self,
-    ) -> Option<(
-        String,
-        Vec<MontyObject>,
-        Vec<(MontyObject, MontyObject)>,
-        Vec<RuntimeValueId>,
-        Vec<(RuntimeValueId, RuntimeValueId)>,
-        u32,
-        bool,
-        Snapshot<T>,
-    )> {
+    pub fn into_function_call(self) -> Option<FunctionCallPayload<T>> {
         match self {
             Self::FunctionCall {
                 function_name,
@@ -667,20 +666,32 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
     }
 }
 
-/// Handles a FrameExit result and converts it to RunProgress for FutureSnapshot.
-///
-/// This is a standalone function to avoid partial move issues when destructuring FutureSnapshot.
-#[expect(clippy::too_many_arguments)]
-fn build_function_call_progress<T: ResourceTracker>(
+struct FunctionCallProgressInput<T: ResourceTracker> {
     function_name: String,
     args: crate::args::ArgValues,
     call_id: CallId,
     method_call: bool,
     executor: Executor,
     vm_state: Option<VMSnapshot>,
-    mut heap: Heap<T>,
+    heap: Heap<T>,
     namespaces: Namespaces,
-) -> RunProgress<T> {
+}
+
+/// Handles a FrameExit result and converts it to RunProgress for FutureSnapshot.
+///
+/// This is a standalone function to avoid partial move issues when destructuring FutureSnapshot.
+fn build_function_call_progress<T: ResourceTracker>(input: FunctionCallProgressInput<T>) -> RunProgress<T> {
+    let FunctionCallProgressInput {
+        function_name,
+        args,
+        call_id,
+        method_call,
+        executor,
+        vm_state,
+        mut heap,
+        namespaces,
+    } = input;
+
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
     let state = Snapshot {
@@ -733,7 +744,13 @@ fn build_os_call_progress<T: ResourceTracker>(
     }
 }
 
-#[cfg_attr(not(feature = "ref-count-panic"), expect(unused_mut))]
+#[cfg_attr(
+    not(feature = "ref-count-panic"),
+    expect(
+        unused_mut,
+        reason = "mut bindings are required when the ref-count-panic feature is enabled"
+    )
+)]
 fn handle_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
     vm_state: Option<VMSnapshot>,
@@ -755,16 +772,16 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
-            Ok(build_function_call_progress(
+            Ok(build_function_call_progress(FunctionCallProgressInput {
                 function_name,
                 args,
                 call_id,
-                false,
+                method_call: false,
                 executor,
                 vm_state,
                 heap,
                 namespaces,
-            ))
+            }))
         }
         Ok(FrameExit::OsCall {
             function,
@@ -779,16 +796,16 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            Ok(build_function_call_progress(
+            Ok(build_function_call_progress(FunctionCallProgressInput {
                 function_name,
                 args,
                 call_id,
-                true,
+                method_call: true,
                 executor,
                 vm_state,
                 heap,
                 namespaces,
-            ))
+            }))
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
             let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();

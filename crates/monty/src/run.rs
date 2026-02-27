@@ -280,10 +280,6 @@ enum RunProgressUnchecked<T: ResourceTracker> {
     Complete(MontyObject),
 }
 
-fn validate_runtime_id_cardinality(context: &str, cardinality: &RuntimeIdCardinality) -> Result<(), String> {
-    crate::progress_runtime_ids::validate_runtime_id_cardinality(context, cardinality)
-}
-
 impl<T: ResourceTracker> RunProgressUnchecked<T> {
     fn into_checked(self) -> Result<RunProgress<T>, String> {
         match self {
@@ -299,7 +295,10 @@ impl<T: ResourceTracker> RunProgressUnchecked<T> {
             } => {
                 let cardinality =
                     RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
-                validate_runtime_id_cardinality("RunProgress::FunctionCall", &cardinality)?;
+                crate::progress_runtime_ids::validate_runtime_id_cardinality(
+                    "RunProgress::FunctionCall",
+                    &cardinality,
+                )?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(RunProgress::FunctionCall {
@@ -324,7 +323,7 @@ impl<T: ResourceTracker> RunProgressUnchecked<T> {
             } => {
                 let cardinality =
                     RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
-                validate_runtime_id_cardinality("RunProgress::OsCall", &cardinality)?;
+                crate::progress_runtime_ids::validate_runtime_id_cardinality("RunProgress::OsCall", &cardinality)?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(RunProgress::OsCall {
@@ -357,31 +356,22 @@ where
     }
 }
 
-type FunctionCallPayload<T> = (
-    String,
-    Vec<MontyObject>,
-    Vec<(MontyObject, MontyObject)>,
-    Vec<RuntimeValueId>,
-    Vec<(RuntimeValueId, RuntimeValueId)>,
-    u32,
-    bool,
-    Snapshot<T>,
-);
+#[derive(Debug)]
+pub struct FunctionCallPayload<T: ResourceTracker> {
+    pub function_name: String,
+    pub args: Vec<MontyObject>,
+    pub kwargs: Vec<(MontyObject, MontyObject)>,
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+    pub call_id: u32,
+    pub method_call: bool,
+    pub state: Snapshot<T>,
+}
 
 impl<T: ResourceTracker> RunProgress<T> {
     /// Consumes the `RunProgress` and returns external function call info and state.
     ///
-    /// Returns:
-    /// (
-    ///   function_name,
-    ///   positional_args,
-    ///   keyword_args,
-    ///   positional_arg_runtime_ids,
-    ///   keyword_arg_runtime_ids,
-    ///   call_id,
-    ///   method_call,
-    ///   state,
-    /// ).
+    /// Returns [`FunctionCallPayload`] if this progress is a function call.
     #[must_use]
     pub fn into_function_call(self) -> Option<FunctionCallPayload<T>> {
         match self {
@@ -394,7 +384,7 @@ impl<T: ResourceTracker> RunProgress<T> {
                 call_id,
                 method_call,
                 state,
-            } => Some((
+            } => Some(FunctionCallPayload {
                 function_name,
                 args,
                 kwargs,
@@ -403,7 +393,7 @@ impl<T: ResourceTracker> RunProgress<T> {
                 call_id,
                 method_call,
                 state,
-            )),
+            }),
             _ => None,
         }
     }

@@ -177,13 +177,12 @@ fn into_function_call_includes_runtime_ids(#[with("ext_fn(a=1, b=2)")] started_p
     let expected_arg_runtime_ids = expected_arg_runtime_ids.to_vec();
     let expected_kwarg_runtime_ids = expected_kwarg_runtime_ids.to_vec();
 
-    let (_name, args, kwargs, arg_runtime_ids, kwarg_runtime_ids, _call_id, _method_call, _state) =
-        loaded.into_function_call().expect("expected function call");
+    let function_call = loaded.into_function_call().expect("expected function call");
 
-    assert_eq!(arg_runtime_ids, expected_arg_runtime_ids);
-    assert_eq!(kwarg_runtime_ids, expected_kwarg_runtime_ids);
-    assert_eq!(args.len(), arg_runtime_ids.len());
-    assert_eq!(kwargs.len(), kwarg_runtime_ids.len());
+    assert_eq!(function_call.arg_runtime_ids, expected_arg_runtime_ids);
+    assert_eq!(function_call.kwarg_runtime_ids, expected_kwarg_runtime_ids);
+    assert_eq!(function_call.args.len(), function_call.arg_runtime_ids.len());
+    assert_eq!(function_call.kwargs.len(), function_call.kwarg_runtime_ids.len());
 }
 
 #[rstest]
@@ -230,17 +229,18 @@ fn runtime_ids_remain_stable_across_run_progress_dump_load_and_resume(
     #[with("x = []; ext_fn(x); ext_fn(x)")] started_progress: RunProgress<NoLimitTracker>,
 ) {
     let bytes = started_progress.dump().expect("run progress dump should succeed");
-    let (_name, _args, _kwargs, arg_runtime_ids, _kwarg_runtime_ids, _call_id, _method_call, state) = started_progress
+    let function_call = started_progress
         .into_function_call()
         .expect("expected first function call");
-    let first_id = arg_runtime_ids
+    let first_id = function_call
+        .arg_runtime_ids
         .first()
         .expect("first call should include one arg id")
         .raw();
 
     // Resume and complete the original suspended snapshot so ref-count-panic
     // tests do not drop a live heap graph.
-    let second_call = resume_with_none(state);
+    let second_call = resume_with_none(function_call.state);
     let RunProgress::FunctionCall { state, .. } = second_call else {
         panic!("expected second function call when resuming original snapshot");
     };

@@ -580,10 +580,6 @@ enum ReplProgressUnchecked<T: ResourceTracker> {
     },
 }
 
-fn validate_repl_runtime_id_cardinality(context: &str, cardinality: &RuntimeIdCardinality) -> Result<(), String> {
-    crate::progress_runtime_ids::validate_runtime_id_cardinality(context, cardinality)
-}
-
 impl<T: ResourceTracker> ReplProgressUnchecked<T> {
     fn into_checked(self) -> Result<ReplProgress<T>, String> {
         match self {
@@ -599,7 +595,10 @@ impl<T: ResourceTracker> ReplProgressUnchecked<T> {
             } => {
                 let cardinality =
                     RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
-                validate_repl_runtime_id_cardinality("ReplProgress::FunctionCall", &cardinality)?;
+                crate::progress_runtime_ids::validate_runtime_id_cardinality(
+                    "ReplProgress::FunctionCall",
+                    &cardinality,
+                )?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(ReplProgress::FunctionCall {
@@ -624,7 +623,7 @@ impl<T: ResourceTracker> ReplProgressUnchecked<T> {
             } => {
                 let cardinality =
                     RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
-                validate_repl_runtime_id_cardinality("ReplProgress::OsCall", &cardinality)?;
+                crate::progress_runtime_ids::validate_runtime_id_cardinality("ReplProgress::OsCall", &cardinality)?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(ReplProgress::OsCall {
@@ -1026,13 +1025,23 @@ fn handle_repl_vm_result<T: ResourceTracker>(
     executor: ReplExecutor,
     mut repl: MontyRepl<T>,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    fn missing_snapshot_error(context: &str) -> MontyException {
+        MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
+    }
+
     macro_rules! new_repl_snapshot {
-        ($call_id: expr) => {
-            ReplSnapshot {
-                repl,
-                executor,
-                vm_state: vm_state.expect("snapshot should exist for ExternalCall"),
-                pending_call_id: $call_id.raw(),
+        ($pending_call_id:expr, $context:expr) => {
+            match vm_state {
+                Some(vm_state) => Ok(ReplSnapshot {
+                    repl,
+                    executor,
+                    vm_state,
+                    pending_call_id: $pending_call_id,
+                }),
+                None => Err(Box::new(ReplStartError {
+                    repl,
+                    error: missing_snapshot_error($context),
+                })),
             }
         };
     }
@@ -1052,7 +1061,8 @@ fn handle_repl_vm_result<T: ResourceTracker>(
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
             let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
-            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), false, new_repl_snapshot!(call_id)))
+            let state = new_repl_snapshot!(call_id.raw(), "external call")?;
+            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), false, state))
         }
         Ok(FrameExit::OsCall {
             function,
@@ -1060,7 +1070,8 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
-            Ok(host_args.into_os_call_progress(function, call_id.raw(), new_repl_snapshot!(call_id)))
+            let state = new_repl_snapshot!(call_id.raw(), "OS call")?;
+            Ok(host_args.into_os_call_progress(function, call_id.raw(), state))
         }
         Ok(FrameExit::MethodCall {
             method_name,
@@ -1069,14 +1080,21 @@ fn handle_repl_vm_result<T: ResourceTracker>(
         }) => {
             let function_name = method_name.into_string(&executor.interns);
             let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
-            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), true, new_repl_snapshot!(call_id)))
+            let state = new_repl_snapshot!(call_id.raw(), "method call")?;
+            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), true, state))
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
             let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();
+            let Some(vm_state) = vm_state else {
+                return Err(Box::new(ReplStartError {
+                    repl,
+                    error: missing_snapshot_error("ResolveFutures"),
+                }));
+            };
             Ok(ReplProgress::ResolveFutures(ReplFutureSnapshot {
                 repl,
                 executor,
-                vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
+                vm_state,
                 pending_call_ids,
             }))
         }

@@ -21,7 +21,7 @@ use crate::{
     os::OsFunction,
     parse::{parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
-    progress_runtime_ids::{RuntimeIdSlices, checked_runtime_id_payload},
+    progress_runtime_ids::{RuntimeIdCardinality, RuntimeIdSlices, checked_runtime_id_payload},
     resource::ResourceTracker,
     run::{ExternalResult, MontyFuture},
     runtime_id::RuntimeValueId,
@@ -580,20 +580,8 @@ enum ReplProgressUnchecked<T: ResourceTracker> {
     },
 }
 
-fn validate_repl_runtime_id_cardinality(
-    context: &str,
-    args_len: usize,
-    arg_runtime_ids_len: usize,
-    kwargs_len: usize,
-    kwarg_runtime_ids_len: usize,
-) -> Result<(), String> {
-    crate::progress_runtime_ids::validate_runtime_id_cardinality(
-        context,
-        args_len,
-        arg_runtime_ids_len,
-        kwargs_len,
-        kwarg_runtime_ids_len,
-    )
+fn validate_repl_runtime_id_cardinality(context: &str, cardinality: &RuntimeIdCardinality) -> Result<(), String> {
+    crate::progress_runtime_ids::validate_runtime_id_cardinality(context, cardinality)
 }
 
 impl<T: ResourceTracker> ReplProgressUnchecked<T> {
@@ -609,13 +597,9 @@ impl<T: ResourceTracker> ReplProgressUnchecked<T> {
                 method_call,
                 state,
             } => {
-                validate_repl_runtime_id_cardinality(
-                    "ReplProgress::FunctionCall",
-                    args.len(),
-                    arg_runtime_ids.len(),
-                    kwargs.len(),
-                    kwarg_runtime_ids.len(),
-                )?;
+                let cardinality =
+                    RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
+                validate_repl_runtime_id_cardinality("ReplProgress::FunctionCall", &cardinality)?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(ReplProgress::FunctionCall {
@@ -638,13 +622,9 @@ impl<T: ResourceTracker> ReplProgressUnchecked<T> {
                 call_id,
                 state,
             } => {
-                validate_repl_runtime_id_cardinality(
-                    "ReplProgress::OsCall",
-                    args.len(),
-                    arg_runtime_ids.len(),
-                    kwargs.len(),
-                    kwarg_runtime_ids.len(),
-                )?;
+                let cardinality =
+                    RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
+                validate_repl_runtime_id_cardinality("ReplProgress::OsCall", &cardinality)?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(ReplProgress::OsCall {

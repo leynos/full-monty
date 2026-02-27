@@ -14,7 +14,7 @@ use crate::{
     os::OsFunction,
     parse::parse,
     prepare::prepare,
-    progress_runtime_ids::{RuntimeIdSlices, checked_runtime_id_payload},
+    progress_runtime_ids::{RuntimeIdCardinality, RuntimeIdSlices, checked_runtime_id_payload},
     resource::{NoLimitTracker, ResourceTracker},
     runtime_id::RuntimeValueId,
     value::Value,
@@ -280,20 +280,8 @@ enum RunProgressUnchecked<T: ResourceTracker> {
     Complete(MontyObject),
 }
 
-fn validate_runtime_id_cardinality(
-    context: &str,
-    args_len: usize,
-    arg_runtime_ids_len: usize,
-    kwargs_len: usize,
-    kwarg_runtime_ids_len: usize,
-) -> Result<(), String> {
-    crate::progress_runtime_ids::validate_runtime_id_cardinality(
-        context,
-        args_len,
-        arg_runtime_ids_len,
-        kwargs_len,
-        kwarg_runtime_ids_len,
-    )
+fn validate_runtime_id_cardinality(context: &str, cardinality: &RuntimeIdCardinality) -> Result<(), String> {
+    crate::progress_runtime_ids::validate_runtime_id_cardinality(context, cardinality)
 }
 
 impl<T: ResourceTracker> RunProgressUnchecked<T> {
@@ -309,13 +297,9 @@ impl<T: ResourceTracker> RunProgressUnchecked<T> {
                 method_call,
                 state,
             } => {
-                validate_runtime_id_cardinality(
-                    "RunProgress::FunctionCall",
-                    args.len(),
-                    arg_runtime_ids.len(),
-                    kwargs.len(),
-                    kwarg_runtime_ids.len(),
-                )?;
+                let cardinality =
+                    RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
+                validate_runtime_id_cardinality("RunProgress::FunctionCall", &cardinality)?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(RunProgress::FunctionCall {
@@ -338,13 +322,9 @@ impl<T: ResourceTracker> RunProgressUnchecked<T> {
                 call_id,
                 state,
             } => {
-                validate_runtime_id_cardinality(
-                    "RunProgress::OsCall",
-                    args.len(),
-                    arg_runtime_ids.len(),
-                    kwargs.len(),
-                    kwarg_runtime_ids.len(),
-                )?;
+                let cardinality =
+                    RuntimeIdCardinality::new(args.len(), arg_runtime_ids.len(), kwargs.len(), kwarg_runtime_ids.len());
+                validate_runtime_id_cardinality("RunProgress::OsCall", &cardinality)?;
                 let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(RunProgress::OsCall {

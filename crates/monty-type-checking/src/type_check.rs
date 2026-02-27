@@ -122,10 +122,18 @@ pub fn type_check(
             let offset = TextSize::new(code_offset);
             for diagnostic in &mut diagnostics {
                 // Adjust spans in main diagnostic annotations (only for spans in the main file)
+                #[expect(
+                    clippy::excessive_nesting,
+                    reason = "nested iteration mirrors diagnostic hierarchy and keeps span adjustment logic local"
+                )]
                 for ann in diagnostic.annotations_mut() {
                     adjust_annotation_span(ann, main_file, offset);
                 }
                 // Adjust spans in sub-diagnostic annotations (e.g., "info: Function defined here")
+                #[expect(
+                    clippy::excessive_nesting,
+                    reason = "nested iteration mirrors diagnostic hierarchy and keeps span adjustment logic local"
+                )]
                 for sub in diagnostic.sub_diagnostics_mut() {
                     for ann in sub.annotations_mut() {
                         adjust_annotation_span(ann, main_file, offset);

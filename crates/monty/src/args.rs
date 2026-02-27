@@ -304,71 +304,44 @@ impl ArgValues {
         interns: &Interns,
     ) -> HostCallArgs {
         match self {
-            Self::Empty => Self::into_hostcall_empty(),
-            Self::One(a) => Self::into_hostcall_one(a, heap, interns),
-            Self::Two(a1, a2) => Self::into_hostcall_two(a1, a2, heap, interns),
-            Self::Kwargs(kwargs) => Self::into_hostcall_kwargs(kwargs, heap, interns),
-            Self::ArgsKargs { args, kwargs } => Self::into_hostcall_argskargs(args, kwargs, heap, interns),
-        }
-    }
-
-    #[inline]
-    fn into_hostcall_empty() -> HostCallArgs {
-        HostCallArgs::empty()
-    }
-
-    fn into_hostcall_one(arg: Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> HostCallArgs {
-        let (args, arg_runtime_ids) = build_args_with_runtime_ids([arg], heap, interns);
-        HostCallArgs {
-            args,
-            kwargs: vec![],
-            arg_runtime_ids,
-            kwarg_runtime_ids: vec![],
-        }
-    }
-
-    fn into_hostcall_two(
-        arg1: Value,
-        arg2: Value,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> HostCallArgs {
-        let (args, arg_runtime_ids) = build_args_with_runtime_ids([arg1, arg2], heap, interns);
-        HostCallArgs {
-            args,
-            kwargs: vec![],
-            arg_runtime_ids,
-            kwarg_runtime_ids: vec![],
-        }
-    }
-
-    fn into_hostcall_kwargs(
-        kwargs: KwargsValues,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> HostCallArgs {
-        let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
-        HostCallArgs {
-            args: vec![],
-            kwargs,
-            arg_runtime_ids: vec![],
-            kwarg_runtime_ids,
-        }
-    }
-
-    fn into_hostcall_argskargs(
-        args: Vec<Value>,
-        kwargs: KwargsValues,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> HostCallArgs {
-        let (args, arg_runtime_ids) = build_args_with_runtime_ids(args, heap, interns);
-        let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
-        HostCallArgs {
-            args,
-            kwargs,
-            arg_runtime_ids,
-            kwarg_runtime_ids,
+            Self::Empty => HostCallArgs::empty(),
+            Self::One(a) => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a], heap, interns);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
+            }
+            Self::Two(a1, a2) => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a1, a2], heap, interns);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
+            }
+            Self::Kwargs(kwargs) => {
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
+                HostCallArgs {
+                    args: vec![],
+                    kwargs,
+                    arg_runtime_ids: vec![],
+                    kwarg_runtime_ids,
+                }
+            }
+            Self::ArgsKargs { args, kwargs } => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids(args, heap, interns);
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(heap, interns);
+                HostCallArgs {
+                    args,
+                    kwargs,
+                    arg_runtime_ids,
+                    kwarg_runtime_ids,
+                }
+            }
         }
     }
 

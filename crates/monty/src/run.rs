@@ -670,6 +670,70 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
 /// Handles a FrameExit result and converts it to RunProgress for FutureSnapshot.
 ///
 /// This is a standalone function to avoid partial move issues when destructuring FutureSnapshot.
+#[expect(clippy::too_many_arguments)]
+fn build_function_call_progress<T: ResourceTracker>(
+    function_name: String,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    method_call: bool,
+    executor: Executor,
+    vm_state: Option<VMSnapshot>,
+    mut heap: Heap<T>,
+    namespaces: Namespaces,
+) -> RunProgress<T> {
+    let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+    let pending_call_id = call_id.raw();
+    let state = Snapshot {
+        executor,
+        vm_state: vm_state.expect("snapshot should exist for function call"),
+        heap,
+        namespaces,
+        pending_call_id,
+    };
+
+    RunProgress::FunctionCall {
+        function_name,
+        args: host_args.args,
+        arg_runtime_ids: host_args.arg_runtime_ids,
+        kwargs: host_args.kwargs,
+        kwarg_runtime_ids: host_args.kwarg_runtime_ids,
+        call_id: pending_call_id,
+        method_call,
+        state,
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_os_call_progress<T: ResourceTracker>(
+    function: OsFunction,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    executor: Executor,
+    vm_state: Option<VMSnapshot>,
+    mut heap: Heap<T>,
+    namespaces: Namespaces,
+) -> RunProgress<T> {
+    let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+    let pending_call_id = call_id.raw();
+    let state = Snapshot {
+        executor,
+        vm_state: vm_state.expect("snapshot should exist for os call"),
+        heap,
+        namespaces,
+        pending_call_id,
+    };
+
+    RunProgress::OsCall {
+        function,
+        args: host_args.args,
+        arg_runtime_ids: host_args.arg_runtime_ids,
+        kwargs: host_args.kwargs,
+        kwarg_runtime_ids: host_args.kwarg_runtime_ids,
+        call_id: pending_call_id,
+        state,
+    }
+}
+
 #[cfg_attr(not(feature = "ref-count-panic"), expect(unused_mut))]
 fn handle_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
@@ -678,18 +742,6 @@ fn handle_vm_result<T: ResourceTracker>(
     mut heap: Heap<T>,
     mut namespaces: Namespaces,
 ) -> Result<RunProgress<T>, MontyException> {
-    macro_rules! new_snapshot {
-        ($call_id: expr) => {
-            Snapshot {
-                executor,
-                vm_state: vm_state.expect("snapshot should exist for ExternalCall"),
-                heap,
-                namespaces,
-                pending_call_id: $call_id.raw(),
-            }
-        };
-    }
-
     match result {
         Ok(FrameExit::Return(value)) => {
             #[cfg(feature = "ref-count-panic")]
@@ -704,54 +756,40 @@ fn handle_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
-            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
-
-            Ok(RunProgress::FunctionCall {
+            Ok(build_function_call_progress(
                 function_name,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                method_call: false,
-                state: new_snapshot!(call_id),
-            })
+                args,
+                call_id,
+                false,
+                executor,
+                vm_state,
+                heap,
+                namespaces,
+            ))
         }
         Ok(FrameExit::OsCall {
             function,
             args,
             call_id,
-        }) => {
-            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
-
-            Ok(RunProgress::OsCall {
-                function,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                state: new_snapshot!(call_id),
-            })
-        }
+        }) => Ok(build_os_call_progress(
+            function, args, call_id, executor, vm_state, heap, namespaces,
+        )),
         Ok(FrameExit::MethodCall {
             method_name,
             args,
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
-
-            Ok(RunProgress::FunctionCall {
+            Ok(build_function_call_progress(
                 function_name,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                method_call: true,
-                state: new_snapshot!(call_id),
-            })
+                args,
+                call_id,
+                true,
+                executor,
+                vm_state,
+                heap,
+                namespaces,
+            ))
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
             let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();

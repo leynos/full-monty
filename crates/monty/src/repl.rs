@@ -855,6 +855,62 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
 /// This mirrors `handle_vm_result` but preserves REPL heap/namespaces on
 /// completion by returning `ReplProgress::Complete { repl, value }`.
 /// On runtime errors, the REPL is preserved inside a `ReplStartError`.
+struct HostArgs {
+    args: Vec<MontyObject>,
+    arg_runtime_ids: Vec<RuntimeValueId>,
+    kwargs: Vec<(MontyObject, MontyObject)>,
+    kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+}
+
+impl HostArgs {
+    fn from_vm_args<T: ResourceTracker>(args: crate::args::ArgValues, heap: &mut Heap<T>, interns: &Interns) -> Self {
+        let host_args = args.into_py_objects_with_runtime_ids(heap, interns);
+        Self {
+            args: host_args.args,
+            arg_runtime_ids: host_args.arg_runtime_ids,
+            kwargs: host_args.kwargs,
+            kwarg_runtime_ids: host_args.kwarg_runtime_ids,
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn into_function_call_progress<T: ResourceTracker>(
+        self,
+        function_name: String,
+        call_id: u32,
+        method_call: bool,
+        state: ReplSnapshot<T>,
+    ) -> ReplProgress<T> {
+        ReplProgress::FunctionCall {
+            function_name,
+            args: self.args,
+            arg_runtime_ids: self.arg_runtime_ids,
+            kwargs: self.kwargs,
+            kwarg_runtime_ids: self.kwarg_runtime_ids,
+            call_id,
+            method_call,
+            state,
+        }
+    }
+
+    fn into_os_call_progress<T: ResourceTracker>(
+        self,
+        function: OsFunction,
+        call_id: u32,
+        state: ReplSnapshot<T>,
+    ) -> ReplProgress<T> {
+        ReplProgress::OsCall {
+            function,
+            args: self.args,
+            arg_runtime_ids: self.arg_runtime_ids,
+            kwargs: self.kwargs,
+            kwarg_runtime_ids: self.kwarg_runtime_ids,
+            call_id,
+            state,
+        }
+    }
+}
+
 fn handle_repl_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
     vm_state: Option<VMSnapshot>,
@@ -886,35 +942,16 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = executor.interns.get_external_function_name(ext_function_id);
-            let host_args = args.into_py_objects_with_runtime_ids(&mut repl.heap, &executor.interns);
-
-            Ok(ReplProgress::FunctionCall {
-                function_name,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                method_call: false,
-                state: new_repl_snapshot!(call_id),
-            })
+            let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
+            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), false, new_repl_snapshot!(call_id)))
         }
         Ok(FrameExit::OsCall {
             function,
             args,
             call_id,
         }) => {
-            let host_args = args.into_py_objects_with_runtime_ids(&mut repl.heap, &executor.interns);
-
-            Ok(ReplProgress::OsCall {
-                function,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                state: new_repl_snapshot!(call_id),
-            })
+            let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
+            Ok(host_args.into_os_call_progress(function, call_id.raw(), new_repl_snapshot!(call_id)))
         }
         Ok(FrameExit::MethodCall {
             method_name,
@@ -922,18 +959,8 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            let host_args = args.into_py_objects_with_runtime_ids(&mut repl.heap, &executor.interns);
-
-            Ok(ReplProgress::FunctionCall {
-                function_name,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                method_call: true,
-                state: new_repl_snapshot!(call_id),
-            })
+            let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
+            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), true, new_repl_snapshot!(call_id)))
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
             let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();

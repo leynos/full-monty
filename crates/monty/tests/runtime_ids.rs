@@ -6,11 +6,12 @@
 use std::collections::HashSet;
 
 use monty::{MontyObject, MontyRun, NoLimitTracker, PrintWriter, ResourceTracker, RunProgress, RuntimeValueId};
+use rstest::{fixture, rstest};
 
-fn start_with_ext_fn(code: &str) -> RunProgress<NoLimitTracker> {
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
-        .expect("runner creation should succeed");
-    runner
+#[fixture]
+fn started_progress(#[default("ext_fn([])")] code: &str) -> RunProgress<NoLimitTracker> {
+    MontyRun::new(code.to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
+        .expect("runner creation should succeed")
         .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
         .expect("run should pause at external call")
 }
@@ -69,26 +70,17 @@ fn validate_kwarg_function_call_and_extract_ids(
         .collect()
 }
 
-#[test]
-fn function_call_runtime_ids_are_unique_for_distinct_positional_arguments() {
-    let runner = MontyRun::new(
-        "ext_fn(1, 2, 'three', [4])".to_owned(),
-        "test.py",
-        vec![],
-        vec!["ext_fn".to_owned()],
-    )
-    .expect("runner creation should succeed");
-
-    let progress = runner
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should pause at external call");
+#[rstest]
+fn function_call_runtime_ids_are_unique_for_distinct_positional_arguments(
+    #[with("ext_fn(1, 2, 'three', [4])")] started_progress: RunProgress<NoLimitTracker>,
+) {
     let RunProgress::FunctionCall {
         args,
         kwargs,
         arg_runtime_ids,
         kwarg_runtime_ids,
         ..
-    } = progress
+    } = started_progress
     else {
         panic!("expected function call");
     };
@@ -101,61 +93,46 @@ fn function_call_runtime_ids_are_unique_for_distinct_positional_arguments() {
     assert_eq!(unique_ids.len(), arg_runtime_ids.len());
 }
 
-#[test]
-fn function_call_runtime_ids_match_for_reused_positional_object() {
-    let progress = start_with_ext_fn("x = []; ext_fn(x, x)");
+#[rstest]
+#[case("x = []; ext_fn(x, x)", true)]
+#[case("ext_fn([], [])", false)]
+fn function_call_runtime_id_identity_matches_object_identity(
+    #[case] code: &str,
+    #[case] should_match: bool,
+    #[with(code)] started_progress: RunProgress<NoLimitTracker>,
+) {
     let RunProgress::FunctionCall {
         arg_runtime_ids, state, ..
-    } = progress
+    } = started_progress
     else {
         panic!("expected function call");
     };
+
+    assert_eq!(arg_runtime_ids.len(), 2, "{code}: expected two positional IDs");
+    let ids_match = arg_runtime_ids[0] == arg_runtime_ids[1];
+    assert_eq!(
+        ids_match, should_match,
+        "{code}: runtime IDs should reflect object identity semantics"
+    );
 
     let completion = resume_with_none(state);
     assert!(
         matches!(completion, RunProgress::Complete(_)),
         "single call script should complete after one resume"
     );
-
-    assert_eq!(arg_runtime_ids.len(), 2);
-    assert_eq!(
-        arg_runtime_ids[0], arg_runtime_ids[1],
-        "reusing the same runtime object should preserve ID identity"
-    );
 }
 
-#[test]
-fn function_call_runtime_ids_differ_for_equal_but_distinct_positional_objects() {
-    let progress = start_with_ext_fn("ext_fn([], [])");
-    let arg_runtime_ids = extract_arg_runtime_ids(&progress);
-
-    assert_eq!(arg_runtime_ids.len(), 2);
-    assert_ne!(
-        arg_runtime_ids[0], arg_runtime_ids[1],
-        "distinct runtime objects should not share an ID even when values compare equal"
-    );
-}
-
-#[test]
-fn function_call_kwarg_runtime_ids_match_kwargs_and_are_stable_across_dump_load() {
-    let runner = MontyRun::new(
-        "ext_fn(a=1, b=2)".to_owned(),
-        "test.py",
-        vec![],
-        vec!["ext_fn".to_owned()],
-    )
-    .expect("runner creation should succeed");
-
-    let progress = runner
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should pause at external call");
-    let first_kwarg_runtime_ids = validate_kwarg_function_call_and_extract_ids(&progress, "initial state");
+#[rstest]
+fn function_call_kwarg_runtime_ids_match_kwargs_and_are_stable_across_dump_load(
+    #[with("ext_fn(a=1, b=2)")] started_progress: RunProgress<NoLimitTracker>,
+) {
+    let first_kwarg_runtime_ids = validate_kwarg_function_call_and_extract_ids(&started_progress, "initial state");
     assert_ne!(
         first_kwarg_runtime_ids[0], first_kwarg_runtime_ids[1],
         "distinct kwargs should have distinct (key, value) runtime IDs"
     );
 
-    let bytes = progress.dump().expect("run progress dump should succeed");
+    let bytes = started_progress.dump().expect("run progress dump should succeed");
     let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
 
     let second_kwarg_runtime_ids = validate_kwarg_function_call_and_extract_ids(&loaded, "after dump/load");
@@ -165,15 +142,11 @@ fn function_call_kwarg_runtime_ids_match_kwargs_and_are_stable_across_dump_load(
     );
 }
 
-#[test]
-fn runtime_ids_round_trip_with_run_progress_dump_load() {
-    let runner = MontyRun::new("ext_fn([])".to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
-        .expect("runner creation should succeed");
-
-    let progress = runner
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should pause at external call");
-    let expected_ids: Vec<usize> = progress
+#[rstest]
+fn runtime_ids_round_trip_with_run_progress_dump_load(
+    #[with("ext_fn([])")] started_progress: RunProgress<NoLimitTracker>,
+) {
+    let expected_ids: Vec<usize> = started_progress
         .runtime_ids()
         .expect("function call should expose runtime ids")
         .0
@@ -181,7 +154,7 @@ fn runtime_ids_round_trip_with_run_progress_dump_load() {
         .map(|id| id.raw())
         .collect();
 
-    let bytes = progress.dump().expect("run progress dump should succeed");
+    let bytes = started_progress.dump().expect("run progress dump should succeed");
     let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
     let loaded_ids: Vec<usize> = loaded
         .runtime_ids()
@@ -194,20 +167,9 @@ fn runtime_ids_round_trip_with_run_progress_dump_load() {
     assert_eq!(loaded_ids, expected_ids);
 }
 
-#[test]
-fn into_function_call_includes_runtime_ids() {
-    let runner = MontyRun::new(
-        "ext_fn(a=1, b=2)".to_owned(),
-        "test.py",
-        vec![],
-        vec!["ext_fn".to_owned()],
-    )
-    .expect("runner creation should succeed");
-
-    let progress = runner
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should pause at external call");
-    let bytes = progress.dump().expect("run progress dump should succeed");
+#[rstest]
+fn into_function_call_includes_runtime_ids(#[with("ext_fn(a=1, b=2)")] started_progress: RunProgress<NoLimitTracker>) {
+    let bytes = started_progress.dump().expect("run progress dump should succeed");
     let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
 
     let (expected_arg_runtime_ids, expected_kwarg_runtime_ids) =
@@ -224,18 +186,19 @@ fn into_function_call_includes_runtime_ids() {
     assert_eq!(kwargs.len(), kwarg_runtime_ids.len());
 }
 
-#[test]
+#[rstest]
 fn runtime_ids_are_unavailable_for_non_call_progress() {
     let progress = RunProgress::<NoLimitTracker>::Complete(MontyObject::None);
     assert!(progress.runtime_ids().is_none());
 }
 
-#[test]
-fn runtime_ids_remain_stable_across_resume_boundaries() {
-    let progress = start_with_ext_fn("x = []; ext_fn(x); ext_fn(x)");
+#[rstest]
+fn runtime_ids_remain_stable_across_resume_boundaries(
+    #[with("x = []; ext_fn(x); ext_fn(x)")] started_progress: RunProgress<NoLimitTracker>,
+) {
     let RunProgress::FunctionCall {
         arg_runtime_ids, state, ..
-    } = progress
+    } = started_progress
     else {
         panic!("expected first function call");
     };
@@ -262,12 +225,14 @@ fn runtime_ids_remain_stable_across_resume_boundaries() {
     assert!(matches!(completion, RunProgress::Complete(_)));
 }
 
-#[test]
-fn runtime_ids_remain_stable_across_run_progress_dump_load_and_resume() {
-    let progress = start_with_ext_fn("x = []; ext_fn(x); ext_fn(x)");
-    let bytes = progress.dump().expect("run progress dump should succeed");
-    let (_name, _args, _kwargs, arg_runtime_ids, _kwarg_runtime_ids, _call_id, _method_call, state) =
-        progress.into_function_call().expect("expected first function call");
+#[rstest]
+fn runtime_ids_remain_stable_across_run_progress_dump_load_and_resume(
+    #[with("x = []; ext_fn(x); ext_fn(x)")] started_progress: RunProgress<NoLimitTracker>,
+) {
+    let bytes = started_progress.dump().expect("run progress dump should succeed");
+    let (_name, _args, _kwargs, arg_runtime_ids, _kwarg_runtime_ids, _call_id, _method_call, state) = started_progress
+        .into_function_call()
+        .expect("expected first function call");
     let first_id = arg_runtime_ids
         .first()
         .expect("first call should include one arg id")
@@ -307,15 +272,9 @@ fn runtime_ids_remain_stable_across_run_progress_dump_load_and_resume() {
     assert!(matches!(completion, RunProgress::Complete(_)));
 }
 
-#[test]
-fn corrupted_run_progress_payload_fails_to_load() {
-    let runner = MontyRun::new("ext_fn([])".to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
-        .expect("runner creation should succeed");
-
-    let progress = runner
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should pause at external call");
-    let mut bytes = progress.dump().expect("run progress dump should succeed");
+#[rstest]
+fn corrupted_run_progress_payload_fails_to_load(#[with("ext_fn([])")] started_progress: RunProgress<NoLimitTracker>) {
+    let mut bytes = started_progress.dump().expect("run progress dump should succeed");
     assert!(
         RunProgress::<NoLimitTracker>::load(&bytes).is_ok(),
         "unmodified run progress payload should load"
@@ -325,4 +284,9 @@ fn corrupted_run_progress_payload_fails_to_load() {
     bytes[0] ^= 0xFF;
 
     assert!(RunProgress::<NoLimitTracker>::load(&bytes).is_err());
+}
+
+#[rstest]
+fn extract_arg_runtime_ids_returns_runtime_ids(#[with("ext_fn(1, 2)")] started_progress: RunProgress<NoLimitTracker>) {
+    assert_eq!(extract_arg_runtime_ids(&started_progress).len(), 2);
 }

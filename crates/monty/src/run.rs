@@ -14,7 +14,7 @@ use crate::{
     os::OsFunction,
     parse::parse,
     prepare::prepare,
-    progress_runtime_ids::RuntimeIdSlices,
+    progress_runtime_ids::{RuntimeIdSlices, checked_runtime_id_payload},
     resource::{NoLimitTracker, ResourceTracker},
     runtime_id::RuntimeValueId,
     value::Value,
@@ -287,19 +287,13 @@ fn validate_runtime_id_cardinality(
     kwargs_len: usize,
     kwarg_runtime_ids_len: usize,
 ) -> Result<(), String> {
-    if arg_runtime_ids_len != args_len {
-        return Err(format!(
-            "{context} payload is malformed: arg_runtime_ids length ({arg_runtime_ids_len}) does not match args length ({args_len})"
-        ));
-    }
-
-    if kwarg_runtime_ids_len != kwargs_len {
-        return Err(format!(
-            "{context} payload is malformed: kwarg_runtime_ids length ({kwarg_runtime_ids_len}) does not match kwargs length ({kwargs_len})"
-        ));
-    }
-
-    Ok(())
+    crate::progress_runtime_ids::validate_runtime_id_cardinality(
+        context,
+        args_len,
+        arg_runtime_ids_len,
+        kwargs_len,
+        kwarg_runtime_ids_len,
+    )
 }
 
 impl<T: ResourceTracker> RunProgressUnchecked<T> {
@@ -322,13 +316,14 @@ impl<T: ResourceTracker> RunProgressUnchecked<T> {
                     kwargs.len(),
                     kwarg_runtime_ids.len(),
                 )?;
+                let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(RunProgress::FunctionCall {
                     function_name,
-                    args,
-                    arg_runtime_ids,
-                    kwargs,
-                    kwarg_runtime_ids,
+                    args: checked_payload.args,
+                    arg_runtime_ids: checked_payload.arg_runtime_ids,
+                    kwargs: checked_payload.kwargs,
+                    kwarg_runtime_ids: checked_payload.kwarg_runtime_ids,
                     call_id,
                     method_call,
                     state,
@@ -350,13 +345,14 @@ impl<T: ResourceTracker> RunProgressUnchecked<T> {
                     kwargs.len(),
                     kwarg_runtime_ids.len(),
                 )?;
+                let checked_payload = checked_runtime_id_payload(args, arg_runtime_ids, kwargs, kwarg_runtime_ids);
 
                 Ok(RunProgress::OsCall {
                     function,
-                    args,
-                    arg_runtime_ids,
-                    kwargs,
-                    kwarg_runtime_ids,
+                    args: checked_payload.args,
+                    arg_runtime_ids: checked_payload.arg_runtime_ids,
+                    kwargs: checked_payload.kwargs,
+                    kwarg_runtime_ids: checked_payload.kwarg_runtime_ids,
                     call_id,
                     state,
                 })

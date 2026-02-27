@@ -181,8 +181,8 @@ impl MontyRun {
 /// * `T` - Resource tracker implementation (e.g., `NoLimitTracker` or `LimitedTracker`)
 ///
 /// Serialization requires `T: Serialize + Deserialize`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(bound(serialize = "T: serde::Serialize", deserialize = "T: serde::de::DeserializeOwned"))]
+#[derive(Debug, serde::Serialize)]
+#[serde(bound(serialize = "T: serde::Serialize"))]
 pub enum RunProgress<T: ResourceTracker> {
     /// Execution paused at an external function call or dataclass method call.
     ///
@@ -248,6 +248,137 @@ pub enum RunProgress<T: ResourceTracker> {
     ResolveFutures(FutureSnapshot<T>),
     /// Execution completed with a final result.
     Complete(MontyObject),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(bound(deserialize = "T: serde::de::DeserializeOwned"))]
+enum RunProgressUnchecked<T: ResourceTracker> {
+    FunctionCall {
+        function_name: String,
+        args: Vec<MontyObject>,
+        #[serde(default)]
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwargs: Vec<(MontyObject, MontyObject)>,
+        #[serde(default)]
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+        call_id: u32,
+        method_call: bool,
+        state: Snapshot<T>,
+    },
+    OsCall {
+        function: OsFunction,
+        args: Vec<MontyObject>,
+        #[serde(default)]
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwargs: Vec<(MontyObject, MontyObject)>,
+        #[serde(default)]
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+        call_id: u32,
+        state: Snapshot<T>,
+    },
+    ResolveFutures(FutureSnapshot<T>),
+    Complete(MontyObject),
+}
+
+fn validate_runtime_id_cardinality(
+    context: &str,
+    args_len: usize,
+    arg_runtime_ids_len: usize,
+    kwargs_len: usize,
+    kwarg_runtime_ids_len: usize,
+) -> Result<(), String> {
+    if arg_runtime_ids_len != args_len {
+        return Err(format!(
+            "{context} payload is malformed: arg_runtime_ids length ({arg_runtime_ids_len}) does not match args length ({args_len})"
+        ));
+    }
+
+    if kwarg_runtime_ids_len != kwargs_len {
+        return Err(format!(
+            "{context} payload is malformed: kwarg_runtime_ids length ({kwarg_runtime_ids_len}) does not match kwargs length ({kwargs_len})"
+        ));
+    }
+
+    Ok(())
+}
+
+impl<T: ResourceTracker> RunProgressUnchecked<T> {
+    fn into_checked(self) -> Result<RunProgress<T>, String> {
+        match self {
+            Self::FunctionCall {
+                function_name,
+                args,
+                arg_runtime_ids,
+                kwargs,
+                kwarg_runtime_ids,
+                call_id,
+                method_call,
+                state,
+            } => {
+                validate_runtime_id_cardinality(
+                    "RunProgress::FunctionCall",
+                    args.len(),
+                    arg_runtime_ids.len(),
+                    kwargs.len(),
+                    kwarg_runtime_ids.len(),
+                )?;
+
+                Ok(RunProgress::FunctionCall {
+                    function_name,
+                    args,
+                    arg_runtime_ids,
+                    kwargs,
+                    kwarg_runtime_ids,
+                    call_id,
+                    method_call,
+                    state,
+                })
+            }
+            Self::OsCall {
+                function,
+                args,
+                arg_runtime_ids,
+                kwargs,
+                kwarg_runtime_ids,
+                call_id,
+                state,
+            } => {
+                validate_runtime_id_cardinality(
+                    "RunProgress::OsCall",
+                    args.len(),
+                    arg_runtime_ids.len(),
+                    kwargs.len(),
+                    kwarg_runtime_ids.len(),
+                )?;
+
+                Ok(RunProgress::OsCall {
+                    function,
+                    args,
+                    arg_runtime_ids,
+                    kwargs,
+                    kwarg_runtime_ids,
+                    call_id,
+                    state,
+                })
+            }
+            Self::ResolveFutures(state) => Ok(RunProgress::ResolveFutures(state)),
+            Self::Complete(value) => Ok(RunProgress::Complete(value)),
+        }
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for RunProgress<T>
+where
+    T: ResourceTracker + serde::de::DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <RunProgressUnchecked<T> as serde::Deserialize>::deserialize(deserializer)?
+            .into_checked()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 type FunctionCallPayload<T> = (

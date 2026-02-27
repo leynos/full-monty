@@ -573,6 +573,14 @@ impl EitherProgress {
         print_callback: Option<Py<PyAny>>,
         dc_registry: DcRegistry,
     ) -> PyResult<Bound<'py, PyAny>> {
+        validate_runtime_id_cardinality(
+            "MontySnapshot::FunctionCall",
+            args.len(),
+            kwargs.len(),
+            arg_runtime_ids.len(),
+            kwarg_runtime_ids.len(),
+        )?;
+
         let items: PyResult<Vec<Py<PyAny>>> = args.iter().map(|item| monty_to_py(py, item, &dc_registry)).collect();
 
         let dict = PyDict::new(py);
@@ -613,6 +621,14 @@ impl EitherProgress {
         print_callback: Option<Py<PyAny>>,
         dc_registry: DcRegistry,
     ) -> PyResult<Bound<'py, PyAny>> {
+        validate_runtime_id_cardinality(
+            "MontySnapshot::OsCall",
+            args.len(),
+            kwargs.len(),
+            arg_runtime_ids.len(),
+            kwarg_runtime_ids.len(),
+        )?;
+
         let items: PyResult<Vec<Py<PyAny>>> = args.iter().map(|item| monty_to_py(py, item, &dc_registry)).collect();
 
         let dict = PyDict::new(py);
@@ -988,6 +1004,28 @@ fn extract_external_result(
     }
 }
 
+fn validate_runtime_id_cardinality(
+    context: &str,
+    args_len: usize,
+    kwargs_len: usize,
+    arg_runtime_ids_len: usize,
+    kwarg_runtime_ids_len: usize,
+) -> PyResult<()> {
+    if arg_runtime_ids_len != args_len {
+        return Err(PyValueError::new_err(format!(
+            "{context} payload is malformed: arg_runtime_ids length ({arg_runtime_ids_len}) does not match args length ({args_len})"
+        )));
+    }
+
+    if kwarg_runtime_ids_len != kwargs_len {
+        return Err(PyValueError::new_err(format!(
+            "{context} payload is malformed: kwarg_runtime_ids length ({kwarg_runtime_ids_len}) does not match kwargs length ({kwargs_len})"
+        )));
+    }
+
+    Ok(())
+}
+
 #[pymethods]
 impl PyMontySnapshot {
     /// Resumes execution with either a return value or an exception.
@@ -1154,6 +1192,14 @@ impl PyMontySnapshot {
 
         let serialized: SerializedSnapshotOwned =
             postcard::from_bytes(bytes).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        validate_runtime_id_cardinality(
+            "MontySnapshot::load",
+            serialized.args.len(),
+            serialized.kwargs.len(),
+            serialized.arg_runtime_ids.len(),
+            serialized.kwarg_runtime_ids.len(),
+        )?;
 
         let dc_registry = DcRegistry::from_list(py, dataclass_registry)?;
 

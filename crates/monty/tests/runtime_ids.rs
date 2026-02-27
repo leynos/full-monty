@@ -104,7 +104,18 @@ fn function_call_runtime_ids_are_unique_for_distinct_positional_arguments() {
 #[test]
 fn function_call_runtime_ids_match_for_reused_positional_object() {
     let progress = start_with_ext_fn("x = []; ext_fn(x, x)");
-    let arg_runtime_ids = extract_arg_runtime_ids(&progress);
+    let RunProgress::FunctionCall {
+        arg_runtime_ids, state, ..
+    } = progress
+    else {
+        panic!("expected function call");
+    };
+
+    let completion = resume_with_none(state);
+    assert!(
+        matches!(completion, RunProgress::Complete(_)),
+        "single call script should complete after one resume"
+    );
 
     assert_eq!(arg_runtime_ids.len(), 2);
     assert_eq!(
@@ -254,18 +265,23 @@ fn runtime_ids_remain_stable_across_resume_boundaries() {
 #[test]
 fn runtime_ids_remain_stable_across_run_progress_dump_load_and_resume() {
     let progress = start_with_ext_fn("x = []; ext_fn(x); ext_fn(x)");
-    let RunProgress::FunctionCall {
-        ref arg_runtime_ids, ..
-    } = progress
-    else {
-        panic!("expected first function call");
-    };
+    let bytes = progress.dump().expect("run progress dump should succeed");
+    let (_name, _args, _kwargs, arg_runtime_ids, _kwarg_runtime_ids, _call_id, _method_call, state) =
+        progress.into_function_call().expect("expected first function call");
     let first_id = arg_runtime_ids
         .first()
         .expect("first call should include one arg id")
         .raw();
 
-    let bytes = progress.dump().expect("run progress dump should succeed");
+    // Resume and complete the original suspended snapshot so ref-count-panic
+    // tests do not drop a live heap graph.
+    let second_call = resume_with_none(state);
+    let RunProgress::FunctionCall { state, .. } = second_call else {
+        panic!("expected second function call when resuming original snapshot");
+    };
+    let completion = resume_with_none(state);
+    assert!(matches!(completion, RunProgress::Complete(_)));
+
     let loaded_progress: RunProgress<NoLimitTracker> =
         RunProgress::load(&bytes).expect("run progress load should succeed");
 

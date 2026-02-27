@@ -493,8 +493,8 @@ impl<T: ResourceTracker> Drop for MontyRepl<T> {
 ///
 /// This mirrors `RunProgress` but returns the updated `MontyRepl` on completion
 /// so callers can continue feeding additional snippets without replaying prior code.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(bound(serialize = "T: serde::Serialize", deserialize = "T: serde::de::DeserializeOwned"))]
+#[derive(Debug, serde::Serialize)]
+#[serde(bound(serialize = "T: serde::Serialize"))]
 pub enum ReplProgress<T: ResourceTracker> {
     /// Execution paused at an external function call or dataclass method call.
     FunctionCall {
@@ -545,6 +545,140 @@ pub enum ReplProgress<T: ResourceTracker> {
         /// Final result produced by the snippet.
         value: MontyObject,
     },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(bound(deserialize = "T: serde::de::DeserializeOwned"))]
+enum ReplProgressUnchecked<T: ResourceTracker> {
+    FunctionCall {
+        function_name: String,
+        args: Vec<MontyObject>,
+        #[serde(default)]
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwargs: Vec<(MontyObject, MontyObject)>,
+        #[serde(default)]
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+        call_id: u32,
+        method_call: bool,
+        state: ReplSnapshot<T>,
+    },
+    OsCall {
+        function: OsFunction,
+        args: Vec<MontyObject>,
+        #[serde(default)]
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwargs: Vec<(MontyObject, MontyObject)>,
+        #[serde(default)]
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+        call_id: u32,
+        state: ReplSnapshot<T>,
+    },
+    ResolveFutures(ReplFutureSnapshot<T>),
+    Complete {
+        repl: MontyRepl<T>,
+        value: MontyObject,
+    },
+}
+
+fn validate_repl_runtime_id_cardinality(
+    context: &str,
+    args_len: usize,
+    arg_runtime_ids_len: usize,
+    kwargs_len: usize,
+    kwarg_runtime_ids_len: usize,
+) -> Result<(), String> {
+    if arg_runtime_ids_len != args_len {
+        return Err(format!(
+            "{context} payload is malformed: arg_runtime_ids length ({arg_runtime_ids_len}) does not match args length ({args_len})"
+        ));
+    }
+
+    if kwarg_runtime_ids_len != kwargs_len {
+        return Err(format!(
+            "{context} payload is malformed: kwarg_runtime_ids length ({kwarg_runtime_ids_len}) does not match kwargs length ({kwargs_len})"
+        ));
+    }
+
+    Ok(())
+}
+
+impl<T: ResourceTracker> ReplProgressUnchecked<T> {
+    fn into_checked(self) -> Result<ReplProgress<T>, String> {
+        match self {
+            Self::FunctionCall {
+                function_name,
+                args,
+                arg_runtime_ids,
+                kwargs,
+                kwarg_runtime_ids,
+                call_id,
+                method_call,
+                state,
+            } => {
+                validate_repl_runtime_id_cardinality(
+                    "ReplProgress::FunctionCall",
+                    args.len(),
+                    arg_runtime_ids.len(),
+                    kwargs.len(),
+                    kwarg_runtime_ids.len(),
+                )?;
+
+                Ok(ReplProgress::FunctionCall {
+                    function_name,
+                    args,
+                    arg_runtime_ids,
+                    kwargs,
+                    kwarg_runtime_ids,
+                    call_id,
+                    method_call,
+                    state,
+                })
+            }
+            Self::OsCall {
+                function,
+                args,
+                arg_runtime_ids,
+                kwargs,
+                kwarg_runtime_ids,
+                call_id,
+                state,
+            } => {
+                validate_repl_runtime_id_cardinality(
+                    "ReplProgress::OsCall",
+                    args.len(),
+                    arg_runtime_ids.len(),
+                    kwargs.len(),
+                    kwarg_runtime_ids.len(),
+                )?;
+
+                Ok(ReplProgress::OsCall {
+                    function,
+                    args,
+                    arg_runtime_ids,
+                    kwargs,
+                    kwarg_runtime_ids,
+                    call_id,
+                    state,
+                })
+            }
+            Self::ResolveFutures(state) => Ok(ReplProgress::ResolveFutures(state)),
+            Self::Complete { repl, value } => Ok(ReplProgress::Complete { repl, value }),
+        }
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for ReplProgress<T>
+where
+    T: ResourceTracker + serde::de::DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <ReplProgressUnchecked<T> as serde::Deserialize>::deserialize(deserializer)?
+            .into_checked()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Error returned when a REPL snippet raises a Python exception during `start()` or `resume()`.

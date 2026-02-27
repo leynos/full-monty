@@ -1,3 +1,11 @@
+//! Argument containers and helpers for Monty runtime calls.
+//!
+//! This module converts between parser/runtime argument forms (`ExprLoc`,
+//! `Identifier`, `Value`) and host-facing forms (`MontyObject`) while
+//! preserving reference-count and resource-tracking behaviour
+//! (`ResourceTracker`). It also provides parsing/validation utilities that
+//! surface `ParseError` for malformed argument syntax.
+
 use std::vec::IntoIter;
 
 use crate::{

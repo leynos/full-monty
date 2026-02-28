@@ -55,6 +55,8 @@ test-hooks = []
 [dev-dependencies]
 tempfile = "3"
 insta = { workspace = true }
+rstest = "0.26.1"
+rstest-bdd-macros = { version = "0.5.0", features = ["compile-time-validation"] }
 
 [lints]
 workspace = true

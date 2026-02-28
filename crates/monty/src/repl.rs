@@ -28,8 +28,11 @@ use crate::{
     resource::ResourceTracker,
     run::Executor,
     run_progress::{ConvertedExit, ExtFunctionResult, NameLookupResult, convert_frame_exit},
+    runtime_id::RuntimeValueId,
     value::Value,
 };
+
+type RuntimeIdSlices<'a> = (&'a [RuntimeValueId], &'a [(RuntimeValueId, RuntimeValueId)]);
 
 /// Stateful REPL session that executes snippets incrementally without replay.
 ///
@@ -466,6 +469,16 @@ impl<T: ResourceTracker> ReplProgress<T> {
         }
     }
 
+    /// Returns runtime-ID slices for suspendable call variants.
+    #[must_use]
+    pub fn runtime_ids(&self) -> Option<RuntimeIdSlices<'_>> {
+        match self {
+            Self::FunctionCall(call) => Some((&call.arg_runtime_ids, &call.kwarg_runtime_ids)),
+            Self::OsCall(call) => Some((&call.arg_runtime_ids, &call.kwarg_runtime_ids)),
+            _ => None,
+        }
+    }
+
     /// Extracts the REPL session from any progress variant, discarding
     /// the in-flight execution state.
     ///
@@ -522,6 +535,10 @@ pub struct ReplFunctionCall<T: ResourceTracker> {
     pub args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (key, value pairs).
     pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// Stable runtime IDs for positional arguments.
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs.
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Whether this is a dataclass method call (first arg is `self`).
@@ -572,6 +589,10 @@ pub struct ReplOsCall<T: ResourceTracker> {
     pub args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (key, value pairs).
     pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// Stable runtime IDs for positional arguments.
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs.
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Internal REPL execution snapshot.
@@ -1008,12 +1029,16 @@ fn build_repl_progress<T: ResourceTracker>(
             function_name,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             method_call,
         } => Ok(ReplProgress::FunctionCall(ReplFunctionCall {
             function_name,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             method_call,
             snapshot: new_repl_snapshot!(),
@@ -1022,11 +1047,15 @@ fn build_repl_progress<T: ResourceTracker>(
             function,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
         } => Ok(ReplProgress::OsCall(ReplOsCall {
             function,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             snapshot: new_repl_snapshot!(),
         })),

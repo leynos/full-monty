@@ -9,6 +9,7 @@ use ::monty::{
     ExcType, ExtFunctionResult, FunctionCall, JsonMontyArray, JsonMontyObject, JsonMontyPairs, LimitedTracker,
     MontyException, MontyObject, MontyRun, NameLookupResult, NoLimitTracker, OsCall, ReplFunctionCall, ReplNameLookup,
     ReplOsCall, ReplProgress, ReplResolveFutures, ReplStartError, ResolveFutures, ResourceTracker, RunProgress,
+    RuntimeValueId,
 };
 use monty::{NameLookup, fs::MountTable};
 use pyo3::{
@@ -940,6 +941,14 @@ pub struct PyFunctionSnapshot {
     #[pyo3(get)]
     pub call_id: u32,
 
+    /// Stable runtime IDs for positional args in `args` order.
+    #[pyo3(get)]
+    pub arg_runtime_ids: Vec<usize>,
+
+    /// Stable runtime IDs for keyword `(key, value)` pairs in `kwargs` order.
+    #[pyo3(get)]
+    pub kwarg_runtime_ids: Vec<(usize, usize)>,
+
     /// Positional args in Monty's native representation. Python callers see
     /// them as a `tuple` via the `args` getter, which converts on each
     /// access (mirroring `MontyComplete.output`); `args_json()` serializes
@@ -948,6 +957,43 @@ pub struct PyFunctionSnapshot {
     /// Keyword args as (key, value) pairs — same rationale as `args`;
     /// exposed as a Python `dict` via the `kwargs` getter.
     kwargs: Vec<(MontyObject, MontyObject)>,
+}
+
+/// Converts runtime-id wrappers to raw stable IDs for Python-facing snapshots.
+fn map_runtime_ids(
+    arg_ids: &[RuntimeValueId],
+    kwarg_ids: &[(RuntimeValueId, RuntimeValueId)],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    (
+        arg_ids.iter().map(RuntimeValueId::raw).collect(),
+        kwarg_ids
+            .iter()
+            .map(|(key, value)| (key.raw(), value.raw()))
+            .collect(),
+    )
+}
+
+/// Extracts runtime IDs from any function-snapshot variant.
+fn snapshot_runtime_ids(snapshot: &EitherFunctionSnapshot) -> (Vec<usize>, Vec<(usize, usize)>) {
+    match snapshot {
+        EitherFunctionSnapshot::NoLimitFn(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::NoLimitOs(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::LimitedFn(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::LimitedOs(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::ReplNoLimitFn(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::ReplNoLimitOs(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::ReplLimitedFn(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::ReplLimitedOs(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::Done => (Vec::new(), Vec::new()),
+    }
 }
 
 impl PyFunctionSnapshot {
@@ -968,6 +1014,7 @@ impl PyFunctionSnapshot {
         let function_name = call.function_name.clone();
         let call_id = call.call_id;
         let method_call = call.method_call;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let args = call.args.clone();
         let kwargs = call.kwargs.clone();
 
@@ -979,6 +1026,8 @@ impl PyFunctionSnapshot {
             is_method_call: method_call,
             function_name,
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
             args,
             kwargs,
@@ -1002,6 +1051,7 @@ impl PyFunctionSnapshot {
     {
         let function_name = call.function.to_string();
         let call_id = call.call_id;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let args = call.args.clone();
         let kwargs = call.kwargs.clone();
 
@@ -1013,6 +1063,8 @@ impl PyFunctionSnapshot {
             is_method_call: false,
             function_name,
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
             args,
             kwargs,
@@ -1035,6 +1087,7 @@ impl PyFunctionSnapshot {
         let function_name = call.function_name.clone();
         let call_id = call.call_id;
         let method_call = call.method_call;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let args = call.args.clone();
         let kwargs = call.kwargs.clone();
 
@@ -1046,6 +1099,8 @@ impl PyFunctionSnapshot {
             is_method_call: method_call,
             function_name,
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
             args,
             kwargs,
@@ -1067,6 +1122,7 @@ impl PyFunctionSnapshot {
     {
         let function_name = call.function.to_string();
         let call_id = call.call_id;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let args = call.args.clone();
         let kwargs = call.kwargs.clone();
 
@@ -1078,6 +1134,8 @@ impl PyFunctionSnapshot {
             is_method_call: false,
             function_name,
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
             args,
             kwargs,
@@ -1102,6 +1160,7 @@ impl PyFunctionSnapshot {
         kwargs: Vec<(MontyObject, MontyObject)>,
         call_id: u32,
     ) -> PyResult<Bound<'_, PyAny>> {
+        let (arg_runtime_ids, kwarg_runtime_ids) = snapshot_runtime_ids(&snapshot);
         let slf = Self {
             snapshot: Mutex::new(snapshot),
             print_callback,
@@ -1113,6 +1172,8 @@ impl PyFunctionSnapshot {
             args,
             kwargs,
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
         };
         slf.into_bound_py_any(py)
     }

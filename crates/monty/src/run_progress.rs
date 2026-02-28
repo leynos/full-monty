@@ -22,6 +22,7 @@ use crate::{
     resource::ResourceTracker,
     run::Executor,
     value::Value,
+    runtime_id::RuntimeValueId,
 };
 
 // ---------------------------------------------------------------------------
@@ -52,60 +53,23 @@ pub enum RunProgress<T: ResourceTracker> {
     Complete(MontyObject),
 }
 
-impl<T: ResourceTracker> RunProgress<T> {
-    /// Consumes the progress and returns the `FunctionCall` struct if this is a function call.
-    #[must_use]
-    pub fn into_function_call(self) -> Option<FunctionCall<T>> {
-        match self {
-            Self::FunctionCall(call) => Some(call),
-            _ => None,
-        }
-    }
-
-    /// Consumes the progress and returns the `OsCall` struct if this is an OS call.
-    #[must_use]
-    pub fn into_os_call(self) -> Option<OsCall<T>> {
-        match self {
-            Self::OsCall(call) => Some(call),
-            _ => None,
-        }
-    }
-
-    /// Consumes the progress and returns the final value if execution completed.
-    #[must_use]
-    pub fn into_complete(self) -> Option<MontyObject> {
-        match self {
-            Self::Complete(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    /// Consumes the progress and returns the `ResolveFutures` struct.
-    #[must_use]
-    pub fn into_resolve_futures(self) -> Option<ResolveFutures<T>> {
-        match self {
-            Self::ResolveFutures(state) => Some(state),
-            _ => None,
-        }
-    }
-
-    /// Consumes the progress and returns the `NameLookup` struct.
-    #[must_use]
-    pub fn into_name_lookup(self) -> Option<NameLookup<T>> {
-        match self {
-            Self::NameLookup(lookup) => Some(lookup),
-            _ => None,
-        }
+impl<T: ResourceTracker + DeserializeOwned> RunProgress<T> {
+    /// Deserializes execution state from binary format.
+    ///
+    /// # Errors
+    /// Returns an error if deserialization fails.
+    pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
     }
 }
 
-impl<T: ResourceTracker + serde::Serialize> RunProgress<T> {
-    /// Serializes the execution state to a binary format.
+impl<T: ResourceTracker + DeserializeOwned> RunProgress<T> {
+    /// Deserializes execution state from binary format.
     ///
     /// # Errors
-    /// Returns an error if serialization fails.
-    pub fn dump(&self) -> Result<Vec<u8>, postcard::Error> {
-        postcard::to_allocvec(self)
+    /// Returns an error if deserialization fails.
+    pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
     }
 }
 
@@ -143,6 +107,10 @@ pub struct FunctionCall<T: ResourceTracker> {
     pub args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (key, value pairs).
     pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// Stable runtime IDs for positional arguments.
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs.
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Whether this is a dataclass method call (first arg is `self`).
@@ -152,25 +120,6 @@ pub struct FunctionCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> FunctionCall<T> {
-    /// Creates a new `FunctionCall` from its parts.
-    fn new(
-        function_name: String,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
-        call_id: u32,
-        method_call: bool,
-        snapshot: Snapshot<T>,
-    ) -> Self {
-        Self {
-            function_name,
-            args,
-            kwargs,
-            call_id,
-            method_call,
-            snapshot,
-        }
-    }
-
     /// Returns a mutable reference to the resource tracker.
     ///
     /// This allows modifying resource limits between execution phases,
@@ -229,6 +178,10 @@ pub struct OsCall<T: ResourceTracker> {
     pub args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (key, value pairs).
     pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// Stable runtime IDs for positional arguments.
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs.
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Internal execution snapshot.
@@ -236,23 +189,6 @@ pub struct OsCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> OsCall<T> {
-    /// Creates a new `OsCall` from its parts.
-    fn new(
-        function: OsFunction,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
-        call_id: u32,
-        snapshot: Snapshot<T>,
-    ) -> Self {
-        Self {
-            function,
-            args,
-            kwargs,
-            call_id,
-            snapshot,
-        }
-    }
-
     /// Resumes execution with the OS call result.
     ///
     /// # Arguments
@@ -652,6 +588,8 @@ pub(crate) enum ConvertedExit {
         function_name: String,
         args: Vec<MontyObject>,
         kwargs: Vec<(MontyObject, MontyObject)>,
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
         call_id: u32,
         method_call: bool,
     },
@@ -660,6 +598,8 @@ pub(crate) enum ConvertedExit {
         function: OsFunction,
         args: Vec<MontyObject>,
         kwargs: Vec<(MontyObject, MontyObject)>,
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
         call_id: u32,
     },
     /// All async tasks are blocked waiting for external futures.
@@ -695,11 +635,13 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_, i
             ..
         }) => {
             let name = function_name.into_string(vm.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let host_args = args.into_py_objects_with_runtime_ids(vm);
             ConvertedExit::FunctionCall {
                 function_name: name,
-                args: args_py,
-                kwargs: kwargs_py,
+                args: host_args.args,
+                kwargs: host_args.kwargs,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: false,
             }
@@ -709,11 +651,13 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_, i
             args,
             call_id,
         }) => {
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let host_args = args.into_py_objects_with_runtime_ids(vm);
             ConvertedExit::OsCall {
                 function,
-                args: args_py,
-                kwargs: kwargs_py,
+                args: host_args.args,
+                kwargs: host_args.kwargs,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
             }
         }
@@ -723,11 +667,13 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_, i
             call_id,
         }) => {
             let name = method_name.into_string(vm.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let host_args = args.into_py_objects_with_runtime_ids(vm);
             ConvertedExit::FunctionCall {
                 function_name: name,
-                args: args_py,
-                kwargs: kwargs_py,
+                args: host_args.args,
+                kwargs: host_args.kwargs,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: true,
             }
@@ -792,28 +738,36 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             function_name,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             method_call,
-        } => Ok(RunProgress::FunctionCall(FunctionCall::new(
+        } => Ok(RunProgress::FunctionCall(FunctionCall {
             function_name,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             method_call,
-            new_snapshot!(),
-        ))),
+            snapshot: new_snapshot!(),
+        })),
         ConvertedExit::OsCall {
             function,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
-        } => Ok(RunProgress::OsCall(OsCall::new(
+        } => Ok(RunProgress::OsCall(OsCall {
             function,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
-            new_snapshot!(),
-        ))),
+            snapshot: new_snapshot!(),
+        })),
         ConvertedExit::ResolveFutures(pending_call_ids) => Ok(RunProgress::ResolveFutures(ResolveFutures::new(
             executor,
             vm_state.expect("snapshot should exist for ResolveFutures"),
@@ -835,3 +789,5 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
         }
     }
 }
+
+type RuntimeIdSlices<'a> = (&'a [RuntimeValueId], &'a [(RuntimeValueId, RuntimeValueId)]);

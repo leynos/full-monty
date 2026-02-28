@@ -11,6 +11,7 @@ use crate::{
     parse::ParseError,
     types::{Dict, dict::DictIntoIter},
     value::Value,
+    runtime_id::RuntimeValueId,
 };
 
 /// Type for method call arguments.
@@ -27,6 +28,13 @@ pub(crate) enum ArgValues {
     ArgsKargs { args: Vec<Value>, kwargs: KwargsValues },
 }
 
+/// Host-facing external call arguments plus stable runtime IDs.
+pub(crate) struct HostCallArgs {
+    pub args: Vec<MontyObject>,
+    pub kwargs: Vec<(MontyObject, MontyObject)>,
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+}
 impl ArgValues {
     /// Checks that zero arguments were passed.
     ///
@@ -45,6 +53,7 @@ impl ArgValues {
     /// Checks that exactly one positional argument was passed, returning it.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
+
     pub fn get_one_arg(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
         match self {
             Self::One(a) => Ok(a),
@@ -59,6 +68,7 @@ impl ArgValues {
     /// Checks that exactly two positional arguments were passed, returning them as a tuple.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
+
     pub fn get_two_args(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<(Value, Value)> {
         match self {
             Self::Two(a1, a2) => Ok((a1, a2)),
@@ -73,10 +83,12 @@ impl ArgValues {
     /// Checks that one or two arguments were passed, returning them as a tuple.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
+
     pub fn get_one_two_args(
         self,
         name: &str,
         heap: &mut Heap<impl ResourceTracker>,
+
     ) -> RunResult<(Value, Option<Value>)> {
         match self {
             Self::One(a) => Ok((a, None)),
@@ -96,6 +108,7 @@ impl ArgValues {
     /// Checks that zero or one argument was passed, returning the optional value.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
+
     pub fn get_zero_one_arg(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Value>> {
         match self {
             Self::Empty => Ok(None),
@@ -118,12 +131,14 @@ impl ArgValues {
     /// Uses `EitherStr::matches()` for fast O(1) comparison when the kwarg key is interned.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
+
     pub fn get_zero_one_named_arg(
         self,
         method_name: &str,
         kwarg_name: impl Into<StringId>,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
+
     ) -> RunResult<Option<Value>> {
         let (mut pos, kwargs) = self.into_parts();
 
@@ -180,46 +195,12 @@ impl ArgValues {
     ///
     /// Returns (None, None) for 0 args, (Some(a), None) for 1 arg, (Some(a), Some(b)) for 2 args.
     /// On error, properly drops all contained values to maintain reference counts.
+
     pub fn get_zero_one_two_args(
         self,
         name: &str,
         heap: &mut Heap<impl ResourceTracker>,
-    ) -> RunResult<(Option<Value>, Option<Value>)> {
-        match self {
-            Self::Empty => Ok((None, None)),
-            Self::One(a) => Ok((Some(a), None)),
-            Self::Two(a, b) => Ok((Some(a), Some(b))),
-            other => {
-                let count = other.count();
-                other.drop_with_heap(heap);
-                Err(ExcType::type_error_at_most(name, 2, count))
-            }
-        }
-    }
 
-    /// Extracts a keyword-only pair by name.
-    ///
-    /// Validates that no positional arguments are provided and only the specified
-    /// keyword arguments are present. Returns `(None, None)` when neither keyword
-    /// is provided.
-    ///
-    /// # Arguments
-    /// * `method_name` - Method name for error messages (e.g., "list.sort")
-    /// * `kwarg1` - Name of the first keyword argument
-    /// * `kwarg2` - Name of the second keyword argument
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - Any positional arguments are provided
-    /// - A keyword argument other than `kwarg1` or `kwarg2` is provided
-    /// - A keyword is not a string
-    pub fn extract_keyword_only_pair(
-        self,
-        method_name: &str,
-        kwarg1: &str,
-        kwarg2: &str,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
     ) -> RunResult<(Option<Value>, Option<Value>)> {
         let (pos, kwargs) = self.into_parts();
         defer_drop!(pos, heap);
@@ -242,6 +223,15 @@ impl ArgValues {
     /// Used to insert `self` when dispatching dataclass method calls to the host.
     /// The dataclass instance becomes the first arg so the host can reconstruct
     /// the original object and call the method on it.
+
+    pub fn extract_keyword_only_pair(
+        self,
+        method_name: &str,
+        kwarg1: &str,
+        kwarg2: &str,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+
     pub fn prepend(self, value: Value) -> Self {
         match self {
             Self::Empty => Self::One(value),
@@ -263,6 +253,7 @@ impl ArgValues {
 
     /// Splits into positional iterator and keyword values without allocating
     /// for the common One/Two cases.
+
     pub fn into_parts(self) -> (ArgPosIter, KwargsValues) {
         match self {
             Self::Empty => (ArgPosIter::Empty, KwargsValues::Empty),
@@ -274,6 +265,7 @@ impl ArgValues {
     }
 
     /// Variant of [`into_parts()`](Self::into_parts) that accepts no kwargs, returning an error if any are present.
+
     pub fn into_pos_only(self, method_name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<ArgPosIter> {
         match self {
             Self::Empty => Ok(ArgPosIter::Empty),
@@ -298,37 +290,26 @@ impl ArgValues {
     }
 
     #[cold]
+
     fn unexpected_kwargs_error(
         kwargs: KwargsValues,
         method_name: &str,
         heap: &mut Heap<impl ResourceTracker>,
+
     ) -> RunError {
         kwargs.drop_with_heap(heap);
         ExcType::type_error_no_kwargs(method_name)
     }
 
-    /// Converts the arguments into a Vec of MontyObjects.
+    /// Converts arguments into host values and their runtime IDs.
     ///
-    /// This is used when passing arguments to external functions.
+    /// The runtime IDs are host-facing instrumentation metadata used to track
+    /// value identity continuity across suspend/resume and snapshot boundaries.
+
     pub fn into_py_objects(
         self,
         vm: &mut VM<'_, impl ResourceTracker>,
-    ) -> (Vec<MontyObject>, Vec<(MontyObject, MontyObject)>) {
-        match self {
-            Self::Empty => (vec![], vec![]),
-            Self::One(a) => (vec![MontyObject::new(a, vm)], vec![]),
-            Self::Two(a1, a2) => (vec![MontyObject::new(a1, vm), MontyObject::new(a2, vm)], vec![]),
-            Self::Kwargs(kwargs) => (vec![], kwargs.into_py_objects(vm)),
-            Self::ArgsKargs { args, kwargs } => (
-                args.into_iter().map(|v| MontyObject::new(v, vm)).collect(),
-                kwargs.into_py_objects(vm),
-            ),
-        }
-    }
 
-    /// Returns the number of positional arguments.
-    ///
-    /// For `Kwargs` returns 0, for `ArgsKargs` returns only the positional args count.
     fn count(&self) -> usize {
         match self {
             Self::Empty => 0,
@@ -338,6 +319,53 @@ impl ArgValues {
             Self::ArgsKargs { args, .. } => args.len(),
         }
     }
+
+    pub fn into_py_objects_with_runtime_ids(self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> HostCallArgs {
+        match self {
+            Self::Empty => HostCallArgs::empty(),
+            Self::One(a) => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a], vm);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
+            }
+            Self::Two(a1, a2) => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a1, a2], vm);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
+            }
+            Self::Kwargs(kwargs) => {
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(vm);
+                HostCallArgs {
+                    args: vec![],
+                    kwargs,
+                    arg_runtime_ids: vec![],
+                    kwarg_runtime_ids,
+                }
+            }
+            Self::ArgsKargs { args, kwargs } => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids(args, vm);
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(vm);
+                HostCallArgs {
+                    args,
+                    kwargs,
+                    arg_runtime_ids,
+                    kwarg_runtime_ids,
+                }
+            }
+        }
+    }
+
+    /// Returns the number of positional arguments.
+    ///
+    /// For `Kwargs` returns 0, for `ArgsKargs` returns only the positional args count.
 }
 
 impl DropWithHeap for ArgValues {
@@ -459,13 +487,13 @@ impl KwargsValues {
 
     /// Returns true if there are no keyword arguments.
     #[must_use]
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Converts the arguments into a Vec of MontyObjects.
-    ///
-    /// This is used when passing arguments to external functions.
+    /// Converts kwargs into host values and runtime IDs.
+
     fn into_py_objects(self, vm: &mut VM<'_, impl ResourceTracker>) -> Vec<(MontyObject, MontyObject)> {
         match self {
             Self::Empty => vec![],
@@ -485,6 +513,7 @@ impl KwargsValues {
     }
 
     /// Helper for functions which do not yet support kwargs, returns an `Err` if there are kwargs.
+
     pub fn not_supported_yet(self, method_name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<()> {
         if self.is_empty() {
             Ok(())
@@ -507,6 +536,7 @@ impl KwargsValues {
     ///
     /// `unexpected_keyword` formats the call-site-specific error for keywords
     /// other than `kwarg1` and `kwarg2`.
+
     pub fn parse_named_kwargs_pair(
         self,
         func_name: &str,
@@ -515,6 +545,7 @@ impl KwargsValues {
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
         unexpected_keyword: impl Fn(&str, &str) -> RunError,
+
     ) -> RunResult<(Option<Value>, Option<Value>)> {
         let kwargs = self.into_iter();
         defer_drop_mut!(kwargs, heap);
@@ -551,6 +582,23 @@ impl KwargsValues {
 
         Ok((val1_guard.into_inner(), val2_guard.into_inner()))
     }
+
+    fn into_py_objects_with_runtime_ids(
+        self,
+        vm: &mut VM<'_, '_, impl ResourceTracker>,
+
+    ) -> (Vec<HostKwarg>, Vec<HostKwargRuntimeIds>) {
+        match self {
+            Self::Empty => (vec![], vec![]),
+            Self::Inline(kvs) => kvs
+                .into_iter()
+                .map(|(k, v)| build_kwarg_pair(Value::InternString(k), v, vm))
+                .unzip(),
+            Self::Dict(dict) => dict.into_iter().map(|(k, v)| build_kwarg_pair(k, v, vm)).unzip(),
+        }
+    }
+
+    /// Helper for functions which do not yet support kwargs, returns an `Err` if there are kwargs.
 }
 
 impl DropWithHeap for KwargsValues {
@@ -586,6 +634,19 @@ impl IntoIterator for KwargsValues {
     }
 }
 
+fn build_args_with_runtime_ids(
+    values: impl IntoIterator<Item = Value>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> (Vec<MontyObject>, Vec<RuntimeValueId>) {
+    values
+        .into_iter()
+        .map(|value| {
+            let runtime_id = runtime_value_id(&value);
+            let py_object = MontyObject::new(value, vm);
+            (py_object, runtime_id)
+        })
+        .unzip()
+}
 /// Iterator over keyword argument (key, value) pairs.
 ///
 /// For `Inline` kwargs, converts `StringId` keys to `Value::InternString`.
@@ -828,3 +889,35 @@ impl ArgExprs {
         Ok(())
     }
 }
+
+fn build_kwarg_pair(
+    key: Value,
+    value: Value,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> ((MontyObject, MontyObject), (RuntimeValueId, RuntimeValueId)) {
+    let key_runtime_id = runtime_value_id(&key);
+    let value_runtime_id = runtime_value_id(&value);
+    let key_py = MontyObject::new(key, vm);
+    let value_py = MontyObject::new(value, vm);
+    ((key_py, value_py), (key_runtime_id, value_runtime_id))
+}
+
+impl HostCallArgs {
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            args: vec![],
+            kwargs: vec![],
+            arg_runtime_ids: vec![],
+            kwarg_runtime_ids: vec![],
+        }
+    }
+}
+
+fn runtime_value_id(value: &Value) -> RuntimeValueId {
+    let runtime_id = RuntimeValueId::new(value.id());
+    debug_assert_eq!(runtime_id.raw(), value.id());
+    runtime_id
+}
+type HostKwarg = (MontyObject, MontyObject);
+type HostKwargRuntimeIds = (RuntimeValueId, RuntimeValueId);

@@ -11,6 +11,10 @@ use crate::{
     io::PrintWriter,
     namespace::Namespaces,
     object::MontyObject,
+    observer::{
+        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, ExternalCallReturnedEvent,
+        RuntimeObserverEvent, RuntimeObserverHandle,
+    },
     os::OsFunction,
     parse::parse,
     prepare::prepare,
@@ -151,6 +155,19 @@ impl MontyRun {
         resource_tracker: T,
         print: &mut PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
+        self.start_with_observer(inputs, resource_tracker, print, RuntimeObserverHandle::disabled())
+    }
+
+    /// Starts execution with a runtime observer.
+    ///
+    /// Observer events are emitted only when `observer` is enabled.
+    pub fn start_with_observer<T: ResourceTracker>(
+        self,
+        inputs: Vec<MontyObject>,
+        resource_tracker: T,
+        print: &mut PrintWriter<'_>,
+        observer: RuntimeObserverHandle,
+    ) -> Result<RunProgress<T>, MontyException> {
         let executor = self.executor;
 
         // Create heap and prepare namespaces
@@ -158,7 +175,7 @@ impl MontyRun {
         let mut namespaces = executor.prepare_namespaces(inputs, &mut heap)?;
 
         // Create and run VM
-        let mut vm = VM::new(&mut heap, &mut namespaces, &executor.interns, print);
+        let mut vm = VM::new_with_observer(&mut heap, &mut namespaces, &executor.interns, print, observer.clone());
 
         // Start execution
         let vm_result = vm.run_module(&executor.module_code);
@@ -166,7 +183,7 @@ impl MontyRun {
         let vm_state = vm.check_snapshot(&vm_result);
 
         // Handle the result using the destructured parts
-        handle_vm_result(vm_result, vm_state, executor, heap, namespaces)
+        handle_vm_result(vm_result, vm_state, executor, heap, namespaces, observer)
     }
 }
 
@@ -475,6 +492,9 @@ pub struct Snapshot<T: ResourceTracker> {
     /// The call_id from the most recent FunctionCall that created this Snapshot.
     /// Used by `run_pending()` to push the correct `ExternalFuture`.
     pending_call_id: u32,
+    /// Optional runtime observer handle for resumed execution.
+    #[serde(skip)]
+    observer: RuntimeObserverHandle,
 }
 
 #[derive(Debug)]
@@ -535,22 +555,51 @@ impl<T: ResourceTracker> Snapshot<T> {
         print: &mut PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
         let ext_result = result.into();
+        let observer = self.observer.clone();
 
         // Restore the VM from the snapshot
-        let mut vm = VM::restore(
-            self.vm_state,
-            &self.executor.module_code,
-            &mut self.heap,
-            &mut self.namespaces,
-            &self.executor.interns,
-            print,
-        );
+        let mut vm = if observer.is_enabled() {
+            VM::restore_with_observer(
+                self.vm_state,
+                &self.executor.module_code,
+                &mut self.heap,
+                &mut self.namespaces,
+                &self.executor.interns,
+                print,
+                observer.clone(),
+            )
+        } else {
+            VM::restore(
+                self.vm_state,
+                &self.executor.module_code,
+                &mut self.heap,
+                &mut self.namespaces,
+                &self.executor.interns,
+                print,
+            )
+        };
 
         // Convert return value or exception before creating VM (to avoid borrow conflicts)
         let vm_result = match ext_result {
-            ExternalResult::Return(obj) => vm.resume(obj),
-            ExternalResult::Error(exc) => vm.resume_with_exception(exc.into()),
+            ExternalResult::Return(obj) => {
+                observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+                    call_id: self.pending_call_id,
+                    kind: ExternalCallReturnKind::Return,
+                }));
+                vm.resume(obj)
+            }
+            ExternalResult::Error(exc) => {
+                observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+                    call_id: self.pending_call_id,
+                    kind: ExternalCallReturnKind::Error,
+                }));
+                vm.resume_with_exception(exc.into())
+            }
             ExternalResult::Future => {
+                observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+                    call_id: self.pending_call_id,
+                    kind: ExternalCallReturnKind::Future,
+                }));
                 // Get the call_id and ext_function_id that were stored when this Snapshot was created
                 let call_id = CallId::new(self.pending_call_id);
 
@@ -570,7 +619,7 @@ impl<T: ResourceTracker> Snapshot<T> {
         let vm_state = vm.check_snapshot(&vm_result);
 
         // Handle the result using the destructured parts
-        handle_vm_result(vm_result, vm_state, self.executor, self.heap, self.namespaces)
+        handle_vm_result(vm_result, vm_state, self.executor, self.heap, self.namespaces, observer)
     }
 
     /// Continues execution by pushing an ExternalFuture instead of a concrete value.
@@ -620,6 +669,9 @@ pub struct FutureSnapshot<T: ResourceTracker> {
     /// The pending call_ids that this snapshot is waiting on.
     /// Used to validate that resume() only receives known call_ids.
     pending_call_ids: Vec<u32>,
+    /// Optional runtime observer handle for resumed execution.
+    #[serde(skip)]
+    observer: RuntimeObserverHandle,
 }
 
 impl<T: ResourceTracker> FutureSnapshot<T> {
@@ -668,6 +720,7 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
             mut heap,
             mut namespaces,
             pending_call_ids,
+            observer,
         } = self;
 
         // Validate that all provided call_ids are in the pending set before restoring VM
@@ -677,14 +730,26 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
             .map(|(call_id, _)| *call_id);
 
         // Restore the VM from the snapshot (must happen before any error return to clean up properly)
-        let mut vm = VM::restore(
-            vm_state,
-            &executor.module_code,
-            &mut heap,
-            &mut namespaces,
-            &executor.interns,
-            print,
-        );
+        let mut vm = if observer.is_enabled() {
+            VM::restore_with_observer(
+                vm_state,
+                &executor.module_code,
+                &mut heap,
+                &mut namespaces,
+                &executor.interns,
+                print,
+                observer.clone(),
+            )
+        } else {
+            VM::restore(
+                vm_state,
+                &executor.module_code,
+                &mut heap,
+                &mut namespaces,
+                &executor.interns,
+                print,
+            )
+        };
 
         // Now check for invalid call_ids after VM is restored
         if let Some(call_id) = invalid_call_id {
@@ -699,13 +764,30 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
         for (call_id, ext_result) in results {
             match ext_result {
                 // Resolve successful futures in the scheduler
-                ExternalResult::Return(obj) => vm.resolve_future(call_id, obj).map_err(|e| {
-                    MontyException::runtime_error(format!("Invalid return type for call {call_id}: {e}"))
-                })?,
+                ExternalResult::Return(obj) => {
+                    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+                        call_id,
+                        kind: ExternalCallReturnKind::Return,
+                    }));
+                    vm.resolve_future(call_id, obj).map_err(|e| {
+                        MontyException::runtime_error(format!("Invalid return type for call {call_id}: {e}"))
+                    })?;
+                }
                 // Fail futures that returned errors
-                ExternalResult::Error(exc) => vm.fail_future(call_id, RunError::from(exc)),
+                ExternalResult::Error(exc) => {
+                    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+                        call_id,
+                        kind: ExternalCallReturnKind::Error,
+                    }));
+                    vm.fail_future(call_id, RunError::from(exc));
+                }
                 // do nothing, same as not returning this id
-                ExternalResult::Future => {}
+                ExternalResult::Future => {
+                    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+                        call_id,
+                        kind: ExternalCallReturnKind::Future,
+                    }));
+                }
             }
         }
 
@@ -749,6 +831,7 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
                     heap,
                     namespaces,
                     pending_call_ids,
+                    observer,
                 }));
             }
         }
@@ -759,7 +842,7 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
         let vm_state = vm.check_snapshot(&result);
 
         // Handle the result using the destructured parts
-        handle_vm_result(result, vm_state, executor, heap, namespaces)
+        handle_vm_result(result, vm_state, executor, heap, namespaces, observer)
     }
 }
 
@@ -772,6 +855,18 @@ struct FunctionCallProgressInput<T: ResourceTracker> {
     vm_state: Option<VMSnapshot>,
     heap: Heap<T>,
     namespaces: Namespaces,
+    observer: RuntimeObserverHandle,
+}
+
+struct OsCallProgressInput<T: ResourceTracker> {
+    function: OsFunction,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    executor: Executor,
+    vm_state: Option<VMSnapshot>,
+    heap: Heap<T>,
+    namespaces: Namespaces,
+    observer: RuntimeObserverHandle,
 }
 
 fn missing_snapshot_error(context: &str) -> MontyException {
@@ -793,10 +888,24 @@ fn build_function_call_progress<T: ResourceTracker>(
         vm_state,
         mut heap,
         namespaces,
+        observer,
     } = input;
 
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
+    let kind = if method_call {
+        ExternalCallKind::Method
+    } else {
+        ExternalCallKind::Function
+    };
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id: pending_call_id,
+            kind,
+            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
+            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
+        },
+    ));
     let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("function call"))?;
     let state = Snapshot {
         executor,
@@ -804,6 +913,7 @@ fn build_function_call_progress<T: ResourceTracker>(
         heap,
         namespaces,
         pending_call_id,
+        observer,
     };
 
     Ok(RunProgress::FunctionCall {
@@ -818,17 +928,28 @@ fn build_function_call_progress<T: ResourceTracker>(
     })
 }
 
-fn build_os_call_progress<T: ResourceTracker>(
-    function: OsFunction,
-    args: crate::args::ArgValues,
-    call_id: CallId,
-    executor: Executor,
-    vm_state: Option<VMSnapshot>,
-    mut heap: Heap<T>,
-    namespaces: Namespaces,
-) -> Result<RunProgress<T>, MontyException> {
+fn build_os_call_progress<T: ResourceTracker>(input: OsCallProgressInput<T>) -> Result<RunProgress<T>, MontyException> {
+    let OsCallProgressInput {
+        function,
+        args,
+        call_id,
+        executor,
+        vm_state,
+        mut heap,
+        namespaces,
+        observer,
+    } = input;
+
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id: pending_call_id,
+            kind: ExternalCallKind::Os,
+            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
+            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
+        },
+    ));
     let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
     let state = Snapshot {
         executor,
@@ -836,6 +957,7 @@ fn build_os_call_progress<T: ResourceTracker>(
         heap,
         namespaces,
         pending_call_id,
+        observer,
     };
 
     Ok(RunProgress::OsCall {
@@ -862,6 +984,7 @@ fn handle_vm_result<T: ResourceTracker>(
     executor: Executor,
     mut heap: Heap<T>,
     mut namespaces: Namespaces,
+    observer: RuntimeObserverHandle,
 ) -> Result<RunProgress<T>, MontyException> {
     match result {
         Ok(FrameExit::Return(value)) => {
@@ -886,13 +1009,23 @@ fn handle_vm_result<T: ResourceTracker>(
                 vm_state,
                 heap,
                 namespaces,
+                observer,
             })
         }
         Ok(FrameExit::OsCall {
             function,
             args,
             call_id,
-        }) => build_os_call_progress(function, args, call_id, executor, vm_state, heap, namespaces),
+        }) => build_os_call_progress(OsCallProgressInput {
+            function,
+            args,
+            call_id,
+            executor,
+            vm_state,
+            heap,
+            namespaces,
+            observer,
+        }),
         Ok(FrameExit::MethodCall {
             method_name,
             args,
@@ -908,6 +1041,7 @@ fn handle_vm_result<T: ResourceTracker>(
                 vm_state,
                 heap,
                 namespaces,
+                observer,
             })
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
@@ -919,6 +1053,7 @@ fn handle_vm_result<T: ResourceTracker>(
                 heap,
                 namespaces,
                 pending_call_ids,
+                observer,
             }))
         }
         Err(err) => {

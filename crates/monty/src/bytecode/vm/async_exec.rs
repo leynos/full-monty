@@ -757,6 +757,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             return Ok(());
         }
         let value = obj.to_value(self.heap, self.interns)?;
+        self.emit_op_result(&value, crate::observer::OpInputIds::none());
 
         // Check if a gather is waiting on this CallId
         if let Some((gather_id, result_idx)) = self.scheduler_mut().take_gather_waiter(call_id) {

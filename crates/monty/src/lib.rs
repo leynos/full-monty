@@ -25,6 +25,7 @@ mod repl;
 mod resource;
 mod run;
 mod run_progress;
+mod runtime_id;
 mod signature;
 mod sorting;
 mod types;
@@ -49,4 +50,5 @@ pub use crate::{
     run_progress::{
         ExtFunctionResult, FunctionCall, NameLookup, NameLookupResult, OsCall, ResolveFutures, RunProgress,
     },
+    runtime_id::RuntimeValueId,
 };

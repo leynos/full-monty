@@ -19,8 +19,11 @@ use crate::{
     os::OsFunction,
     resource::ResourceTracker,
     run::Executor,
+    runtime_id::RuntimeValueId,
     value::Value,
 };
+
+type RuntimeIdSlices<'a> = (&'a [RuntimeValueId], &'a [(RuntimeValueId, RuntimeValueId)]);
 
 // ---------------------------------------------------------------------------
 // RunProgress enum
@@ -95,6 +98,16 @@ impl<T: ResourceTracker> RunProgress<T> {
             _ => None,
         }
     }
+
+    /// Returns runtime-ID slices for suspendable call variants.
+    #[must_use]
+    pub fn runtime_ids(&self) -> Option<RuntimeIdSlices<'_>> {
+        match self {
+            Self::FunctionCall(call) => Some((&call.arg_runtime_ids, &call.kwarg_runtime_ids)),
+            Self::OsCall(call) => Some((&call.arg_runtime_ids, &call.kwarg_runtime_ids)),
+            _ => None,
+        }
+    }
 }
 
 impl<T: ResourceTracker + serde::Serialize> RunProgress<T> {
@@ -141,6 +154,10 @@ pub struct FunctionCall<T: ResourceTracker> {
     pub args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (key, value pairs).
     pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// Stable runtime IDs for positional arguments.
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs.
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Whether this is a dataclass method call (first arg is `self`).
@@ -150,25 +167,6 @@ pub struct FunctionCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> FunctionCall<T> {
-    /// Creates a new `FunctionCall` from its parts.
-    fn new(
-        function_name: String,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
-        call_id: u32,
-        method_call: bool,
-        snapshot: Snapshot<T>,
-    ) -> Self {
-        Self {
-            function_name,
-            args,
-            kwargs,
-            call_id,
-            method_call,
-            snapshot,
-        }
-    }
-
     /// Returns a mutable reference to the resource tracker.
     ///
     /// This allows modifying resource limits between execution phases,
@@ -227,6 +225,10 @@ pub struct OsCall<T: ResourceTracker> {
     pub args: Vec<MontyObject>,
     /// The keyword arguments passed to the function (key, value pairs).
     pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// Stable runtime IDs for positional arguments.
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs.
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Internal execution snapshot.
@@ -234,23 +236,6 @@ pub struct OsCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> OsCall<T> {
-    /// Creates a new `OsCall` from its parts.
-    fn new(
-        function: OsFunction,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
-        call_id: u32,
-        snapshot: Snapshot<T>,
-    ) -> Self {
-        Self {
-            function,
-            args,
-            kwargs,
-            call_id,
-            snapshot,
-        }
-    }
-
     /// Resumes execution with the OS call result.
     ///
     /// # Arguments
@@ -634,6 +619,8 @@ pub(crate) enum ConvertedExit {
         function_name: String,
         args: Vec<MontyObject>,
         kwargs: Vec<(MontyObject, MontyObject)>,
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
         call_id: u32,
         method_call: bool,
     },
@@ -642,6 +629,8 @@ pub(crate) enum ConvertedExit {
         function: OsFunction,
         args: Vec<MontyObject>,
         kwargs: Vec<(MontyObject, MontyObject)>,
+        arg_runtime_ids: Vec<RuntimeValueId>,
+        kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
         call_id: u32,
     },
     /// All async tasks are blocked waiting for external futures.
@@ -680,11 +669,13 @@ pub(crate) fn convert_frame_exit(
             ..
         }) => {
             let name = function_name.into_string(vm.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let host_args = args.into_py_objects_with_runtime_ids(vm);
             ConvertedExit::FunctionCall {
                 function_name: name,
-                args: args_py,
-                kwargs: kwargs_py,
+                args: host_args.args,
+                kwargs: host_args.kwargs,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: false,
             }
@@ -694,11 +685,13 @@ pub(crate) fn convert_frame_exit(
             args,
             call_id,
         }) => {
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let host_args = args.into_py_objects_with_runtime_ids(vm);
             ConvertedExit::OsCall {
                 function,
-                args: args_py,
-                kwargs: kwargs_py,
+                args: host_args.args,
+                kwargs: host_args.kwargs,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
             }
         }
@@ -708,11 +701,13 @@ pub(crate) fn convert_frame_exit(
             call_id,
         }) => {
             let name = method_name.into_string(vm.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let host_args = args.into_py_objects_with_runtime_ids(vm);
             ConvertedExit::FunctionCall {
                 function_name: name,
-                args: args_py,
-                kwargs: kwargs_py,
+                args: host_args.args,
+                kwargs: host_args.kwargs,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
                 call_id: call_id.raw(),
                 method_call: true,
             }
@@ -778,28 +773,36 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             function_name,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             method_call,
-        } => Ok(RunProgress::FunctionCall(FunctionCall::new(
+        } => Ok(RunProgress::FunctionCall(FunctionCall {
             function_name,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
             method_call,
-            new_snapshot!(),
-        ))),
+            snapshot: new_snapshot!(),
+        })),
         ConvertedExit::OsCall {
             function,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
-        } => Ok(RunProgress::OsCall(OsCall::new(
+        } => Ok(RunProgress::OsCall(OsCall {
             function,
             args,
             kwargs,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             call_id,
-            new_snapshot!(),
-        ))),
+            snapshot: new_snapshot!(),
+        })),
         ConvertedExit::ResolveFutures(pending_call_ids) => Ok(RunProgress::ResolveFutures(ResolveFutures::new(
             executor,
             vm_state.expect("snapshot should exist for ResolveFutures"),

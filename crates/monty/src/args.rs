@@ -1,3 +1,11 @@
+//! Argument containers and helpers for Monty runtime calls.
+//!
+//! This module converts between parser/runtime argument forms (`ExprLoc`,
+//! `Identifier`, `Value`) and host-facing forms (`MontyObject`) while
+//! preserving reference-count and resource-tracking behaviour
+//! (`ResourceTracker`). It also provides parsing/validation utilities that
+//! surface `ParseError` for malformed argument syntax.
+
 use std::vec::IntoIter;
 
 use crate::{
@@ -9,6 +17,7 @@ use crate::{
     heap::{ContainsHeap, DropWithHeap, Heap, HeapGuard},
     intern::{Interns, StringId},
     parse::ParseError,
+    runtime_id::RuntimeValueId,
     types::{Dict, dict::DictIntoIter},
     value::Value,
 };
@@ -27,6 +36,13 @@ pub(crate) enum ArgValues {
     ArgsKargs { args: Vec<Value>, kwargs: KwargsValues },
 }
 
+/// Host-facing external call arguments plus stable runtime IDs.
+pub(crate) struct HostCallArgs {
+    pub args: Vec<MontyObject>,
+    pub kwargs: Vec<(MontyObject, MontyObject)>,
+    pub arg_runtime_ids: Vec<RuntimeValueId>,
+    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+}
 impl ArgValues {
     /// Checks that zero arguments were passed.
     ///
@@ -264,22 +280,50 @@ impl ArgValues {
         ExcType::type_error_no_kwargs(method_name)
     }
 
-    /// Converts the arguments into a Vec of MontyObjects.
+    /// Converts arguments into host values and their runtime IDs.
     ///
-    /// This is used when passing arguments to external functions.
-    pub fn into_py_objects(
-        self,
-        vm: &mut VM<'_, '_, impl ResourceTracker>,
-    ) -> (Vec<MontyObject>, Vec<(MontyObject, MontyObject)>) {
+    /// The runtime IDs are host-facing instrumentation metadata used to track
+    /// value identity continuity across suspend/resume and snapshot boundaries.
+    pub fn into_py_objects_with_runtime_ids(self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> HostCallArgs {
         match self {
-            Self::Empty => (vec![], vec![]),
-            Self::One(a) => (vec![MontyObject::new(a, vm)], vec![]),
-            Self::Two(a1, a2) => (vec![MontyObject::new(a1, vm), MontyObject::new(a2, vm)], vec![]),
-            Self::Kwargs(kwargs) => (vec![], kwargs.into_py_objects(vm)),
-            Self::ArgsKargs { args, kwargs } => (
-                args.into_iter().map(|v| MontyObject::new(v, vm)).collect(),
-                kwargs.into_py_objects(vm),
-            ),
+            Self::Empty => HostCallArgs::empty(),
+            Self::One(a) => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a], vm);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
+            }
+            Self::Two(a1, a2) => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids([a1, a2], vm);
+                HostCallArgs {
+                    args,
+                    kwargs: vec![],
+                    arg_runtime_ids,
+                    kwarg_runtime_ids: vec![],
+                }
+            }
+            Self::Kwargs(kwargs) => {
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(vm);
+                HostCallArgs {
+                    args: vec![],
+                    kwargs,
+                    arg_runtime_ids: vec![],
+                    kwarg_runtime_ids,
+                }
+            }
+            Self::ArgsKargs { args, kwargs } => {
+                let (args, arg_runtime_ids) = build_args_with_runtime_ids(args, vm);
+                let (kwargs, kwarg_runtime_ids) = kwargs.into_py_objects_with_runtime_ids(vm);
+                HostCallArgs {
+                    args,
+                    kwargs,
+                    arg_runtime_ids,
+                    kwarg_runtime_ids,
+                }
+            }
         }
     }
 
@@ -420,24 +464,18 @@ impl KwargsValues {
         self.len() == 0
     }
 
-    /// Converts the arguments into a Vec of MontyObjects.
-    ///
-    /// This is used when passing arguments to external functions.
-    fn into_py_objects(self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> Vec<(MontyObject, MontyObject)> {
+    /// Converts kwargs into host values and runtime IDs.
+    fn into_py_objects_with_runtime_ids(
+        self,
+        vm: &mut VM<'_, '_, impl ResourceTracker>,
+    ) -> (Vec<HostKwarg>, Vec<HostKwargRuntimeIds>) {
         match self {
-            Self::Empty => vec![],
+            Self::Empty => (vec![], vec![]),
             Self::Inline(kvs) => kvs
                 .into_iter()
-                .map(|(k, v)| {
-                    let key = MontyObject::String(vm.interns.get_str(k).to_owned());
-                    let value = MontyObject::new(v, vm);
-                    (key, value)
-                })
-                .collect(),
-            Self::Dict(dict) => dict
-                .into_iter()
-                .map(|(k, v)| (MontyObject::new(k, vm), MontyObject::new(v, vm)))
-                .collect(),
+                .map(|(k, v)| build_kwarg_pair(Value::InternString(k), v, vm))
+                .unzip(),
+            Self::Dict(dict) => dict.into_iter().map(|(k, v)| build_kwarg_pair(k, v, vm)).unzip(),
         }
     }
 
@@ -487,6 +525,20 @@ impl IntoIterator for KwargsValues {
             Self::Dict(dict) => KwargsValuesIter::Dict(dict.into_iter()),
         }
     }
+}
+
+fn build_args_with_runtime_ids(
+    values: impl IntoIterator<Item = Value>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> (Vec<MontyObject>, Vec<RuntimeValueId>) {
+    values
+        .into_iter()
+        .map(|value| {
+            let runtime_id = runtime_value_id(&value);
+            let py_object = MontyObject::new(value, vm);
+            (py_object, runtime_id)
+        })
+        .unzip()
 }
 
 /// Iterator over keyword argument (key, value) pairs.
@@ -731,3 +783,37 @@ impl ArgExprs {
         Ok(())
     }
 }
+
+fn build_kwarg_pair(
+    key: Value,
+    value: Value,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> ((MontyObject, MontyObject), (RuntimeValueId, RuntimeValueId)) {
+    let key_runtime_id = runtime_value_id(&key);
+    let value_runtime_id = runtime_value_id(&value);
+    let key_py = MontyObject::new(key, vm);
+    let value_py = MontyObject::new(value, vm);
+    ((key_py, value_py), (key_runtime_id, value_runtime_id))
+}
+
+impl HostCallArgs {
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            args: vec![],
+            kwargs: vec![],
+            arg_runtime_ids: vec![],
+            kwarg_runtime_ids: vec![],
+        }
+    }
+}
+
+fn runtime_value_id(value: &Value) -> RuntimeValueId {
+    let runtime_id = RuntimeValueId::new(value.id());
+    debug_assert_eq!(runtime_id.raw(), value.id());
+    runtime_id
+}
+
+type HostKwarg = (MontyObject, MontyObject);
+
+type HostKwargRuntimeIds = (RuntimeValueId, RuntimeValueId);

@@ -315,6 +315,14 @@ class FunctionSnapshot:
     def call_id(self) -> int:
         """The unique identifier for this external function call."""
 
+    @property
+    def arg_runtime_ids(self) -> list[int]:
+        """Stable runtime IDs for positional arguments in `args` order."""
+
+    @property
+    def kwarg_runtime_ids(self) -> list[tuple[int, int]]:
+        """Stable runtime IDs for keyword argument `(key, value)` pairs in `kwargs` order."""
+
     @overload
     def resume(self, *, return_value: Any) -> FunctionSnapshot | NameLookupSnapshot | FutureSnapshot | MontyComplete:
         """Resume execution with a return value from the external function.
@@ -362,7 +370,7 @@ class FunctionSnapshot:
         """
         Serialize the FunctionSnapshot instance to a binary format.
 
-        The serialized data can be restored with `load_snapshot()` or `load_repl_snapshot()`.
+        The serialized data can be restored with `FunctionSnapshot.load()` or `load_repl_snapshot()`.
         This allows suspending execution and resuming later, potentially in a different process.
 
         Note: The `print_callback` is not serialized and must be re-provided via
@@ -374,6 +382,32 @@ class FunctionSnapshot:
         Raises:
             ValueError: If serialization fails.
             RuntimeError: If the progress has already been resumed.
+        """
+
+    @staticmethod
+    def load(
+        data: bytes,
+        *,
+        print_callback: Callable[[Literal['stdout'], str], None] | None = None,
+        dataclass_registry: list[type] | None = None,
+    ) -> FunctionSnapshot:
+        """
+        Deserialize a FunctionSnapshot instance from binary format.
+
+        Note: The `print_callback` is not preserved during serialization and must be
+        re-provided as a keyword argument if print output is needed.
+
+        Arguments:
+            data: The serialized FunctionSnapshot data from `dump()`
+            print_callback: Optional callback for print output
+            dataclass_registry: Optional list of dataclass types to register for proper
+                isinstance() support on output, see `register_dataclass()` above.
+
+        Returns:
+            A new FunctionSnapshot instance.
+
+        Raises:
+            ValueError: If deserialization fails.
         """
 
     def __repr__(self) -> str: ...

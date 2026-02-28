@@ -8,7 +8,7 @@ use std::{
 use ::monty::{
     ExtFunctionResult, FunctionCall, LimitedTracker, MontyException, MontyObject, MontyRun, NameLookupResult,
     NoLimitTracker, OsCall, PrintWriter, PrintWriterCallback, ReplFunctionCall, ReplNameLookup, ReplOsCall,
-    ReplProgress, ReplResolveFutures, ReplStartError, ResolveFutures, ResourceTracker, RunProgress,
+    ReplProgress, ReplResolveFutures, ReplStartError, ResolveFutures, ResourceTracker, RunProgress, RuntimeValueId,
 };
 use monty::{ExcType, NameLookup};
 use monty_type_checking::{SourceFile, type_check};
@@ -690,6 +690,46 @@ pub struct PyFunctionSnapshot {
     /// The unique identifier for this call
     #[pyo3(get)]
     pub call_id: u32,
+    /// Stable runtime IDs for positional args in `args` order.
+    #[pyo3(get)]
+    pub arg_runtime_ids: Vec<usize>,
+    /// Stable runtime IDs for keyword `(key, value)` pairs in `kwargs` order.
+    #[pyo3(get)]
+    pub kwarg_runtime_ids: Vec<(usize, usize)>,
+}
+
+/// Converts runtime-id wrappers to raw stable IDs for Python-facing snapshots.
+fn map_runtime_ids(
+    arg_ids: &[RuntimeValueId],
+    kwarg_ids: &[(RuntimeValueId, RuntimeValueId)],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    (
+        arg_ids.iter().map(|id| id.raw()).collect(),
+        kwarg_ids.iter().map(|(key, value)| (key.raw(), value.raw())).collect(),
+    )
+}
+
+/// Extracts runtime IDs from any function-snapshot variant.
+fn snapshot_runtime_ids(snapshot: &EitherFunctionSnapshot) -> (Vec<usize>, Vec<(usize, usize)>) {
+    match snapshot {
+        EitherFunctionSnapshot::NoLimitFn(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::NoLimitOs(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::LimitedFn(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::LimitedOs(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
+        EitherFunctionSnapshot::ReplNoLimitFn(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::ReplNoLimitOs(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::ReplLimitedFn(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::ReplLimitedOs(call, _) => {
+            map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids)
+        }
+        EitherFunctionSnapshot::Done => (Vec::new(), Vec::new()),
+    }
 }
 
 impl PyFunctionSnapshot {
@@ -710,6 +750,7 @@ impl PyFunctionSnapshot {
         let function_name = call.function_name.clone();
         let call_id = call.call_id;
         let method_call = call.method_call;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let items: PyResult<Vec<Py<PyAny>>> = call
             .args
             .iter()
@@ -730,6 +771,8 @@ impl PyFunctionSnapshot {
             args: PyTuple::new(py, items?)?.unbind(),
             kwargs: dict.unbind(),
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
         };
         slf.into_bound_py_any(py)
@@ -751,6 +794,7 @@ impl PyFunctionSnapshot {
     {
         let function_name = call.function.to_string();
         let call_id = call.call_id;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let items: PyResult<Vec<Py<PyAny>>> = call
             .args
             .iter()
@@ -771,6 +815,8 @@ impl PyFunctionSnapshot {
             args: PyTuple::new(py, items?)?.unbind(),
             kwargs: dict.unbind(),
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
         };
         slf.into_bound_py_any(py)
@@ -791,6 +837,7 @@ impl PyFunctionSnapshot {
         let function_name = call.function_name.clone();
         let call_id = call.call_id;
         let method_call = call.method_call;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let items: PyResult<Vec<Py<PyAny>>> = call
             .args
             .iter()
@@ -811,6 +858,8 @@ impl PyFunctionSnapshot {
             args: PyTuple::new(py, items?)?.unbind(),
             kwargs: dict.unbind(),
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
         };
         slf.into_bound_py_any(py)
@@ -830,6 +879,7 @@ impl PyFunctionSnapshot {
     {
         let function_name = call.function.to_string();
         let call_id = call.call_id;
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let items: PyResult<Vec<Py<PyAny>>> = call
             .args
             .iter()
@@ -850,6 +900,8 @@ impl PyFunctionSnapshot {
             args: PyTuple::new(py, items?)?.unbind(),
             kwargs: dict.unbind(),
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
             dc_registry,
         };
         slf.into_bound_py_any(py)
@@ -872,6 +924,7 @@ impl PyFunctionSnapshot {
         kwargs: Py<PyDict>,
         call_id: u32,
     ) -> PyResult<Bound<'_, PyAny>> {
+        let (arg_runtime_ids, kwarg_runtime_ids) = snapshot_runtime_ids(&snapshot);
         let slf = Self {
             snapshot: Mutex::new(snapshot),
             print_callback,
@@ -883,6 +936,8 @@ impl PyFunctionSnapshot {
             args,
             kwargs,
             call_id,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
         };
         slf.into_bound_py_any(py)
     }
@@ -980,7 +1035,7 @@ impl PyFunctionSnapshot {
 
     /// Serializes the FunctionSnapshot instance to a binary format.
     ///
-    /// The serialized data can be stored and later restored with `load_snapshot()`
+    /// The serialized data can be stored and later restored with `FunctionSnapshot.load()`
     /// or `load_repl_snapshot()`. REPL snapshots automatically include the REPL state.
     ///
     /// Note: The `print_callback` is not serialized and must be re-provided when loading.
@@ -1005,6 +1060,25 @@ impl PyFunctionSnapshot {
             &self.dc_registry,
         )?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Deserializes a `FunctionSnapshot` instance from binary format.
+    ///
+    /// Note: The `print_callback` is not preserved during serialization and must be
+    /// re-provided as a keyword argument if print output is needed.
+    #[staticmethod]
+    #[pyo3(signature = (data, *, print_callback=None, dataclass_registry=None))]
+    fn load<'py>(
+        py: Python<'py>,
+        data: &Bound<'_, PyBytes>,
+        print_callback: Option<Py<PyAny>>,
+        dataclass_registry: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let snapshot = crate::serialization::load_snapshot(py, data, print_callback, dataclass_registry)?;
+        snapshot
+            .extract::<PyRef<'_, Self>>()
+            .map_err(|_| PyValueError::new_err("Serialized data does not contain a FunctionSnapshot"))?;
+        Ok(snapshot)
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {

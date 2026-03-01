@@ -8,6 +8,10 @@ else
 PYO3_PYTHON_DEFAULT := $(CURDIR)/.venv/bin/python3
 endif
 
+ifeq ($(strip $(PYO3_PYTHON_DEFAULT)),)
+$(error python3 not found on PATH and $(CURDIR)/.venv/bin/python3 is missing)
+endif
+
 .PHONY: .cargo
 .cargo: ## Check that cargo is installed
 	@cargo --version || echo 'Please install cargo: https://github.com/rust-lang/cargo'

@@ -16,6 +16,7 @@ use crate::{
     exception_private::{ExcType, RunError, SimpleException},
     heap::{HeapData, HeapGuard, HeapId},
     intern::FunctionId,
+    observer::OpInputIds,
     resource::ResourceTracker,
     types::{List, PyTrait},
     value::Value,
@@ -465,7 +466,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                     self.scheduler_mut().set_current_task(Some(waiter_id));
                     self.load_or_init_task(waiter_id)?;
                     // Push the result onto the waiter's stack
-                    self.push(Value::Ref(list_id));
+                    self.push_created(Value::Ref(list_id));
                     return Ok(AwaitResult::FramePushed);
                 }
 
@@ -757,7 +758,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             return Ok(());
         }
         let value = obj.to_value(self.heap, self.interns)?;
-        self.emit_op_result(&value, crate::observer::OpInputIds::none());
+        self.emit_op_result(&value, OpInputIds::none());
 
         // Check if a gather is waiting on this CallId
         if let Some((gather_id, result_idx)) = self.scheduler_mut().take_gather_waiter(call_id) {

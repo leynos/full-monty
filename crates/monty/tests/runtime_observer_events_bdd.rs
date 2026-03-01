@@ -9,6 +9,7 @@ use monty::{
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
 
+/// Test-friendly observer event projection used by BDD steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedEvent {
     ExternalCallRequested { call_id: u32, kind: ExternalCallKind },
@@ -42,6 +43,7 @@ impl RecordedEvent {
     }
 }
 
+/// Observer that records events into a shared `Arc<Mutex<Vec<RecordedEvent>>>` buffer.
 #[derive(Clone)]
 struct RecordingObserver {
     events: Arc<Mutex<Vec<RecordedEvent>>>,
@@ -64,6 +66,10 @@ impl RuntimeObserver for RecordingObserver {
     }
 }
 
+/// Shared mutable world state for runtime-observer BDD scenarios.
+///
+/// The world stores the current script under test, the captured event stream,
+/// and the latest host-visible `call_id` for request/return assertions.
 #[derive(Default)]
 struct RuntimeObserverWorld {
     script: String,
@@ -71,34 +77,66 @@ struct RuntimeObserverWorld {
     call_id: Option<u32>,
 }
 
+#[derive(Debug)]
+struct RecordingRunFixture {
+    events: Arc<Mutex<Vec<RecordedEvent>>>,
+    observer: RuntimeObserverHandle,
+    progress: RunProgress<NoLimitTracker>,
+}
+
+/// Fixture that creates a fresh world per BDD scenario.
 #[fixture]
 fn world() -> RuntimeObserverWorld {
     RuntimeObserverWorld::default()
 }
 
+/// Fixture that provides a recording observer and shared event storage.
+#[fixture]
+fn recording_observer_fixture() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observer = RuntimeObserverHandle::new(RecordingObserver::new(Arc::clone(&events)));
+    (observer, events)
+}
+
+/// Starts a run with a recording observer and returns progress plus event handles.
+fn recording_start_with_observer(
+    script: String,
+    input_names: Vec<String>,
+    external_functions: Vec<String>,
+    inputs: Vec<MontyObject>,
+) -> RecordingRunFixture {
+    let (observer, events) = recording_observer_fixture();
+    let run =
+        MontyRun::new(script, "test.py", input_names, external_functions).expect("runner creation should succeed");
+    let progress = run
+        .start_with_observer(inputs, NoLimitTracker, &mut PrintWriter::Stdout, observer.clone())
+        .expect("start_with_observer should succeed");
+
+    RecordingRunFixture {
+        events,
+        observer,
+        progress,
+    }
+}
+
+/// Provides a script that pauses at one external call.
 #[given("a suspendable script with one external function call")]
 fn given_external_function_script(world: &mut RuntimeObserverWorld) {
     "ext_fn(1)".clone_into(&mut world.script);
 }
 
+/// Provides a script that emits branch-control and operation-result events.
 #[given("a script with arithmetic and branch control flow")]
 fn given_branching_script(world: &mut RuntimeObserverWorld) {
     "if x > 0:\n    y = x + 2\nelse:\n    y = x - 2\ny".clone_into(&mut world.script);
 }
 
+/// Starts execution with an observer and resumes with a concrete return value.
 #[when("execution starts with a recording observer and resumes with integer return value")]
 fn when_start_and_resume_with_return(world: &mut RuntimeObserverWorld) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let observer = RuntimeObserverHandle::new(RecordingObserver::new(Arc::clone(&events)));
+    let fixture = recording_start_with_observer(world.script.clone(), vec![], vec!["ext_fn".to_owned()], vec![]);
 
-    let run = MontyRun::new(world.script.clone(), "test.py", vec![], vec!["ext_fn".to_owned()])
-        .expect("runner creation should succeed");
-
-    let progress = run
-        .start_with_observer(vec![], NoLimitTracker, &mut PrintWriter::Stdout, observer)
-        .expect("start should pause at external call");
-
-    let RunProgress::FunctionCall { call_id, state, .. } = progress else {
+    let RunProgress::FunctionCall { call_id, state, .. } = fixture.progress else {
         panic!("expected function call progress");
     };
 
@@ -109,48 +147,36 @@ fn when_start_and_resume_with_return(world: &mut RuntimeObserverWorld) {
         .expect("resume should complete");
     assert!(matches!(completion, RunProgress::Complete(MontyObject::Int(9))));
 
+    drop(fixture.observer);
     world
         .events
-        .clone_from(&events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
 }
 
+/// Starts execution with an observer and runs a branch snippet to completion.
 #[when("execution starts with a recording observer and runs to completion")]
 fn when_start_and_complete(world: &mut RuntimeObserverWorld) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let observer = RuntimeObserverHandle::new(RecordingObserver::new(Arc::clone(&events)));
+    let fixture = recording_start_with_observer(
+        world.script.clone(),
+        vec!["x".to_owned()],
+        vec![],
+        vec![MontyObject::Int(1)],
+    );
 
-    let run = MontyRun::new(world.script.clone(), "test.py", vec!["x".to_owned()], vec![])
-        .expect("runner creation should succeed");
+    assert!(matches!(fixture.progress, RunProgress::Complete(MontyObject::Int(3))));
 
-    let progress = run
-        .start_with_observer(
-            vec![MontyObject::Int(1)],
-            NoLimitTracker,
-            &mut PrintWriter::Stdout,
-            observer,
-        )
-        .expect("start should complete");
-
-    assert!(matches!(progress, RunProgress::Complete(MontyObject::Int(3))));
-
+    drop(fixture.observer);
     world
         .events
-        .clone_from(&events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
 }
 
+/// Starts execution with an observer and resumes with an external exception.
 #[when("execution starts with a recording observer and resumes with raised exception")]
 fn when_start_and_resume_with_exception(world: &mut RuntimeObserverWorld) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let observer = RuntimeObserverHandle::new(RecordingObserver::new(Arc::clone(&events)));
+    let fixture = recording_start_with_observer(world.script.clone(), vec![], vec!["ext_fn".to_owned()], vec![]);
 
-    let run = MontyRun::new(world.script.clone(), "test.py", vec![], vec!["ext_fn".to_owned()])
-        .expect("runner creation should succeed");
-
-    let progress = run
-        .start_with_observer(vec![], NoLimitTracker, &mut PrintWriter::Stdout, observer)
-        .expect("start should pause at external call");
-
-    let RunProgress::FunctionCall { call_id, state, .. } = progress else {
+    let RunProgress::FunctionCall { call_id, state, .. } = fixture.progress else {
         panic!("expected function call progress");
     };
 
@@ -164,11 +190,13 @@ fn when_start_and_resume_with_exception(world: &mut RuntimeObserverWorld) {
         .expect_err("resume should return an error");
     assert!(error.to_string().contains("bdd failure"));
 
+    drop(fixture.observer);
     world
         .events
-        .clone_from(&events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
 }
 
+/// Asserts that an external function request event exists for the recorded call.
 #[then("observer events include an external function request")]
 fn then_has_external_request(world: &RuntimeObserverWorld) {
     let Some(call_id) = world.call_id else {
@@ -186,6 +214,7 @@ fn then_has_external_request(world: &RuntimeObserverWorld) {
     }));
 }
 
+/// Asserts that a successful external return event exists for the recorded call.
 #[then("observer events include an external function return")]
 fn then_has_external_return(world: &RuntimeObserverWorld) {
     let Some(call_id) = world.call_id else {
@@ -203,6 +232,7 @@ fn then_has_external_return(world: &RuntimeObserverWorld) {
     }));
 }
 
+/// Asserts that an external error return event exists for the recorded call.
 #[then("observer events include an external error return")]
 fn then_has_external_error_return(world: &RuntimeObserverWorld) {
     let Some(call_id) = world.call_id else {
@@ -220,6 +250,7 @@ fn then_has_external_error_return(world: &RuntimeObserverWorld) {
     }));
 }
 
+/// Asserts that at least one control-condition event was emitted.
 #[then("observer events include a control condition event")]
 fn then_has_control_condition(world: &RuntimeObserverWorld) {
     assert!(
@@ -230,6 +261,7 @@ fn then_has_control_condition(world: &RuntimeObserverWorld) {
     );
 }
 
+/// Asserts that at least one operation-result event had tracked inputs.
 #[then("observer events include an operation-result event with inputs")]
 fn then_has_op_result_with_inputs(world: &RuntimeObserverWorld) {
     assert!(world.events.iter().any(|event| {
@@ -242,6 +274,7 @@ fn then_has_op_result_with_inputs(world: &RuntimeObserverWorld) {
     }));
 }
 
+/// Scenario: external function calls emit request and return observer events.
 #[scenario(
     path = "tests/features/runtime_observer_events.feature",
     name = "Function call emits request and return events"
@@ -250,6 +283,7 @@ fn function_call_emits_request_and_return(world: RuntimeObserverWorld) {
     drop(world);
 }
 
+/// Scenario: branching code emits control-condition and op-result observer events.
 #[scenario(
     path = "tests/features/runtime_observer_events.feature",
     name = "Branching code emits control and operation-result events"
@@ -258,6 +292,7 @@ fn branching_code_emits_control_and_operation_result(world: RuntimeObserverWorld
     drop(world);
 }
 
+/// Scenario: failed external calls emit error return observer events.
 #[scenario(
     path = "tests/features/runtime_observer_events.feature",
     name = "Failed external call emits error return event"

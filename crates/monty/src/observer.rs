@@ -160,7 +160,7 @@ impl RuntimeObserverHandle {
 
     /// Wraps an existing shared observer.
     #[must_use]
-    pub fn from_shared(observer: SharedRuntimeObserver) -> Self {
+    pub fn from_shared(observer: Arc<Mutex<dyn RuntimeObserver>>) -> Self {
         Self { inner: Some(observer) }
     }
 

@@ -11,6 +11,7 @@ mod collections;
 mod compare;
 mod exceptions;
 mod format;
+mod observer_hooks;
 mod scheduler;
 
 use std::cmp::Ordering;
@@ -29,10 +30,7 @@ use crate::{
     io::PrintWriter,
     modules::BuiltinModule,
     namespace::{GLOBAL_NS_IDX, NamespaceId, Namespaces},
-    observer::{
-        ControlConditionEvent, OpInputIds, OpResultEvent, RuntimeObserverEvent, RuntimeObserverHandle,
-        ValueCreatedEvent,
-    },
+    observer::{OpInputIds, RuntimeObserverHandle},
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
@@ -545,109 +543,6 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         )
     }
 
-    /// Creates a new VM with an optional runtime observer.
-    pub fn new_with_observer(
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
-        observer: RuntimeObserverHandle,
-    ) -> Self {
-        Self {
-            stack: Vec::with_capacity(64),
-            frames: Vec::with_capacity(16),
-            heap,
-            namespaces,
-            interns,
-            print_writer,
-            exception_stack: Vec::new(),
-            instruction_ip: 0,
-            next_call_id: 0,
-            scheduler: None, // Lazy - no allocation for sync code
-            module_code: None,
-            observer,
-        }
-    }
-
-    /// Reconstructs a VM from a snapshot.
-    ///
-    /// The heap and namespaces must already be deserialized. `FunctionId` values
-    /// in frames are used to look up pre-compiled `Code` objects from the `Interns`.
-    /// The `module_code` is used for frames with `function_id = None`.
-    ///
-    /// # Arguments
-    /// * `snapshot` - The VM snapshot to restore
-    /// * `module_code` - Compiled module code (for frames with function_id = None)
-    /// * `heap` - The deserialized heap
-    /// * `namespaces` - The deserialized namespaces
-    /// * `interns` - Interns for looking up function code
-    /// * `print_writer` - Writer for print output
-    pub fn restore(
-        snapshot: VMSnapshot,
-        module_code: &'a Code,
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
-    ) -> Self {
-        Self::restore_with_observer(
-            snapshot,
-            module_code,
-            heap,
-            namespaces,
-            interns,
-            print_writer,
-            RuntimeObserverHandle::disabled(),
-        )
-    }
-
-    /// Reconstructs a VM from a snapshot with an optional runtime observer.
-    pub fn restore_with_observer(
-        snapshot: VMSnapshot,
-        module_code: &'a Code,
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
-        observer: RuntimeObserverHandle,
-    ) -> Self {
-        // Reconstruct call frames from serialized form
-        let frames = snapshot
-            .frames
-            .into_iter()
-            .map(|sf| {
-                let code = match sf.function_id {
-                    Some(func_id) => &interns.get_function(func_id).code,
-                    None => module_code,
-                };
-                CallFrame {
-                    code,
-                    ip: sf.ip,
-                    stack_base: sf.stack_base,
-                    namespace_idx: sf.namespace_idx,
-                    function_id: sf.function_id,
-                    cells: sf.cells,
-                    call_position: sf.call_position,
-                    should_return: false,
-                }
-            })
-            .collect();
-
-        Self {
-            stack: snapshot.stack,
-            frames,
-            heap,
-            namespaces,
-            interns,
-            print_writer,
-            exception_stack: snapshot.exception_stack,
-            instruction_ip: snapshot.instruction_ip,
-            next_call_id: snapshot.next_call_id,
-            scheduler: snapshot.scheduler,
-            module_code: Some(module_code),
-            observer,
-        }
-    }
     /// Consumes the VM and creates a snapshot for pause/resume if needed.
     pub fn check_snapshot(mut self, result: &RunResult<FrameExit>) -> Option<VMSnapshot> {
         if matches!(
@@ -836,19 +731,19 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     if let Value::InternLongInt(long_int_id) = value {
                         let bi = self.interns.get_long_int(*long_int_id).clone();
                         match LongInt::new(bi).into_value(self.heap) {
-                            Ok(v) => self.push(v),
+                            Ok(v) => self.push_created(v),
                             Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
                         }
                     } else {
                         self.push(value.clone_with_heap(self.heap));
                     }
                 }
-                Opcode::LoadNone => self.push(Value::None),
-                Opcode::LoadTrue => self.push(Value::Bool(true)),
-                Opcode::LoadFalse => self.push(Value::Bool(false)),
+                Opcode::LoadNone => self.push_created(Value::None),
+                Opcode::LoadTrue => self.push_created(Value::Bool(true)),
+                Opcode::LoadFalse => self.push_created(Value::Bool(false)),
                 Opcode::LoadSmallInt => {
                     let n = fetch_i8!(cached_frame);
-                    self.push(Value::Int(i64::from(n)));
+                    self.push_created(Value::Int(i64::from(n)));
                 }
                 // Variables - Specialized Local Loads (no operand)
                 Opcode::LoadLocal0 => try_catch_sync!(self, cached_frame, self.load_local(&cached_frame, 0)),
@@ -937,7 +832,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     let output = Value::Bool(result);
                     self.emit_unary_op_result(input_id, &output);
                     value.drop_with_heap(self.heap);
-                    self.push(output);
+                    self.push_created(output);
                 }
                 Opcode::UnaryNeg => {
                     // Unary minus - negate numeric value
@@ -949,14 +844,14 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                             if let Some(negated) = n.checked_neg() {
                                 let output = Value::Int(negated);
                                 self.emit_unary_op_result(input_id, &output);
-                                self.push(output);
+                                self.push_created(output);
                             } else {
                                 // i64::MIN negated overflows to LongInt
                                 let li = -LongInt::from(n);
                                 match li.into_value(self.heap) {
                                     Ok(v) => {
                                         self.emit_unary_op_result(input_id, &v);
-                                        self.push(v);
+                                        self.push_created(v);
                                     }
                                     Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
                                 }
@@ -965,12 +860,12 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         Value::Float(f) => {
                             let output = Value::Float(-f);
                             self.emit_unary_op_result(input_id, &output);
-                            self.push(output);
+                            self.push_created(output);
                         }
                         Value::Bool(b) => {
                             let output = Value::Int(if b { -1 } else { 0 });
                             self.emit_unary_op_result(input_id, &output);
-                            self.push(output);
+                            self.push_created(output);
                         }
                         Value::Ref(id) => {
                             if let HeapData::LongInt(li) = self.heap.get(id) {
@@ -979,7 +874,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                                     Ok(v) => {
                                         self.emit_unary_op_result(input_id, &v);
                                         value.drop_with_heap(self.heap);
-                                        self.push(v);
+                                        self.push_created(v);
                                     }
                                     Err(e) => {
                                         value.drop_with_heap(self.heap);
@@ -1011,7 +906,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         Value::Bool(b) => {
                             let output = Value::Int(i64::from(b));
                             self.emit_unary_op_result(input_id, &output);
-                            self.push(output);
+                            self.push_created(output);
                         }
                         Value::Ref(id) => {
                             if matches!(self.heap.get(id), HeapData::LongInt(_)) {
@@ -1039,12 +934,12 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         Value::Int(n) => {
                             let output = Value::Int(!n);
                             self.emit_unary_op_result(input_id, &output);
-                            self.push(output);
+                            self.push_created(output);
                         }
                         Value::Bool(b) => {
                             let output = Value::Int(!i64::from(b));
                             self.emit_unary_op_result(input_id, &output);
-                            self.push(output);
+                            self.push_created(output);
                         }
                         Value::Ref(id) => {
                             if let HeapData::LongInt(li) = self.heap.get(id) {
@@ -1054,7 +949,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                                     Ok(v) => {
                                         self.emit_unary_op_result(input_id, &v);
                                         value.drop_with_heap(self.heap);
-                                        self.push(v);
+                                        self.push_created(v);
                                     }
                                     Err(e) => {
                                         value.drop_with_heap(self.heap);
@@ -1238,7 +1133,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     // Create a MontyIter from the value and store on heap
                     match MontyIter::new(value, self.heap, self.interns) {
                         Ok(iter) => match self.heap.allocate(HeapData::Iter(iter)) {
-                            Ok(heap_id) => self.push(Value::Ref(heap_id)),
+                            Ok(heap_id) => self.push_created(Value::Ref(heap_id)),
                             Err(e) => catch_sync!(self, cached_frame, e.into()),
                         },
                         Err(e) => catch_sync!(self, cached_frame, e),
@@ -1382,7 +1277,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
 
                     if defaults_count == 0 {
                         // No defaults - use inline Value::Function (no heap allocation)
-                        self.push(Value::DefFunction(func_id));
+                        self.push_created(Value::DefFunction(func_id));
                     } else {
                         // Pop default values from stack (drain maintains order: first pushed = first in vec)
                         let defaults = self.pop_n(defaults_count);
@@ -1391,7 +1286,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         let heap_id = self
                             .heap
                             .allocate(HeapData::FunctionDefaults(FunctionDefaults { func_id, defaults }))?;
-                        self.push(Value::Ref(heap_id));
+                        self.push_created(Value::Ref(heap_id));
                     }
                 }
                 Opcode::MakeClosure => {
@@ -1435,7 +1330,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         cells,
                         defaults,
                     }))?;
-                    self.push(Value::Ref(heap_id));
+                    self.push_created(Value::Ref(heap_id));
                 }
                 // Exception Handling
                 Opcode::Raise => {
@@ -1468,7 +1363,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     let result = self.check_exc_match(exception, &exc_type);
                     exc_type.drop_with_heap(self.heap);
                     let result = result?;
-                    self.push(Value::Bool(result));
+                    self.push_created(Value::Bool(result));
                 }
                 // Return - reload cache after popping frame
                 Opcode::ReturnValue => {
@@ -1575,7 +1470,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
 
         // Create the module on the heap using pre-interned strings
         let heap_id = module.create(self.heap, self.interns)?;
-        self.push(Value::Ref(heap_id));
+        self.push_created(Value::Ref(heap_id));
         Ok(())
     }
 
@@ -1587,7 +1482,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             .to_value(self.heap, self.interns)
             .map_err(|e| SimpleException::new(ExcType::RuntimeError, Some(format!("invalid return type: {e}"))))?;
         self.emit_op_result(&value, OpInputIds::none());
-        self.push(value);
+        self.push_created(value);
         self.run()
     }
 
@@ -1612,6 +1507,12 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Pushes a value onto the operand stack.
     #[inline]
     pub(crate) fn push(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+
+    /// Pushes a newly created value onto the operand stack and emits creation.
+    #[inline]
+    pub(crate) fn push_created(&mut self, value: Value) {
         self.emit_value_created(&value);
         self.stack.push(value);
     }
@@ -1648,49 +1549,6 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     #[inline]
     pub(super) fn new_cached_frame(&self) -> CachedFrame<'a> {
         self.current_frame().into()
-    }
-
-    /// Emits a value-creation observer event for a stack value.
-    #[inline]
-    fn emit_value_created(&self, value: &Value) {
-        self.observer
-            .emit(RuntimeObserverEvent::ValueCreated(ValueCreatedEvent {
-                value_id: RuntimeValueId::new(value.id()),
-            }));
-    }
-
-    /// Emits an operation-result observer event.
-    #[inline]
-    fn emit_op_result(&self, output: &Value, inputs: OpInputIds) {
-        self.observer.emit(RuntimeObserverEvent::OpResult(OpResultEvent {
-            output_id: RuntimeValueId::new(output.id()),
-            inputs,
-        }));
-    }
-
-    /// Emits a unary operation-result event.
-    #[inline]
-    fn emit_unary_op_result(&self, input_id: RuntimeValueId, output: &Value) {
-        self.emit_op_result(output, OpInputIds::One(input_id));
-    }
-
-    /// Emits a binary operation-result event.
-    #[inline]
-    fn emit_binary_op_result(&self, lhs: &Value, rhs: &Value, output: &Value) {
-        self.emit_op_result(
-            output,
-            OpInputIds::Two(RuntimeValueId::new(lhs.id()), RuntimeValueId::new(rhs.id())),
-        );
-    }
-
-    /// Emits a control-condition observer event.
-    #[inline]
-    fn emit_control_condition(&self, condition: &Value, branch_taken: bool) {
-        self.observer
-            .emit(RuntimeObserverEvent::ControlCondition(ControlConditionEvent {
-                condition_id: RuntimeValueId::new(condition.id()),
-                branch_taken,
-            }));
     }
 
     /// Returns a mutable reference to the current call frame.

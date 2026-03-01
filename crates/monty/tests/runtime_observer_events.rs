@@ -3,11 +3,16 @@
 use std::sync::{Arc, Mutex};
 
 use monty::{
-    ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRun, NoLimitTracker,
-    NoopRuntimeObserver, OpInputIds, PrintWriter, RunProgress, RuntimeObserver, RuntimeObserverEvent,
-    RuntimeObserverHandle,
+    ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyFuture, MontyObject, MontyRepl, MontyRun,
+    NoLimitTracker, NoopRuntimeObserver, OpInputIds, PrintWriter, ResourceTracker, RunProgress, RuntimeObserver,
+    RuntimeObserverEvent, RuntimeObserverHandle, Snapshot,
 };
+use rstest::{fixture, rstest};
 
+/// Captured observer events in test-friendly form.
+///
+/// Each variant stores raw runtime IDs (`RuntimeValueId::raw()`) so assertions can compare
+/// stable primitive values without reconstructing runtime wrappers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedEvent {
     ValueCreated {
@@ -69,6 +74,10 @@ impl RecordedEvent {
     }
 }
 
+/// Observer implementation that records every event into shared test storage.
+///
+/// The event buffer is `Arc<Mutex<Vec<_>>>` so tests can resume execution across
+/// owned snapshot values while still observing a single, thread-safe event stream.
 #[derive(Clone)]
 struct RecordingObserver {
     events: Arc<Mutex<Vec<RecordedEvent>>>,
@@ -87,19 +96,92 @@ impl RuntimeObserver for RecordingObserver {
     }
 }
 
+/// Builds a recording observer handle plus shared event storage used by tests.
+///
+/// The returned buffer can be read after each resume step to assert event ordering and payloads.
 fn build_recording_observer() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let handle = RuntimeObserverHandle::new(RecordingObserver::new(Arc::clone(&events)));
     (handle, events)
 }
 
+/// Clones the current recorded event stream.
+///
+/// Poisoned mutexes are recovered by taking the inner value so assertions can still inspect
+/// partially recorded state from failing execution paths.
 fn read_events(events: &Arc<Mutex<Vec<RecordedEvent>>>) -> Vec<RecordedEvent> {
     events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
-#[test]
-fn runtime_observer_tracks_external_function_request_and_return() {
-    let (observer, events) = build_recording_observer();
+#[fixture]
+fn recording() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>) {
+    build_recording_observer()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExternalResumeCase {
+    Return,
+    Error,
+    Future,
+}
+
+type FunctionCallExtract<T> = (String, Vec<MontyObject>, Vec<(String, MontyObject)>, Snapshot<T>);
+
+fn build_dataclass_point() -> MontyObject {
+    MontyObject::Dataclass {
+        name: "Point".to_string(),
+        type_id: 0,
+        field_names: vec!["x".to_string(), "y".to_string()],
+        attrs: vec![
+            (MontyObject::String("x".to_string()), MontyObject::Int(1)),
+            (MontyObject::String("y".to_string()), MontyObject::Int(2)),
+        ]
+        .into(),
+        frozen: true,
+    }
+}
+
+/// Destructures a `RunProgress::FunctionCall` with a context-rich panic on mismatch.
+fn extract_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: &str) -> FunctionCallExtract<T> {
+    let RunProgress::FunctionCall {
+        function_name,
+        args,
+        kwargs,
+        state,
+        ..
+    } = progress
+    else {
+        panic!("{context}: expected function-call progress");
+    };
+
+    let kwargs = kwargs
+        .into_iter()
+        .map(|(key, value)| match key {
+            MontyObject::String(name) => (name, value),
+            other => panic!("{context}: expected string kwarg key, got {other:?}"),
+        })
+        .collect();
+
+    (function_name, args, kwargs, state)
+}
+
+/// Asserts that two extracted function-call payloads match for name and arguments.
+fn assert_function_calls_equal<T: ResourceTracker>(left: &FunctionCallExtract<T>, right: &FunctionCallExtract<T>) {
+    assert_eq!(left.0, right.0);
+    assert_eq!(left.1, right.1);
+    assert_eq!(left.2, right.2);
+}
+
+#[rstest]
+#[case::returns(ExternalResumeCase::Return, ExternalCallReturnKind::Return)]
+#[case::error(ExternalResumeCase::Error, ExternalCallReturnKind::Error)]
+#[case::future(ExternalResumeCase::Future, ExternalCallReturnKind::Future)]
+fn runtime_observer_emits_external_return_kinds(
+    #[case] resume_case: ExternalResumeCase,
+    #[case] expected_kind: ExternalCallReturnKind,
+    recording: (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>),
+) {
+    let (observer, events) = recording;
     let run = MontyRun::new("ext_fn(1)".to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
         .expect("runner creation should succeed");
 
@@ -111,10 +193,28 @@ fn runtime_observer_tracks_external_function_request_and_return() {
         panic!("expected function-call progress");
     };
 
-    let completion = state
-        .run(MontyObject::Int(7), &mut PrintWriter::Stdout)
-        .expect("resume should complete");
-    assert!(matches!(completion, RunProgress::Complete(MontyObject::Int(7))));
+    match resume_case {
+        ExternalResumeCase::Return => {
+            let completion = state
+                .run(MontyObject::Int(7), &mut PrintWriter::Stdout)
+                .expect("resume should complete");
+            assert!(matches!(completion, RunProgress::Complete(MontyObject::Int(7))));
+        }
+        ExternalResumeCase::Error => {
+            let error = state
+                .run(
+                    MontyException::new(ExcType::RuntimeError, Some("observer failure".to_owned())),
+                    &mut PrintWriter::Stdout,
+                )
+                .expect_err("resume should return an error");
+            assert!(error.to_string().contains("observer failure"));
+        }
+        ExternalResumeCase::Future => {
+            let _ = state
+                .run(MontyFuture, &mut PrintWriter::Stdout)
+                .expect("future resume should continue execution");
+        }
+    }
 
     let events = read_events(&events);
     assert!(events.iter().any(|event| {
@@ -132,24 +232,27 @@ fn runtime_observer_tracks_external_function_request_and_return() {
             event,
             RecordedEvent::ExternalCallReturned {
                 call_id: observed_call_id,
-                kind: ExternalCallReturnKind::Return,
-            } if *observed_call_id == call_id
+                kind,
+            } if *observed_call_id == call_id && *kind == expected_kind
         )
     }));
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            RecordedEvent::OpResult {
-                input_ids,
-                ..
-            } if input_ids.is_empty()
-        )
-    }));
+
+    if matches!(resume_case, ExternalResumeCase::Return) {
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RecordedEvent::OpResult {
+                    input_ids,
+                    ..
+                } if input_ids.is_empty()
+            )
+        }));
+    }
 }
 
-#[test]
-fn runtime_observer_tracks_os_call_requests() {
-    let (observer, events) = build_recording_observer();
+#[rstest]
+fn runtime_observer_tracks_os_call_requests(recording: (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>)) {
+    let (observer, events) = recording;
     let run = MontyRun::new(
         "from pathlib import Path\nPath('/tmp/observer-test').exists()".to_owned(),
         "test.py",
@@ -183,9 +286,55 @@ fn runtime_observer_tracks_os_call_requests() {
     }));
 }
 
-#[test]
-fn runtime_observer_emits_control_and_operation_events_for_branching_code() {
-    let (observer, events) = build_recording_observer();
+#[rstest]
+fn runtime_observer_tracks_method_call_requests(recording: (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>)) {
+    let (observer, events) = recording;
+    let run = MontyRun::new("point.sum()".to_owned(), "test.py", vec!["point".to_owned()], vec![])
+        .expect("runner creation should succeed");
+
+    let progress = run
+        .start_with_observer(
+            vec![build_dataclass_point()],
+            NoLimitTracker,
+            &mut PrintWriter::Stdout,
+            observer,
+        )
+        .expect("start should pause at method call");
+
+    let RunProgress::FunctionCall {
+        call_id,
+        method_call,
+        state,
+        ..
+    } = progress
+    else {
+        panic!("expected method-call progress");
+    };
+    assert!(method_call, "expected method_call=true for dataclass method dispatch");
+
+    let completion = state
+        .run(MontyObject::Int(3), &mut PrintWriter::Stdout)
+        .expect("method-call resume should complete");
+    assert!(matches!(completion, RunProgress::Complete(MontyObject::Int(3))));
+
+    let events = read_events(&events);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            RecordedEvent::ExternalCallRequested {
+                call_id: observed_call_id,
+                kind: ExternalCallKind::Method,
+                ..
+            } if *observed_call_id == call_id
+        )
+    }));
+}
+
+#[rstest]
+fn runtime_observer_emits_control_and_operation_events_for_branching_code(
+    recording: (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>),
+) {
+    let (observer, events) = recording;
     let run = MontyRun::new(
         "if x > 0:\n    y = x + 2\nelse:\n    y = x - 2\ny".to_owned(),
         "test.py",
@@ -221,36 +370,79 @@ fn runtime_observer_emits_control_and_operation_events_for_branching_code() {
     }));
 }
 
-#[test]
-fn runtime_observer_emits_error_return_for_failed_external_call() {
-    let (observer, events) = build_recording_observer();
-    let run = MontyRun::new("ext_fn(1)".to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
-        .expect("runner creation should succeed");
+#[rstest]
+fn runtime_observer_repl_paths_emit_external_control_and_op_events(
+    recording: (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>),
+) {
+    let (observer, events) = recording;
 
-    let progress = run
-        .start_with_observer(vec![], NoLimitTracker, &mut PrintWriter::Stdout, observer)
-        .expect("start should pause at external call");
+    let (repl, init) = MontyRepl::new(
+        String::new(),
+        "repl.py",
+        vec![],
+        vec!["ext_fn".to_owned()],
+        vec![],
+        NoLimitTracker,
+        &mut PrintWriter::Stdout,
+    )
+    .expect("REPL initialization should succeed");
+    assert_eq!(init, MontyObject::None);
 
-    let RunProgress::FunctionCall { call_id, state, .. } = progress else {
-        panic!("expected function-call progress");
-    };
+    let progress = repl
+        .start_with_observer("ext_fn(1)", &mut PrintWriter::Stdout, observer.clone())
+        .expect("repl start should pause at external call");
+    let (_, _, _, _, _, call_id, _, state) = progress
+        .into_function_call()
+        .expect("expected REPL function-call progress");
 
-    let error = state
-        .run(
-            MontyException::new(ExcType::RuntimeError, Some("observer failure".to_owned())),
+    let progress = state
+        .run(MontyObject::Int(9), &mut PrintWriter::Stdout)
+        .expect("repl resume should complete");
+    let (repl, value) = progress.into_complete().expect("expected REPL completion");
+    assert_eq!(value, MontyObject::Int(9));
+
+    let progress = repl
+        .start_with_observer(
+            "if 1 > 0:\n    y = 3\nelse:\n    y = 4\ny",
             &mut PrintWriter::Stdout,
+            observer,
         )
-        .expect_err("resume should return an error");
-    assert!(error.to_string().contains("observer failure"));
+        .expect("branching snippet should complete");
+    let (_repl, value) = progress.into_complete().expect("expected REPL completion");
+    assert_eq!(value, MontyObject::Int(3));
 
     let events = read_events(&events);
     assert!(events.iter().any(|event| {
         matches!(
             event,
+            RecordedEvent::ExternalCallRequested {
+                call_id: observed_call_id,
+                kind: ExternalCallKind::Function,
+                ..
+            } if *observed_call_id == call_id
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
             RecordedEvent::ExternalCallReturned {
                 call_id: observed_call_id,
-                kind: ExternalCallReturnKind::Error,
+                kind: ExternalCallReturnKind::Return,
             } if *observed_call_id == call_id
+        )
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RecordedEvent::ControlCondition { .. }))
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            RecordedEvent::OpResult {
+                input_ids,
+                ..
+            } if input_ids.len() == 2
         )
     }));
 }
@@ -261,84 +453,50 @@ fn noop_observer_preserves_suspend_resume_semantics() {
 
     let run_without_observer = MontyRun::new(script.to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
         .expect("runner creation should succeed");
-    let first_without = run_without_observer
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("start should pause at first call");
-
     let run_with_noop = MontyRun::new(script.to_owned(), "test.py", vec![], vec!["ext_fn".to_owned()])
         .expect("runner creation should succeed");
-    let first_with_noop = run_with_noop
-        .start_with_observer(
-            vec![],
-            NoLimitTracker,
-            &mut PrintWriter::Stdout,
-            RuntimeObserverHandle::new(NoopRuntimeObserver),
-        )
-        .expect("start should pause at first call");
 
-    let RunProgress::FunctionCall {
-        function_name: first_name_without,
-        args: first_args_without,
-        kwargs: first_kwargs_without,
-        state: first_state_without,
-        ..
-    } = first_without
-    else {
-        panic!("expected function-call progress without observer");
-    };
+    let first_without = extract_function_call(
+        run_without_observer
+            .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
+            .expect("start should pause at first call"),
+        "without observer",
+    );
+    let first_with_noop = extract_function_call(
+        run_with_noop
+            .start_with_observer(
+                vec![],
+                NoLimitTracker,
+                &mut PrintWriter::Stdout,
+                RuntimeObserverHandle::new(NoopRuntimeObserver),
+            )
+            .expect("start should pause at first call"),
+        "with no-op observer",
+    );
+    assert_function_calls_equal(&first_without, &first_with_noop);
 
-    let RunProgress::FunctionCall {
-        function_name: first_name_with,
-        args: first_args_with,
-        kwargs: first_kwargs_with,
-        state: first_state_with,
-        ..
-    } = first_with_noop
-    else {
-        panic!("expected function-call progress with no-op observer");
-    };
+    let second_without = extract_function_call(
+        first_without
+            .3
+            .run(MontyObject::None, &mut PrintWriter::Stdout)
+            .expect("resume should pause at second call"),
+        "second call without observer",
+    );
+    let second_with_noop = extract_function_call(
+        first_with_noop
+            .3
+            .run(MontyObject::None, &mut PrintWriter::Stdout)
+            .expect("resume should pause at second call"),
+        "second call with no-op observer",
+    );
+    assert_function_calls_equal(&second_without, &second_with_noop);
 
-    assert_eq!(first_name_without, first_name_with);
-    assert_eq!(first_args_without, first_args_with);
-    assert_eq!(first_kwargs_without, first_kwargs_with);
-
-    let second_without = first_state_without
-        .run(MontyObject::None, &mut PrintWriter::Stdout)
-        .expect("resume should pause at second call");
-    let second_with_noop = first_state_with
-        .run(MontyObject::None, &mut PrintWriter::Stdout)
-        .expect("resume should pause at second call");
-
-    let RunProgress::FunctionCall {
-        function_name: second_name_without,
-        args: second_args_without,
-        kwargs: second_kwargs_without,
-        state: second_state_without,
-        ..
-    } = second_without
-    else {
-        panic!("expected second function-call progress without observer");
-    };
-
-    let RunProgress::FunctionCall {
-        function_name: second_name_with,
-        args: second_args_with,
-        kwargs: second_kwargs_with,
-        state: second_state_with,
-        ..
-    } = second_with_noop
-    else {
-        panic!("expected second function-call progress with no-op observer");
-    };
-
-    assert_eq!(second_name_without, second_name_with);
-    assert_eq!(second_args_without, second_args_with);
-    assert_eq!(second_kwargs_without, second_kwargs_with);
-
-    let completion_without = second_state_without
+    let completion_without = second_without
+        .3
         .run(MontyObject::None, &mut PrintWriter::Stdout)
         .expect("final resume should complete without observer");
-    let completion_with_noop = second_state_with
+    let completion_with_noop = second_with_noop
+        .3
         .run(MontyObject::None, &mut PrintWriter::Stdout)
         .expect("final resume should complete with no-op observer");
 

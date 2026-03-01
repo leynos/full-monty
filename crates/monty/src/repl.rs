@@ -799,6 +799,16 @@ impl<T: ResourceTracker + serde::de::DeserializeOwned> ReplProgress<T> {
     }
 }
 
+fn emit_external_call_returned(observer: &RuntimeObserverHandle, call_id: u32, kind: ExternalCallReturnKind) {
+    if !observer.is_enabled() {
+        return;
+    }
+    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+        call_id,
+        kind,
+    }));
+}
+
 /// REPL execution state that can be resumed after an external call.
 ///
 /// This is the REPL-aware counterpart to `Snapshot`. Resuming continues the
@@ -816,11 +826,18 @@ pub struct ReplSnapshot<T: ResourceTracker> {
     /// call_id used when resuming with an unresolved future.
     pending_call_id: u32,
     /// Optional runtime observer handle for resumed execution.
-    #[serde(skip)]
+    #[serde(skip, default = "RuntimeObserverHandle::disabled")]
     observer: RuntimeObserverHandle,
 }
 
 impl<T: ResourceTracker> ReplSnapshot<T> {
+    /// Installs a runtime observer for subsequent resume calls.
+    #[must_use]
+    pub fn with_observer(mut self, observer: RuntimeObserverHandle) -> Self {
+        self.observer = observer;
+        self
+    }
+
     /// Continues snippet execution with an external result.
     ///
     /// # Arguments
@@ -831,57 +848,48 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
         result: impl Into<ExternalResult>,
         print: &mut PrintWriter<'_>,
     ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+        let observer = self.observer.clone();
+        self.run_with_observer(result, print, observer)
+    }
+
+    /// Continues snippet execution with an explicit runtime observer.
+    pub fn run_with_observer(
+        self,
+        result: impl Into<ExternalResult>,
+        print: &mut PrintWriter<'_>,
+        observer: RuntimeObserverHandle,
+    ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
         let Self {
             mut repl,
             executor,
             vm_state,
             pending_call_id,
-            observer,
+            ..
         } = self;
 
         let ext_result = result.into();
 
-        let mut vm = if observer.is_enabled() {
-            VM::restore_with_observer(
-                vm_state,
-                &executor.module_code,
-                &mut repl.heap,
-                &mut repl.namespaces,
-                &executor.interns,
-                print,
-                observer.clone(),
-            )
-        } else {
-            VM::restore(
-                vm_state,
-                &executor.module_code,
-                &mut repl.heap,
-                &mut repl.namespaces,
-                &executor.interns,
-                print,
-            )
-        };
+        let mut vm = VM::restore_with_observer(
+            vm_state,
+            &executor.module_code,
+            &mut repl.heap,
+            &mut repl.namespaces,
+            &executor.interns,
+            print,
+            observer.clone(),
+        );
 
         let vm_result = match ext_result {
             ExternalResult::Return(obj) => {
-                observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                    call_id: pending_call_id,
-                    kind: ExternalCallReturnKind::Return,
-                }));
+                emit_external_call_returned(&observer, pending_call_id, ExternalCallReturnKind::Return);
                 vm.resume(obj)
             }
             ExternalResult::Error(exc) => {
-                observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                    call_id: pending_call_id,
-                    kind: ExternalCallReturnKind::Error,
-                }));
+                emit_external_call_returned(&observer, pending_call_id, ExternalCallReturnKind::Error);
                 vm.resume_with_exception(exc.into())
             }
             ExternalResult::Future => {
-                observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                    call_id: pending_call_id,
-                    kind: ExternalCallReturnKind::Future,
-                }));
+                emit_external_call_returned(&observer, pending_call_id, ExternalCallReturnKind::Future);
                 let call_id = CallId::new(pending_call_id);
                 vm.add_pending_call(call_id);
                 vm.push(Value::ExternalFuture(call_id));
@@ -917,11 +925,18 @@ pub struct ReplFutureSnapshot<T: ResourceTracker> {
     /// Pending call IDs expected by this snapshot.
     pending_call_ids: Vec<u32>,
     /// Optional runtime observer handle for resumed execution.
-    #[serde(skip)]
+    #[serde(skip, default = "RuntimeObserverHandle::disabled")]
     observer: RuntimeObserverHandle,
 }
 
 impl<T: ResourceTracker> ReplFutureSnapshot<T> {
+    /// Installs a runtime observer for subsequent resume calls.
+    #[must_use]
+    pub fn with_observer(mut self, observer: RuntimeObserverHandle) -> Self {
+        self.observer = observer;
+        self
+    }
+
     /// Returns unresolved call IDs for this suspended state.
     #[must_use]
     pub fn pending_call_ids(&self) -> &[u32] {
@@ -941,12 +956,23 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
         results: Vec<(u32, ExternalResult)>,
         print: &mut PrintWriter<'_>,
     ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+        let observer = self.observer.clone();
+        self.resume_with_observer(results, print, observer)
+    }
+
+    /// Resumes snippet execution with an explicit runtime observer.
+    pub fn resume_with_observer(
+        self,
+        results: Vec<(u32, ExternalResult)>,
+        print: &mut PrintWriter<'_>,
+        observer: RuntimeObserverHandle,
+    ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
         let Self {
             mut repl,
             executor,
             vm_state,
             pending_call_ids,
-            observer,
+            ..
         } = self;
 
         let invalid_call_id = results
@@ -954,26 +980,15 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
             .find(|(call_id, _)| !pending_call_ids.contains(call_id))
             .map(|(call_id, _)| *call_id);
 
-        let mut vm = if observer.is_enabled() {
-            VM::restore_with_observer(
-                vm_state,
-                &executor.module_code,
-                &mut repl.heap,
-                &mut repl.namespaces,
-                &executor.interns,
-                print,
-                observer.clone(),
-            )
-        } else {
-            VM::restore(
-                vm_state,
-                &executor.module_code,
-                &mut repl.heap,
-                &mut repl.namespaces,
-                &executor.interns,
-                print,
-            )
-        };
+        let mut vm = VM::restore_with_observer(
+            vm_state,
+            &executor.module_code,
+            &mut repl.heap,
+            &mut repl.namespaces,
+            &executor.interns,
+            print,
+            observer.clone(),
+        );
 
         if let Some(call_id) = invalid_call_id {
             vm.cleanup();
@@ -986,10 +1001,7 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
         for (call_id, ext_result) in results {
             match ext_result {
                 ExternalResult::Return(obj) => {
-                    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                        call_id,
-                        kind: ExternalCallReturnKind::Return,
-                    }));
+                    emit_external_call_returned(&observer, call_id, ExternalCallReturnKind::Return);
                     if let Err(e) = vm.resolve_future(call_id, obj) {
                         vm.cleanup();
                         let error =
@@ -998,17 +1010,11 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
                     }
                 }
                 ExternalResult::Error(exc) => {
-                    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                        call_id,
-                        kind: ExternalCallReturnKind::Error,
-                    }));
+                    emit_external_call_returned(&observer, call_id, ExternalCallReturnKind::Error);
                     vm.fail_future(call_id, RunError::from(exc));
                 }
                 ExternalResult::Future => {
-                    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                        call_id,
-                        kind: ExternalCallReturnKind::Future,
-                    }));
+                    emit_external_call_returned(&observer, call_id, ExternalCallReturnKind::Future);
                 }
             }
         }

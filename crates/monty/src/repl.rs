@@ -11,7 +11,7 @@ use ruff_python_parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErr
 use crate::{
     ExcType, MontyException,
     asyncio::CallId,
-    bytecode::{Code, Compiler, FrameExit, VM, VMSnapshot},
+    bytecode::{Code, Compiler, FrameExit, VM, VMContext, VMSnapshot},
     exception_private::{RunError, RunResult},
     heap::{DropWithHeap, Heap},
     intern::{ExtFunctionId, InternerBuilder, Interns},
@@ -311,7 +311,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
         let mut heap = Heap::new(executor.namespace_size, resource_tracker);
         let mut namespaces = executor.prepare_namespaces(inputs, &mut heap)?;
 
-        let mut vm = VM::new(&mut heap, &mut namespaces, &executor.interns, print);
+        let mut vm = VM::new(VMContext::new(&mut heap, &mut namespaces, &executor.interns, print));
         let frame_exit_result = vm.run_module(&executor.module_code);
         vm.cleanup();
 
@@ -383,10 +383,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         let (vm_result, vm_state) = {
             let mut vm = VM::new_with_observer(
-                &mut this.heap,
-                &mut this.namespaces,
-                &executor.interns,
-                print,
+                VMContext::new(&mut this.heap, &mut this.namespaces, &executor.interns, print),
                 observer.clone(),
             );
             let vm_result = vm.run_module(&executor.module_code);
@@ -446,7 +443,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         self.ensure_global_namespace_size(namespace_size);
 
-        let mut vm = VM::new(&mut self.heap, &mut self.namespaces, &interns, print);
+        let mut vm = VM::new(VMContext::new(&mut self.heap, &mut self.namespaces, &interns, print));
         let frame_exit_result = vm.run_module(&module_code);
         vm.cleanup();
 
@@ -869,15 +866,12 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
 
         let ext_result = result.into();
 
-        let mut vm = VM::restore_with_observer(
-            vm_state,
-            &executor.module_code,
-            &mut repl.heap,
-            &mut repl.namespaces,
-            &executor.interns,
-            print,
-            observer.clone(),
-        );
+        let context = VMContext::new(&mut repl.heap, &mut repl.namespaces, &executor.interns, print);
+        let mut vm = if observer.is_enabled() {
+            VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone())
+        } else {
+            VM::restore(vm_state, &executor.module_code, context)
+        };
 
         let vm_result = match ext_result {
             ExternalResult::Return(obj) => {
@@ -980,15 +974,12 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
             .find(|(call_id, _)| !pending_call_ids.contains(call_id))
             .map(|(call_id, _)| *call_id);
 
-        let mut vm = VM::restore_with_observer(
-            vm_state,
-            &executor.module_code,
-            &mut repl.heap,
-            &mut repl.namespaces,
-            &executor.interns,
-            print,
-            observer.clone(),
-        );
+        let context = VMContext::new(&mut repl.heap, &mut repl.namespaces, &executor.interns, print);
+        let mut vm = if observer.is_enabled() {
+            VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone())
+        } else {
+            VM::restore(vm_state, &executor.module_code, context)
+        };
 
         if let Some(call_id) = invalid_call_id {
             vm.cleanup();

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::{
     ExcType, MontyException,
     asyncio::CallId,
-    bytecode::{Code, Compiler, FrameExit, VM, VMSnapshot},
+    bytecode::{Code, Compiler, FrameExit, VM, VMContext, VMSnapshot},
     exception_private::RunResult,
     heap::{DropWithHeap, Heap},
     intern::{ExtFunctionId, Interns},
@@ -175,7 +175,10 @@ impl MontyRun {
         let mut namespaces = executor.prepare_namespaces(inputs, &mut heap)?;
 
         // Create and run VM
-        let mut vm = VM::new_with_observer(&mut heap, &mut namespaces, &executor.interns, print, observer.clone());
+        let mut vm = VM::new_with_observer(
+            VMContext::new(&mut heap, &mut namespaces, &executor.interns, print),
+            observer.clone(),
+        );
 
         // Start execution
         let vm_result = vm.run_module(&executor.module_code);
@@ -576,15 +579,12 @@ impl<T: ResourceTracker> Snapshot<T> {
         let ext_result = result.into();
 
         // Restore the VM from the snapshot
-        let mut vm = VM::restore_with_observer(
-            self.vm_state,
-            &self.executor.module_code,
-            &mut self.heap,
-            &mut self.namespaces,
-            &self.executor.interns,
-            print,
-            observer.clone(),
-        );
+        let context = VMContext::new(&mut self.heap, &mut self.namespaces, &self.executor.interns, print);
+        let mut vm = if observer.is_enabled() {
+            VM::restore_with_observer(self.vm_state, &self.executor.module_code, context, observer.clone())
+        } else {
+            VM::restore(self.vm_state, &self.executor.module_code, context)
+        };
 
         // Convert return value or exception before creating VM (to avoid borrow conflicts)
         let vm_result = match ext_result {
@@ -746,15 +746,12 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
             .map(|(call_id, _)| *call_id);
 
         // Restore the VM from the snapshot (must happen before any error return to clean up properly)
-        let mut vm = VM::restore_with_observer(
-            vm_state,
-            &executor.module_code,
-            &mut heap,
-            &mut namespaces,
-            &executor.interns,
-            print,
-            observer.clone(),
-        );
+        let context = VMContext::new(&mut heap, &mut namespaces, &executor.interns, print);
+        let mut vm = if observer.is_enabled() {
+            VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone())
+        } else {
+            VM::restore(vm_state, &executor.module_code, context)
+        };
 
         // Now check for invalid call_ids after VM is restored
         if let Some(call_id) = invalid_call_id {
@@ -1177,7 +1174,7 @@ impl Executor {
         let mut namespaces = self.prepare_namespaces(inputs, &mut heap)?;
 
         // Create and run VM
-        let mut vm = VM::new(&mut heap, &mut namespaces, &self.interns, print);
+        let mut vm = VM::new(VMContext::new(&mut heap, &mut namespaces, &self.interns, print));
         let frame_exit_result = vm.run_module(&self.module_code);
 
         // Clean up VM state before it goes out of scope
@@ -1217,7 +1214,7 @@ impl Executor {
 
         // Create and run VM with Stdout for output
         let mut print = PrintWriter::Stdout;
-        let mut vm = VM::new(&mut heap, &mut namespaces, &self.interns, &mut print);
+        let mut vm = VM::new(VMContext::new(&mut heap, &mut namespaces, &self.interns, &mut print));
         let frame_exit_result = vm.run_module(&self.module_code);
 
         // Compute ref counts before consuming the heap - return value is still alive

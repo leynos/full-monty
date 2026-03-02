@@ -3,13 +3,9 @@
 //! This module isolates observer-specific VM extensions so upstream VM changes
 //! remain easier to sync.
 
-use super::{CallFrame, VM, VMSnapshot};
+use super::{CallFrame, VM, VMContext, VMSnapshot};
 use crate::{
     bytecode::code::Code,
-    heap::Heap,
-    intern::Interns,
-    io::PrintWriter,
-    namespace::Namespaces,
     observer::{
         ControlConditionEvent, OpInputIds, OpResultEvent, RuntimeObserverEvent, RuntimeObserverHandle,
         ValueCreatedEvent,
@@ -20,14 +16,19 @@ use crate::{
 };
 
 impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
+    /// Creates a new VM without an observer.
+    pub fn new(context: VMContext<'a, 'p, T>) -> Self {
+        Self::new_with_observer(context, RuntimeObserverHandle::disabled())
+    }
+
     /// Creates a new VM with an optional runtime observer.
-    pub fn new_with_observer(
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
-        observer: RuntimeObserverHandle,
-    ) -> Self {
+    pub fn new_with_observer(context: VMContext<'a, 'p, T>, observer: RuntimeObserverHandle) -> Self {
+        let VMContext {
+            heap,
+            namespaces,
+            interns,
+            print_writer,
+        } = context;
         Self {
             stack: Vec::with_capacity(64),
             frames: Vec::with_capacity(16),
@@ -44,14 +45,16 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         }
     }
 
+    /// Reconstructs a VM from a snapshot without an observer.
+    pub fn restore(snapshot: VMSnapshot, module_code: &'a Code, context: VMContext<'a, 'p, T>) -> Self {
+        Self::restore_with_observer(snapshot, module_code, context, RuntimeObserverHandle::disabled())
+    }
+
     /// Reconstructs a VM from a snapshot with an optional runtime observer.
     pub fn restore_with_observer(
         snapshot: VMSnapshot,
         module_code: &'a Code,
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
+        context: VMContext<'a, 'p, T>,
         observer: RuntimeObserverHandle,
     ) -> Self {
         // Reconstruct call frames from serialized form
@@ -60,7 +63,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             .into_iter()
             .map(|sf| {
                 let code = match sf.function_id {
-                    Some(func_id) => &interns.get_function(func_id).code,
+                    Some(func_id) => &context.interns.get_function(func_id).code,
                     None => module_code,
                 };
                 CallFrame {
@@ -75,6 +78,12 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 }
             })
             .collect();
+        let VMContext {
+            heap,
+            namespaces,
+            interns,
+            print_writer,
+        } = context;
 
         Self {
             stack: snapshot.stack,

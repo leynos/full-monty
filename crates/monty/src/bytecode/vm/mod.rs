@@ -526,23 +526,32 @@ pub struct VM<'a, 'p, T: ResourceTracker> {
     observer: RuntimeObserverHandle,
 }
 
-impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
-    /// Creates a new VM with the given runtime context.
-    pub fn new(
+/// Borrowed runtime context required to construct or restore a VM.
+pub struct VMContext<'a, 'p, T: ResourceTracker> {
+    pub(crate) heap: &'a mut Heap<T>,
+    pub(crate) namespaces: &'a mut Namespaces,
+    pub(crate) interns: &'a Interns,
+    pub(crate) print_writer: &'a mut PrintWriter<'p>,
+}
+
+impl<'a, 'p, T: ResourceTracker> VMContext<'a, 'p, T> {
+    /// Creates a new VM runtime context bundle.
+    pub(crate) fn new(
         heap: &'a mut Heap<T>,
         namespaces: &'a mut Namespaces,
         interns: &'a Interns,
         print_writer: &'a mut PrintWriter<'p>,
     ) -> Self {
-        Self::new_with_observer(
+        Self {
             heap,
             namespaces,
             interns,
             print_writer,
-            RuntimeObserverHandle::disabled(),
-        )
+        }
     }
+}
 
+impl<'a, T: ResourceTracker> VM<'a, '_, T> {
     /// Consumes the VM and creates a snapshot for pause/resume if needed.
     pub fn check_snapshot(mut self, result: &RunResult<FrameExit>) -> Option<VMSnapshot> {
         if matches!(

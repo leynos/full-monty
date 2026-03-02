@@ -867,11 +867,7 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
         let ext_result = result.into();
 
         let context = VMContext::new(&mut repl.heap, &mut repl.namespaces, &executor.interns, print);
-        let mut vm = if observer.is_enabled() {
-            VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone())
-        } else {
-            VM::restore(vm_state, &executor.module_code, context)
-        };
+        let mut vm = VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone());
 
         let vm_result = match ext_result {
             ExternalResult::Return(obj) => {
@@ -975,11 +971,7 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
             .map(|(call_id, _)| *call_id);
 
         let context = VMContext::new(&mut repl.heap, &mut repl.namespaces, &executor.interns, print);
-        let mut vm = if observer.is_enabled() {
-            VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone())
-        } else {
-            VM::restore(vm_state, &executor.module_code, context)
-        };
+        let mut vm = VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone());
 
         if let Some(call_id) = invalid_call_id {
             vm.cleanup();

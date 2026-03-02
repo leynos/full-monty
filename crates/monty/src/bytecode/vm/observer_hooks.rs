@@ -45,11 +45,6 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         }
     }
 
-    /// Reconstructs a VM from a snapshot without an observer.
-    pub fn restore(snapshot: VMSnapshot, module_code: &'a Code, context: VMContext<'a, 'p, T>) -> Self {
-        Self::restore_with_observer(snapshot, module_code, context, RuntimeObserverHandle::disabled())
-    }
-
     /// Reconstructs a VM from a snapshot with an optional runtime observer.
     pub fn restore_with_observer(
         snapshot: VMSnapshot,

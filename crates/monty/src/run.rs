@@ -580,11 +580,7 @@ impl<T: ResourceTracker> Snapshot<T> {
 
         // Restore the VM from the snapshot
         let context = VMContext::new(&mut self.heap, &mut self.namespaces, &self.executor.interns, print);
-        let mut vm = if observer.is_enabled() {
-            VM::restore_with_observer(self.vm_state, &self.executor.module_code, context, observer.clone())
-        } else {
-            VM::restore(self.vm_state, &self.executor.module_code, context)
-        };
+        let mut vm = VM::restore_with_observer(self.vm_state, &self.executor.module_code, context, observer.clone());
 
         // Convert return value or exception before creating VM (to avoid borrow conflicts)
         let vm_result = match ext_result {
@@ -747,11 +743,7 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
 
         // Restore the VM from the snapshot (must happen before any error return to clean up properly)
         let context = VMContext::new(&mut heap, &mut namespaces, &executor.interns, print);
-        let mut vm = if observer.is_enabled() {
-            VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone())
-        } else {
-            VM::restore(vm_state, &executor.module_code, context)
-        };
+        let mut vm = VM::restore_with_observer(vm_state, &executor.module_code, context, observer.clone());
 
         // Now check for invalid call_ids after VM is restored
         if let Some(call_id) = invalid_call_id {
@@ -851,21 +843,6 @@ struct FunctionCallProgressInput<T: ResourceTracker> {
     observer: RuntimeObserverHandle,
 }
 
-/// Input bundle for converting an `OsCall` frame exit into `RunProgress::OsCall`.
-///
-/// This keeps VM snapshot state, heap/namespaces ownership, and observer wiring together so
-/// callers do not accidentally mismatch components when host execution is paused.
-struct OsCallProgressInput<T: ResourceTracker> {
-    function: OsFunction,
-    args: crate::args::ArgValues,
-    call_id: CallId,
-    executor: Executor,
-    vm_state: Option<VMSnapshot>,
-    heap: Heap<T>,
-    namespaces: Namespaces,
-    observer: RuntimeObserverHandle,
-}
-
 fn missing_snapshot_error(context: &str) -> MontyException {
     MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
 }
@@ -935,53 +912,6 @@ fn build_function_call_progress<T: ResourceTracker>(
     })
 }
 
-/// Builds `RunProgress::OsCall` with host-facing args/runtime IDs and resumable snapshot state.
-///
-/// Callers pass the paused VM components via [`OsCallProgressInput`]; `vm_state` must come from
-/// `check_snapshot`, otherwise this returns an internal-error `MontyException`.
-fn build_os_call_progress<T: ResourceTracker>(input: OsCallProgressInput<T>) -> Result<RunProgress<T>, MontyException> {
-    let OsCallProgressInput {
-        function,
-        args,
-        call_id,
-        executor,
-        vm_state,
-        mut heap,
-        namespaces,
-        observer,
-    } = input;
-
-    let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
-    let pending_call_id = call_id.raw();
-    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-        ExternalCallRequestedEvent {
-            call_id: pending_call_id,
-            kind: ExternalCallKind::Os,
-            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-        },
-    ));
-    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
-    let state = Snapshot {
-        executor,
-        vm_state,
-        heap,
-        namespaces,
-        pending_call_id,
-        observer,
-    };
-
-    Ok(RunProgress::OsCall {
-        function,
-        args: host_args.args,
-        arg_runtime_ids: host_args.arg_runtime_ids,
-        kwargs: host_args.kwargs,
-        kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-        call_id: pending_call_id,
-        state,
-    })
-}
-
 #[cfg_attr(
     not(feature = "ref-count-panic"),
     expect(
@@ -1027,16 +957,37 @@ fn handle_vm_result<T: ResourceTracker>(
             function,
             args,
             call_id,
-        }) => build_os_call_progress(OsCallProgressInput {
-            function,
-            args,
-            call_id,
-            executor,
-            vm_state,
-            heap,
-            namespaces,
-            observer,
-        }),
+        }) => {
+            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+            let pending_call_id = call_id.raw();
+            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+                ExternalCallRequestedEvent {
+                    call_id: pending_call_id,
+                    kind: ExternalCallKind::Os,
+                    arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
+                    kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
+                },
+            ));
+            let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
+            let state = Snapshot {
+                executor,
+                vm_state,
+                heap,
+                namespaces,
+                pending_call_id,
+                observer,
+            };
+
+            Ok(RunProgress::OsCall {
+                function,
+                args: host_args.args,
+                arg_runtime_ids: host_args.arg_runtime_ids,
+                kwargs: host_args.kwargs,
+                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
+                call_id: pending_call_id,
+                state,
+            })
+        }
         Ok(FrameExit::MethodCall {
             method_name,
             args,

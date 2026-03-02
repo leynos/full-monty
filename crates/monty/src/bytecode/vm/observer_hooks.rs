@@ -122,10 +122,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
 
     /// Emits a unary operation-result event.
     #[inline]
-    pub(super) fn emit_unary_op_result(&self, input_id: RuntimeValueId, output: &Value) {
+    pub(super) fn emit_unary_op_result(&self, input_id: Option<RuntimeValueId>, output: &Value) {
         if !self.observer.is_enabled() {
             return;
         }
+        let Some(input_id) = input_id else {
+            return;
+        };
         self.emit_op_result(output, OpInputIds::One(input_id));
     }
 

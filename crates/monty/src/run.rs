@@ -760,9 +760,14 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
                 // Resolve successful futures in the scheduler
                 ExternalResult::Return(obj) => {
                     emit_external_call_returned(&observer, call_id, ExternalCallReturnKind::Return);
-                    vm.resolve_future(call_id, obj).map_err(|e| {
-                        MontyException::runtime_error(format!("Invalid return type for call {call_id}: {e}"))
-                    })?;
+                    if let Err(e) = vm.resolve_future(call_id, obj) {
+                        vm.cleanup();
+                        #[cfg(feature = "ref-count-panic")]
+                        namespaces.drop_global_with_heap(&mut heap);
+                        return Err(MontyException::runtime_error(format!(
+                            "Invalid return type for call {call_id}: {e}"
+                        )));
+                    }
                 }
                 // Fail futures that returned errors
                 ExternalResult::Error(exc) => {
@@ -847,7 +852,11 @@ fn missing_snapshot_error(context: &str) -> MontyException {
     MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
 }
 
-fn emit_external_call_returned(observer: &RuntimeObserverHandle, call_id: u32, kind: ExternalCallReturnKind) {
+pub(crate) fn emit_external_call_returned(
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    kind: ExternalCallReturnKind,
+) {
     if !observer.is_enabled() {
         return;
     }

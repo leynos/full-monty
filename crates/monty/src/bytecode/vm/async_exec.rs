@@ -816,16 +816,19 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                             let waiter_context_in_vm =
                                 self.scheduler().current_task_id() == Some(waiter_id) && !self.frames.is_empty();
 
+                            let list_value = Value::Ref(list_id);
+                            self.emit_value_created(&list_value);
+
                             if waiter_context_in_vm {
                                 // Waiter's frames are in the VM - push directly onto VM stack
-                                self.stack.push(Value::Ref(list_id));
+                                self.stack.push(list_value);
                                 // Mark as ready but don't add to ready_queue
                                 self.scheduler_mut().get_task_mut(waiter_id).state = TaskState::Ready;
                             } else {
                                 // Waiter's context is saved in the task (either spawned task,
                                 // or main task that was saved when switching to spawned tasks)
                                 let scheduler = self.scheduler_mut();
-                                scheduler.get_task_mut(waiter_id).stack.push(Value::Ref(list_id));
+                                scheduler.get_task_mut(waiter_id).stack.push(list_value);
                                 scheduler.make_ready(waiter_id);
                             }
                         }

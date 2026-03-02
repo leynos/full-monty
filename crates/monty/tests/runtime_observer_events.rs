@@ -125,7 +125,12 @@ enum ExternalResumeCase {
     Future,
 }
 
-type FunctionCallExtract<T> = (String, Vec<MontyObject>, Vec<(String, MontyObject)>, Snapshot<T>);
+struct FunctionCallPayload<T: ResourceTracker> {
+    function_name: String,
+    args: Vec<MontyObject>,
+    kwargs: Vec<(String, MontyObject)>,
+    state: Snapshot<T>,
+}
 
 fn build_dataclass_point() -> MontyObject {
     MontyObject::Dataclass {
@@ -142,7 +147,7 @@ fn build_dataclass_point() -> MontyObject {
 }
 
 /// Destructures a `RunProgress::FunctionCall` with a context-rich panic on mismatch.
-fn extract_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: &str) -> FunctionCallExtract<T> {
+fn extract_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: &str) -> FunctionCallPayload<T> {
     let RunProgress::FunctionCall {
         function_name,
         args,
@@ -162,14 +167,19 @@ fn extract_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: 
         })
         .collect();
 
-    (function_name, args, kwargs, state)
+    FunctionCallPayload {
+        function_name,
+        args,
+        kwargs,
+        state,
+    }
 }
 
 /// Asserts that two extracted function-call payloads match for name and arguments.
-fn assert_function_calls_equal<T: ResourceTracker>(left: &FunctionCallExtract<T>, right: &FunctionCallExtract<T>) {
-    assert_eq!(left.0, right.0);
-    assert_eq!(left.1, right.1);
-    assert_eq!(left.2, right.2);
+fn assert_function_calls_equal<T: ResourceTracker>(left: &FunctionCallPayload<T>, right: &FunctionCallPayload<T>) {
+    assert_eq!(left.function_name, right.function_name);
+    assert_eq!(left.args, right.args);
+    assert_eq!(left.kwargs, right.kwargs);
 }
 
 #[rstest]
@@ -477,14 +487,14 @@ fn noop_observer_preserves_suspend_resume_semantics() {
 
     let second_without = extract_function_call(
         first_without
-            .3
+            .state
             .run(MontyObject::None, &mut PrintWriter::Stdout)
             .expect("resume should pause at second call"),
         "second call without observer",
     );
     let second_with_noop = extract_function_call(
         first_with_noop
-            .3
+            .state
             .run(MontyObject::None, &mut PrintWriter::Stdout)
             .expect("resume should pause at second call"),
         "second call with no-op observer",
@@ -492,11 +502,11 @@ fn noop_observer_preserves_suspend_resume_semantics() {
     assert_function_calls_equal(&second_without, &second_with_noop);
 
     let completion_without = second_without
-        .3
+        .state
         .run(MontyObject::None, &mut PrintWriter::Stdout)
         .expect("final resume should complete without observer");
     let completion_with_noop = second_with_noop
-        .3
+        .state
         .run(MontyObject::None, &mut PrintWriter::Stdout)
         .expect("final resume should complete with no-op observer");
 

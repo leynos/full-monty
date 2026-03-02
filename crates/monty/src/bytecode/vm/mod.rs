@@ -836,7 +836,7 @@ impl<'a, T: ResourceTracker> VM<'a, '_, T> {
                 // Unary Operations
                 Opcode::UnaryNot => {
                     let value = self.pop();
-                    let input_id = RuntimeValueId::new(value.id());
+                    let input_id = self.observer.is_enabled().then(|| RuntimeValueId::new(value.id()));
                     let result = !value.py_bool(self.heap, self.interns);
                     let output = Value::Bool(result);
                     self.emit_unary_op_result(input_id, &output);
@@ -846,7 +846,7 @@ impl<'a, T: ResourceTracker> VM<'a, '_, T> {
                 Opcode::UnaryNeg => {
                     // Unary minus - negate numeric value
                     let value = self.pop();
-                    let input_id = RuntimeValueId::new(value.id());
+                    let input_id = self.observer.is_enabled().then(|| RuntimeValueId::new(value.id()));
                     match value {
                         Value::Int(n) => {
                             // Use checked_neg to handle i64::MIN overflow
@@ -906,7 +906,7 @@ impl<'a, T: ResourceTracker> VM<'a, '_, T> {
                 Opcode::UnaryPos => {
                     // Unary plus - converts bools to int, no-op for other numbers
                     let value = self.pop();
-                    let input_id = RuntimeValueId::new(value.id());
+                    let input_id = self.observer.is_enabled().then(|| RuntimeValueId::new(value.id()));
                     match value {
                         Value::Int(_) | Value::Float(_) => {
                             self.emit_unary_op_result(input_id, &value);
@@ -938,7 +938,7 @@ impl<'a, T: ResourceTracker> VM<'a, '_, T> {
                 Opcode::UnaryInvert => {
                     // Bitwise NOT
                     let value = self.pop();
-                    let input_id = RuntimeValueId::new(value.id());
+                    let input_id = self.observer.is_enabled().then(|| RuntimeValueId::new(value.id()));
                     match value {
                         Value::Int(n) => {
                             let output = Value::Int(!n);

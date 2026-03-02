@@ -19,15 +19,15 @@ use crate::{
     namespace::{GLOBAL_NS_IDX, NamespaceId, Namespaces},
     object::MontyObject,
     observer::{
-        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, ExternalCallReturnedEvent,
-        RuntimeObserverEvent, RuntimeObserverHandle,
+        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, RuntimeObserverEvent,
+        RuntimeObserverHandle,
     },
     os::OsFunction,
     parse::{parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
     progress_runtime_ids::{RuntimeIdCardinality, RuntimeIdSlices, checked_runtime_id_payload},
     resource::ResourceTracker,
-    run::{ExternalResult, MontyFuture},
+    run::{ExternalResult, MontyFuture, emit_external_call_returned},
     runtime_id::RuntimeValueId,
     value::Value,
 };
@@ -794,16 +794,6 @@ impl<T: ResourceTracker + serde::de::DeserializeOwned> ReplProgress<T> {
     pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
         postcard::from_bytes(bytes)
     }
-}
-
-fn emit_external_call_returned(observer: &RuntimeObserverHandle, call_id: u32, kind: ExternalCallReturnKind) {
-    if !observer.is_enabled() {
-        return;
-    }
-    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-        call_id,
-        kind,
-    }));
 }
 
 /// REPL execution state that can be resumed after an external call.

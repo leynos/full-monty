@@ -31,6 +31,10 @@ mod types;
 mod value;
 
 pub mod vm {
+    //! VM-facing runtime execution context re-exports.
+    //!
+    //! This module exposes [`VMContext`] for consumers that need to construct
+    //! or restore VM instances through stable crate-level APIs.
     pub use crate::bytecode::VMContext;
 }
 

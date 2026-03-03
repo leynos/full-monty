@@ -1128,6 +1128,41 @@ fn emit_external_call_requested(
     ));
 }
 
+/// Classifies the REPL suspension call type so shared host-argument and
+/// snapshot logic can be reused across function, method, and OS calls.
+enum ReplCallKind {
+    Function(String),
+    Method(String),
+    Os(OsFunction),
+}
+
+/// Builds REPL external-call progress for all suspension call kinds.
+///
+/// This centralizes argument conversion, observer request emission, and
+/// snapshot construction so variant-specific builders only supply call kind
+/// details and naming.
+fn build_repl_external_call_progress_generic<T: ResourceTracker>(
+    kind: ReplCallKind,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    mut context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
+    let (observer_kind, snapshot_desc) = match &kind {
+        ReplCallKind::Function(_) => (ExternalCallKind::Function, "external call"),
+        ReplCallKind::Method(_) => (ExternalCallKind::Method, "method call"),
+        ReplCallKind::Os(_) => (ExternalCallKind::Os, "OS call"),
+    };
+    emit_external_call_requested(&context.observer, call_id.raw(), observer_kind, &host_args);
+    let state = build_repl_snapshot(context, call_id.raw(), snapshot_desc)?;
+    let progress = match kind {
+        ReplCallKind::Function(name) => host_args.into_function_call_progress(name, call_id.raw(), false, state),
+        ReplCallKind::Method(name) => host_args.into_function_call_progress(name, call_id.raw(), true, state),
+        ReplCallKind::Os(function) => host_args.into_os_call_progress(function, call_id.raw(), state),
+    };
+    Ok(progress)
+}
+
 fn build_repl_snapshot<T: ResourceTracker>(
     context: ReplProgressContext<T>,
     pending_call_id: u32,
@@ -1176,38 +1211,29 @@ fn build_repl_external_call_progress<T: ResourceTracker>(
     ext_function_id: ExtFunctionId,
     args: crate::args::ArgValues,
     call_id: CallId,
-    mut context: ReplProgressContext<T>,
+    context: ReplProgressContext<T>,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
     let function_name = context.executor.interns.get_external_function_name(ext_function_id);
-    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
-    emit_external_call_requested(&context.observer, call_id.raw(), ExternalCallKind::Function, &host_args);
-    let state = build_repl_snapshot(context, call_id.raw(), "external call")?;
-    Ok(host_args.into_function_call_progress(function_name, call_id.raw(), false, state))
+    build_repl_external_call_progress_generic(ReplCallKind::Function(function_name), args, call_id, context)
 }
 
 fn build_repl_os_call_progress<T: ResourceTracker>(
     function: OsFunction,
     args: crate::args::ArgValues,
     call_id: CallId,
-    mut context: ReplProgressContext<T>,
+    context: ReplProgressContext<T>,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
-    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
-    emit_external_call_requested(&context.observer, call_id.raw(), ExternalCallKind::Os, &host_args);
-    let state = build_repl_snapshot(context, call_id.raw(), "OS call")?;
-    Ok(host_args.into_os_call_progress(function, call_id.raw(), state))
+    build_repl_external_call_progress_generic(ReplCallKind::Os(function), args, call_id, context)
 }
 
 fn build_repl_method_call_progress<T: ResourceTracker>(
     method_name: crate::value::EitherStr,
     args: crate::args::ArgValues,
     call_id: CallId,
-    mut context: ReplProgressContext<T>,
+    context: ReplProgressContext<T>,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
     let function_name = method_name.into_string(&context.executor.interns);
-    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
-    emit_external_call_requested(&context.observer, call_id.raw(), ExternalCallKind::Method, &host_args);
-    let state = build_repl_snapshot(context, call_id.raw(), "method call")?;
-    Ok(host_args.into_function_call_progress(function_name, call_id.raw(), true, state))
+    build_repl_external_call_progress_generic(ReplCallKind::Method(function_name), args, call_id, context)
 }
 
 fn build_repl_resolve_futures_progress<T: ResourceTracker>(

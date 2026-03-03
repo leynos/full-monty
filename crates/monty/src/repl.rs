@@ -1150,14 +1150,14 @@ fn build_repl_external_call_progress_generic<T: ResourceTracker>(
         ReplCallKind::Method(_) => (ExternalCallKind::Method, "method call"),
         ReplCallKind::Os(_) => (ExternalCallKind::Os, "OS call"),
     };
+    let state = build_repl_snapshot(context, call_id.raw(), snapshot_desc)?;
     emit_external_call_requested(
-        &context.observer,
+        &state.observer,
         call_id.raw(),
         observer_kind,
         host_args.arg_runtime_ids.as_slice(),
         host_args.kwarg_runtime_ids.as_slice(),
     );
-    let state = build_repl_snapshot(context, call_id.raw(), snapshot_desc)?;
     let progress = match kind {
         ReplCallKind::Function(name) => host_args.into_function_call_progress(name, call_id.raw(), false, state),
         ReplCallKind::Method(name) => host_args.into_function_call_progress(name, call_id.raw(), true, state),

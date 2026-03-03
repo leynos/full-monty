@@ -924,6 +924,7 @@ fn build_function_call_progress<T: ResourceTracker>(
     } else {
         ExternalCallKind::Function
     };
+    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("function call"))?;
     emit_external_call_requested(
         &observer,
         pending_call_id,
@@ -931,7 +932,6 @@ fn build_function_call_progress<T: ResourceTracker>(
         host_args.arg_runtime_ids.as_slice(),
         host_args.kwarg_runtime_ids.as_slice(),
     );
-    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("function call"))?;
     let state = Snapshot {
         executor,
         vm_state,
@@ -1036,6 +1036,7 @@ fn build_os_call_progress<T: ResourceTracker>(
     } = context;
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
+    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
     emit_external_call_requested(
         &observer,
         pending_call_id,
@@ -1043,7 +1044,6 @@ fn build_os_call_progress<T: ResourceTracker>(
         host_args.arg_runtime_ids.as_slice(),
         host_args.kwarg_runtime_ids.as_slice(),
     );
-    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
     let state = Snapshot {
         executor,
         vm_state,

@@ -19,6 +19,10 @@ enum RecordedEvent {
 }
 
 impl RecordedEvent {
+    /// Converts a runtime observer callback payload into the reduced BDD event model.
+    ///
+    /// `ValueCreated` is intentionally ignored (`None`) so scenarios can focus on
+    /// call/control/operator signals without coupling to allocation internals.
     fn from_runtime_event(event: RuntimeObserverEvent<'_>) -> Option<Self> {
         match event {
             RuntimeObserverEvent::ExternalCallRequested(call_event) => Some(Self::ExternalCallRequested {
@@ -50,6 +54,9 @@ struct RecordingObserver {
 }
 
 impl RecordingObserver {
+    /// Creates a recording observer backed by a shared `Arc<Mutex<_>>` buffer.
+    ///
+    /// Clones of this observer append into the same synchronized event list.
     fn new(events: Arc<Mutex<Vec<RecordedEvent>>>) -> Self {
         Self { events }
     }
@@ -78,6 +85,10 @@ struct RuntimeObserverWorld {
 }
 
 impl RuntimeObserverWorld {
+    /// Asserts at least one recorded event matches `predicate` for the stored call ID.
+    ///
+    /// Panics when `call_id` is missing, because request/return assertions require
+    /// a prior suspension step to capture host-visible call identity.
     fn assert_has_event<F>(&self, predicate: F, error_message: &str)
     where
         F: Fn(&RecordedEvent, u32) -> bool,
@@ -91,6 +102,7 @@ impl RuntimeObserverWorld {
         );
     }
 
+    /// Asserts the observer stream contains an external-call request of `kind`.
     fn assert_has_external_call_requested(&self, kind: ExternalCallKind) {
         self.assert_has_event(
             |event, cid| {
@@ -104,6 +116,7 @@ impl RuntimeObserverWorld {
         );
     }
 
+    /// Asserts the observer stream contains an external-call return of `kind`.
     fn assert_has_external_call_returned(&self, kind: ExternalCallReturnKind) {
         self.assert_has_event(
             |event, cid| {
@@ -118,6 +131,10 @@ impl RuntimeObserverWorld {
     }
 }
 
+/// Captures the handles returned by a start call with a recording observer.
+///
+/// `events` is a shared, mutex-protected log used across observer clones, while
+/// `progress` and `observer` drive the scenario resume and flush lifecycle.
 #[derive(Debug)]
 struct RecordingRunFixture {
     events: Arc<Mutex<Vec<RecordedEvent>>>,

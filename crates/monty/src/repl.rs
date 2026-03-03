@@ -18,16 +18,13 @@ use crate::{
     io::PrintWriter,
     namespace::{GLOBAL_NS_IDX, NamespaceId, Namespaces},
     object::MontyObject,
-    observer::{
-        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, RuntimeObserverEvent,
-        RuntimeObserverHandle,
-    },
+    observer::{ExternalCallKind, ExternalCallReturnKind, RuntimeObserverHandle},
     os::OsFunction,
     parse::{parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
     progress_runtime_ids::{RuntimeIdCardinality, RuntimeIdSlices, checked_runtime_id_payload},
     resource::ResourceTracker,
-    run::{ExternalResult, MontyFuture, emit_external_call_returned},
+    run::{ExternalResult, MontyFuture, emit_external_call_requested, emit_external_call_returned},
     runtime_id::RuntimeValueId,
     value::Value,
 };
@@ -1105,27 +1102,20 @@ fn missing_repl_snapshot_error(context: &str) -> MontyException {
     MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
 }
 
+/// Tracks REPL state needed to build long-running progress payloads.
+///
+/// For `T: ResourceTracker`, this bundles the optional suspended VM snapshot,
+/// execution metadata, owned REPL state/resources, and observer handle used when
+/// constructing resumable progress results.
 struct ReplProgressContext<T: ResourceTracker> {
+    /// Suspended VM state, present when execution yielded a resumable operation.
     vm_state: Option<VMSnapshot>,
+    /// Compiled snippet/module executor used to convert values and names.
     executor: ReplExecutor,
+    /// Owning REPL session state and resource tracker used for value conversion.
     repl: MontyRepl<T>,
+    /// Runtime observer handle used to emit progress lifecycle notifications.
     observer: RuntimeObserverHandle,
-}
-
-fn emit_external_call_requested(
-    observer: &RuntimeObserverHandle,
-    call_id: u32,
-    kind: ExternalCallKind,
-    host_args: &HostArgs,
-) {
-    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-        ExternalCallRequestedEvent {
-            call_id,
-            kind,
-            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-        },
-    ));
 }
 
 /// Classifies the REPL suspension call type so shared host-argument and
@@ -1153,7 +1143,13 @@ fn build_repl_external_call_progress_generic<T: ResourceTracker>(
         ReplCallKind::Method(_) => (ExternalCallKind::Method, "method call"),
         ReplCallKind::Os(_) => (ExternalCallKind::Os, "OS call"),
     };
-    emit_external_call_requested(&context.observer, call_id.raw(), observer_kind, &host_args);
+    emit_external_call_requested(
+        &context.observer,
+        call_id.raw(),
+        observer_kind,
+        host_args.arg_runtime_ids.as_slice(),
+        host_args.kwarg_runtime_ids.as_slice(),
+    );
     let state = build_repl_snapshot(context, call_id.raw(), snapshot_desc)?;
     let progress = match kind {
         ReplCallKind::Function(name) => host_args.into_function_call_progress(name, call_id.raw(), false, state),

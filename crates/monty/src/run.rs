@@ -575,7 +575,6 @@ impl<T: ResourceTracker> Snapshot<T> {
         print: &mut PrintWriter<'_>,
         observer: RuntimeObserverHandle,
     ) -> Result<RunProgress<T>, MontyException> {
-        self.observer = observer.clone();
         let ext_result = result.into();
 
         // Restore the VM from the snapshot
@@ -872,6 +871,30 @@ pub(crate) fn emit_external_call_returned(
     }));
 }
 
+/// Emits `ExternalCallRequested` when observer hooks are enabled.
+///
+/// Disabled observers are a deliberate no-op so callers can report request
+/// metadata without duplicating enablement checks.
+pub(crate) fn emit_external_call_requested(
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    kind: ExternalCallKind,
+    arg_runtime_ids: &[RuntimeValueId],
+    kwarg_runtime_ids: &[(RuntimeValueId, RuntimeValueId)],
+) {
+    if !observer.is_enabled() {
+        return;
+    }
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id,
+            kind,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
+        },
+    ));
+}
+
 /// Handles a FrameExit result and converts it to RunProgress for FutureSnapshot.
 ///
 /// This is a standalone function to avoid partial move issues when destructuring FutureSnapshot.
@@ -897,14 +920,13 @@ fn build_function_call_progress<T: ResourceTracker>(
     } else {
         ExternalCallKind::Function
     };
-    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-        ExternalCallRequestedEvent {
-            call_id: pending_call_id,
-            kind,
-            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-        },
-    ));
+    emit_external_call_requested(
+        &observer,
+        pending_call_id,
+        kind,
+        host_args.arg_runtime_ids.as_slice(),
+        host_args.kwarg_runtime_ids.as_slice(),
+    );
     let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("function call"))?;
     let state = Snapshot {
         executor,
@@ -927,6 +949,11 @@ fn build_function_call_progress<T: ResourceTracker>(
     })
 }
 
+/// Shared state threaded through `build_*` progress constructors.
+///
+/// The context owns VM snapshot data plus execution resources (`executor`,
+/// `heap`, and `namespaces`) and carries the observer used for emitted runtime
+/// notifications.
 struct RunProgressContext<T: ResourceTracker> {
     vm_state: Option<VMSnapshot>,
     executor: Executor,
@@ -935,6 +962,10 @@ struct RunProgressContext<T: ResourceTracker> {
     observer: RuntimeObserverHandle,
 }
 
+/// Builds a completion progress value from a returned VM value.
+///
+/// This converts the VM `Value` into a host-visible `MontyObject` and applies
+/// ref-count cleanup side effects when that feature is enabled.
 fn build_complete_progress<T: ResourceTracker>(value: Value, context: RunProgressContext<T>) -> RunProgress<T> {
     #[cfg(feature = "ref-count-panic")]
     {
@@ -951,6 +982,10 @@ fn build_complete_progress<T: ResourceTracker>(value: Value, context: RunProgres
     }
 }
 
+/// Builds an external-function call progress payload from a frame-exit record.
+///
+/// This resolves the external function name and forwards all conversion and
+/// snapshot construction to the shared function-call builder.
 fn build_external_call_progress<T: ResourceTracker>(
     ext_function_id: ExtFunctionId,
     args: crate::args::ArgValues,
@@ -978,6 +1013,10 @@ fn build_external_call_progress<T: ResourceTracker>(
     })
 }
 
+/// Builds an OS-call progress payload from a frame-exit record.
+///
+/// This converts VM arguments, emits the observer request event, and returns a
+/// suspendable snapshot that can resume once the host responds.
 fn build_os_call_progress<T: ResourceTracker>(
     function: OsFunction,
     args: crate::args::ArgValues,
@@ -993,14 +1032,13 @@ fn build_os_call_progress<T: ResourceTracker>(
     } = context;
     let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
     let pending_call_id = call_id.raw();
-    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-        ExternalCallRequestedEvent {
-            call_id: pending_call_id,
-            kind: ExternalCallKind::Os,
-            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-        },
-    ));
+    emit_external_call_requested(
+        &observer,
+        pending_call_id,
+        ExternalCallKind::Os,
+        host_args.arg_runtime_ids.as_slice(),
+        host_args.kwarg_runtime_ids.as_slice(),
+    );
     let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
     let state = Snapshot {
         executor,
@@ -1022,6 +1060,10 @@ fn build_os_call_progress<T: ResourceTracker>(
     })
 }
 
+/// Builds a method-call progress payload from a frame-exit record.
+///
+/// This resolves the interned method name and reuses the shared function-call
+/// builder to keep method and function suspension handling aligned.
 fn build_method_call_progress<T: ResourceTracker>(
     method_name: crate::value::EitherStr,
     args: crate::args::ArgValues,
@@ -1049,6 +1091,10 @@ fn build_method_call_progress<T: ResourceTracker>(
     })
 }
 
+/// Builds a resolve-futures progress payload for async suspension.
+///
+/// This converts pending scheduler call identifiers into raw IDs and returns a
+/// `FutureSnapshot` that the host can resume with completed results.
 fn build_resolve_futures_progress<T: ResourceTracker>(
     pending_call_ids: Vec<CallId>,
     context: RunProgressContext<T>,
@@ -1072,6 +1118,10 @@ fn build_resolve_futures_progress<T: ResourceTracker>(
     }))
 }
 
+/// Builds the error result path for a VM run cycle.
+///
+/// This maps internal `RunError` values into `MontyException` while performing
+/// ref-count cleanup side effects under the corresponding feature flag.
 fn build_run_error_progress<T: ResourceTracker>(
     err: RunError,
     context: RunProgressContext<T>,

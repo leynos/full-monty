@@ -602,7 +602,7 @@ impl<T: ResourceTracker> Snapshot<T> {
 
                 // Push the ExternalFuture value onto the stack
                 // This allows the code to continue and potentially await this future later
-                vm.push(Value::ExternalFuture(call_id));
+                vm.push_created(Value::ExternalFuture(call_id));
 
                 // Continue execution
                 vm.run()
@@ -849,6 +849,10 @@ struct FunctionCallProgressInput<T: ResourceTracker> {
     observer: RuntimeObserverHandle,
 }
 
+/// Builds a runtime error describing a missing VM snapshot for a progress path.
+///
+/// This centralises snapshot-missing messaging so all builders report the same
+/// failure when `vm_state` is unexpectedly `None`.
 fn missing_snapshot_error(context: &str) -> MontyException {
     MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
 }
@@ -1139,6 +1143,11 @@ fn build_run_error_progress<T: ResourceTracker>(
     }
 }
 
+/// Dispatches a `FrameExit` into the corresponding `RunProgress` builder.
+///
+/// This keeps branch-specific conversion logic out of the caller; it assumes
+/// `context` owns all resources and may move those resources into the returned
+/// progress value.
 fn dispatch_frame_exit<T: ResourceTracker>(
     frame_exit: FrameExit,
     context: RunProgressContext<T>,
@@ -1164,6 +1173,10 @@ fn dispatch_frame_exit<T: ResourceTracker>(
     }
 }
 
+/// Converts a VM run result into `RunProgress` using shared builder context.
+///
+/// This centralises success/error mapping and consumes `executor`, `heap`, and
+/// `namespaces`, moving them into the produced progress value or error path.
 fn handle_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
     vm_state: Option<VMSnapshot>,

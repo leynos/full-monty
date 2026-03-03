@@ -869,7 +869,7 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
                 emit_external_call_returned(&observer, pending_call_id, ExternalCallReturnKind::Future);
                 let call_id = CallId::new(pending_call_id);
                 vm.add_pending_call(call_id);
-                vm.push(Value::ExternalFuture(call_id));
+                vm.push_created(Value::ExternalFuture(call_id));
                 vm.run()
             }
         };
@@ -1098,15 +1098,19 @@ impl HostArgs {
     }
 }
 
+/// Builds a runtime error describing a missing REPL VM snapshot.
+///
+/// This centralises the message used when resumable REPL builders are invoked
+/// without `vm_state`, which indicates an internal state mismatch.
 fn missing_repl_snapshot_error(context: &str) -> MontyException {
     MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
 }
 
-/// Tracks REPL state needed to build long-running progress payloads.
+/// Shared REPL-owned state for converting `FrameExit` values into progress.
 ///
-/// For `T: ResourceTracker`, this bundles the optional suspended VM snapshot,
-/// execution metadata, owned REPL state/resources, and observer handle used when
-/// constructing resumable progress results.
+/// For `T: ResourceTracker`, this carries mutable REPL ownership (`repl`) plus
+/// compiler metadata and observer state; `vm_state` may be `None`, so builders
+/// that require suspension state must validate before constructing snapshots.
 struct ReplProgressContext<T: ResourceTracker> {
     /// Suspended VM state, present when execution yielded a resumable operation.
     vm_state: Option<VMSnapshot>,
@@ -1118,19 +1122,22 @@ struct ReplProgressContext<T: ResourceTracker> {
     observer: RuntimeObserverHandle,
 }
 
-/// Classifies the REPL suspension call type so shared host-argument and
-/// snapshot logic can be reused across function, method, and OS calls.
+/// Classifies the suspended REPL call variant for shared builder paths.
+///
+/// This allows one generic call-progress constructor to reuse argument
+/// conversion and snapshot logic while preserving variant-specific payload
+/// semantics (function, method, or OS call).
 enum ReplCallKind {
     Function(String),
     Method(String),
     Os(OsFunction),
 }
 
-/// Builds REPL external-call progress for all suspension call kinds.
+/// Builds call-progress output for all suspended REPL call kinds.
 ///
-/// This centralizes argument conversion, observer request emission, and
-/// snapshot construction so variant-specific builders only supply call kind
-/// details and naming.
+/// This exists to keep conversion/emission/snapshot logic in one place; it
+/// consumes `context`, so callers must not expect to reuse `repl` or `executor`
+/// after delegation, and snapshot creation will fail if `vm_state` is absent.
 fn build_repl_external_call_progress_generic<T: ResourceTracker>(
     kind: ReplCallKind,
     args: crate::args::ArgValues,
@@ -1159,6 +1166,11 @@ fn build_repl_external_call_progress_generic<T: ResourceTracker>(
     Ok(progress)
 }
 
+/// Builds a resumable `ReplSnapshot` from shared REPL progress context.
+///
+/// This isolates snapshot assembly and missing-state validation so all
+/// call-progress paths emit identical errors when `vm_state` is unexpectedly
+/// unavailable.
 fn build_repl_snapshot<T: ResourceTracker>(
     context: ReplProgressContext<T>,
     pending_call_id: u32,
@@ -1185,12 +1197,21 @@ fn build_repl_snapshot<T: ResourceTracker>(
     })
 }
 
+/// Commits compiled metadata from a snippet executor into persistent REPL state.
+///
+/// This exists because snippet execution can mutate symbol/function tables even
+/// when execution later fails; callers should run it exactly once when handing
+/// ownership of `executor` back to `repl`.
 fn commit_repl_executor_metadata<T: ResourceTracker>(repl: &mut MontyRepl<T>, executor: ReplExecutor) {
     let ReplExecutor { name_map, interns, .. } = executor;
     repl.global_name_map = name_map;
     repl.interns = interns;
 }
 
+/// Builds `ReplProgress::Complete` from a returned VM value.
+///
+/// This converts the value using the current heap and commits executor metadata
+/// so future snippets observe updated symbols and intern tables.
 fn build_repl_complete_progress<T: ResourceTracker>(
     value: Value,
     mut context: ReplProgressContext<T>,
@@ -1203,6 +1224,10 @@ fn build_repl_complete_progress<T: ResourceTracker>(
     }
 }
 
+/// Builds external-function call progress for REPL suspension.
+///
+/// This resolves the external function name and delegates to the generic call
+/// builder so request emission and snapshot behaviour stay uniform.
 fn build_repl_external_call_progress<T: ResourceTracker>(
     ext_function_id: ExtFunctionId,
     args: crate::args::ArgValues,
@@ -1213,6 +1238,10 @@ fn build_repl_external_call_progress<T: ResourceTracker>(
     build_repl_external_call_progress_generic(ReplCallKind::Function(function_name), args, call_id, context)
 }
 
+/// Builds OS-call progress for REPL suspension.
+///
+/// This exists as a thin adapter so OS calls share the generic conversion and
+/// snapshot pipeline without duplicating observer emission logic.
 fn build_repl_os_call_progress<T: ResourceTracker>(
     function: OsFunction,
     args: crate::args::ArgValues,
@@ -1222,6 +1251,10 @@ fn build_repl_os_call_progress<T: ResourceTracker>(
     build_repl_external_call_progress_generic(ReplCallKind::Os(function), args, call_id, context)
 }
 
+/// Builds method-call progress for REPL suspension.
+///
+/// This resolves the interned method name, then delegates so method-call
+/// progress follows the same snapshot/error semantics as other call kinds.
 fn build_repl_method_call_progress<T: ResourceTracker>(
     method_name: crate::value::EitherStr,
     args: crate::args::ArgValues,
@@ -1232,6 +1265,11 @@ fn build_repl_method_call_progress<T: ResourceTracker>(
     build_repl_external_call_progress_generic(ReplCallKind::Method(function_name), args, call_id, context)
 }
 
+/// Builds resolve-futures progress when a REPL snippet is blocked on futures.
+///
+/// This packages pending call IDs into `ReplFutureSnapshot`; like other
+/// suspendable paths, it errors if `vm_state` is missing because no resume
+/// state can be produced.
 fn build_repl_resolve_futures_progress<T: ResourceTracker>(
     pending_call_ids: Vec<CallId>,
     context: ReplProgressContext<T>,
@@ -1258,6 +1296,10 @@ fn build_repl_resolve_futures_progress<T: ResourceTracker>(
     }))
 }
 
+/// Maps an internal VM `RunError` into a REPL-preserving start error.
+///
+/// This centralises error conversion while ensuring executor metadata is still
+/// committed, because snippets may define symbols before failing.
 fn build_repl_runtime_error_progress<T: ResourceTracker>(
     err: RunError,
     mut context: ReplProgressContext<T>,
@@ -1273,6 +1315,10 @@ fn build_repl_runtime_error_progress<T: ResourceTracker>(
     }))
 }
 
+/// Dispatches a REPL `FrameExit` into the corresponding progress builder.
+///
+/// This keeps branch logic local and moves `context` into downstream builders,
+/// so each branch can safely consume and return owned REPL state.
 fn dispatch_repl_frame_exit<T: ResourceTracker>(
     frame_exit: FrameExit,
     context: ReplProgressContext<T>,
@@ -1298,6 +1344,11 @@ fn dispatch_repl_frame_exit<T: ResourceTracker>(
     }
 }
 
+/// Converts a VM run result into `ReplProgress` using shared context plumbing.
+///
+/// This exists to centralise success/error dispatch and ensures ownership of
+/// `repl`, `executor`, and `vm_state` is consumed into the returned progress or
+/// boxed start error.
 fn handle_repl_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
     vm_state: Option<VMSnapshot>,

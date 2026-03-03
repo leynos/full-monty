@@ -118,6 +118,10 @@ fn recording() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedEvent>>>) {
     build_recording_observer()
 }
 
+/// Selects how a suspended external call is resumed in return-kind tests.
+///
+/// Each case drives one `ExternalCallReturnKind` assertion path for the same
+/// script so event ordering differences stay isolated to resume semantics.
 #[derive(Debug, Clone, Copy)]
 enum ExternalResumeCase {
     Return,
@@ -125,6 +129,10 @@ enum ExternalResumeCase {
     Future,
 }
 
+/// Captures the relevant `RunProgress::FunctionCall` payload for cross-run assertions.
+///
+/// The snapshot state is retained so tests can continue execution while
+/// comparing function identity and argument payload stability.
 struct FunctionCallPayload<T: ResourceTracker> {
     function_name: String,
     args: Vec<MontyObject>,
@@ -134,6 +142,10 @@ struct FunctionCallPayload<T: ResourceTracker> {
     state: Snapshot<T>,
 }
 
+/// Builds a stable frozen dataclass value used in observer payload assertions.
+///
+/// Keeping this fixture value centralized avoids repeating structural literals
+/// across tests that compare serialized/runtime-observer object payloads.
 fn build_dataclass_point() -> MontyObject {
     MontyObject::Dataclass {
         name: "Point".to_string(),

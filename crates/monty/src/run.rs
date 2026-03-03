@@ -834,6 +834,10 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
     }
 }
 
+/// Groups state required to translate a suspended function/method call into `RunProgress`.
+///
+/// This keeps snapshot construction and observer emission wiring consistent
+/// across external-function and method-call branches.
 struct FunctionCallProgressInput<T: ResourceTracker> {
     function_name: String,
     args: crate::args::ArgValues,
@@ -850,6 +854,10 @@ fn missing_snapshot_error(context: &str) -> MontyException {
     MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
 }
 
+/// Emits `ExternalCallReturned` when observer hooks are enabled.
+///
+/// Disabled observers are a deliberate no-op so resume paths can invoke this
+/// helper unconditionally without branching on observer state.
 pub(crate) fn emit_external_call_returned(
     observer: &RuntimeObserverHandle,
     call_id: u32,
@@ -919,118 +927,211 @@ fn build_function_call_progress<T: ResourceTracker>(
     })
 }
 
-#[cfg_attr(
-    not(feature = "ref-count-panic"),
-    expect(
-        unused_mut,
-        reason = "mut bindings are required when the ref-count-panic feature is enabled"
-    )
-)]
+struct RunProgressContext<T: ResourceTracker> {
+    vm_state: Option<VMSnapshot>,
+    executor: Executor,
+    heap: Heap<T>,
+    namespaces: Namespaces,
+    observer: RuntimeObserverHandle,
+}
+
+fn build_complete_progress<T: ResourceTracker>(value: Value, context: RunProgressContext<T>) -> RunProgress<T> {
+    #[cfg(feature = "ref-count-panic")]
+    {
+        let mut context = context;
+        context.namespaces.drop_global_with_heap(&mut context.heap);
+        let obj = MontyObject::new(value, &mut context.heap, &context.executor.interns);
+        RunProgress::Complete(obj)
+    }
+    #[cfg(not(feature = "ref-count-panic"))]
+    {
+        let RunProgressContext { executor, mut heap, .. } = context;
+        let obj = MontyObject::new(value, &mut heap, &executor.interns);
+        RunProgress::Complete(obj)
+    }
+}
+
+fn build_external_call_progress<T: ResourceTracker>(
+    ext_function_id: ExtFunctionId,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    context: RunProgressContext<T>,
+) -> Result<RunProgress<T>, MontyException> {
+    let function_name = context.executor.interns.get_external_function_name(ext_function_id);
+    let RunProgressContext {
+        vm_state,
+        executor,
+        heap,
+        namespaces,
+        observer,
+    } = context;
+    build_function_call_progress(FunctionCallProgressInput {
+        function_name,
+        args,
+        call_id,
+        method_call: false,
+        executor,
+        vm_state,
+        heap,
+        namespaces,
+        observer,
+    })
+}
+
+fn build_os_call_progress<T: ResourceTracker>(
+    function: OsFunction,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    context: RunProgressContext<T>,
+) -> Result<RunProgress<T>, MontyException> {
+    let RunProgressContext {
+        vm_state,
+        executor,
+        mut heap,
+        namespaces,
+        observer,
+    } = context;
+    let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
+    let pending_call_id = call_id.raw();
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id: pending_call_id,
+            kind: ExternalCallKind::Os,
+            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
+            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
+        },
+    ));
+    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
+    let state = Snapshot {
+        executor,
+        vm_state,
+        heap,
+        namespaces,
+        pending_call_id,
+        observer,
+    };
+
+    Ok(RunProgress::OsCall {
+        function,
+        args: host_args.args,
+        arg_runtime_ids: host_args.arg_runtime_ids,
+        kwargs: host_args.kwargs,
+        kwarg_runtime_ids: host_args.kwarg_runtime_ids,
+        call_id: pending_call_id,
+        state,
+    })
+}
+
+fn build_method_call_progress<T: ResourceTracker>(
+    method_name: crate::value::EitherStr,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    context: RunProgressContext<T>,
+) -> Result<RunProgress<T>, MontyException> {
+    let function_name = method_name.into_string(&context.executor.interns);
+    let RunProgressContext {
+        vm_state,
+        executor,
+        heap,
+        namespaces,
+        observer,
+    } = context;
+    build_function_call_progress(FunctionCallProgressInput {
+        function_name,
+        args,
+        call_id,
+        method_call: true,
+        executor,
+        vm_state,
+        heap,
+        namespaces,
+        observer,
+    })
+}
+
+fn build_resolve_futures_progress<T: ResourceTracker>(
+    pending_call_ids: Vec<CallId>,
+    context: RunProgressContext<T>,
+) -> Result<RunProgress<T>, MontyException> {
+    let RunProgressContext {
+        vm_state,
+        executor,
+        heap,
+        namespaces,
+        observer,
+    } = context;
+    let pending_call_ids = pending_call_ids.into_iter().map(CallId::raw).collect();
+    let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("ResolveFutures"))?;
+    Ok(RunProgress::ResolveFutures(FutureSnapshot {
+        executor,
+        vm_state,
+        heap,
+        namespaces,
+        pending_call_ids,
+        observer,
+    }))
+}
+
+fn build_run_error_progress<T: ResourceTracker>(
+    err: RunError,
+    context: RunProgressContext<T>,
+) -> Result<RunProgress<T>, MontyException> {
+    #[cfg(feature = "ref-count-panic")]
+    {
+        let mut context = context;
+        context.namespaces.drop_global_with_heap(&mut context.heap);
+        Err(err.into_python_exception(&context.executor.interns, &context.executor.code))
+    }
+    #[cfg(not(feature = "ref-count-panic"))]
+    {
+        let RunProgressContext { executor, .. } = context;
+        Err(err.into_python_exception(&executor.interns, &executor.code))
+    }
+}
+
+fn dispatch_frame_exit<T: ResourceTracker>(
+    frame_exit: FrameExit,
+    context: RunProgressContext<T>,
+) -> Result<RunProgress<T>, MontyException> {
+    match frame_exit {
+        FrameExit::Return(value) => Ok(build_complete_progress(value, context)),
+        FrameExit::ExternalCall {
+            ext_function_id,
+            args,
+            call_id,
+        } => build_external_call_progress(ext_function_id, args, call_id, context),
+        FrameExit::OsCall {
+            function,
+            args,
+            call_id,
+        } => build_os_call_progress(function, args, call_id, context),
+        FrameExit::MethodCall {
+            method_name,
+            args,
+            call_id,
+        } => build_method_call_progress(method_name, args, call_id, context),
+        FrameExit::ResolveFutures(pending_call_ids) => build_resolve_futures_progress(pending_call_ids, context),
+    }
+}
+
 fn handle_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
     vm_state: Option<VMSnapshot>,
     executor: Executor,
-    mut heap: Heap<T>,
-    mut namespaces: Namespaces,
+    heap: Heap<T>,
+    namespaces: Namespaces,
     observer: RuntimeObserverHandle,
 ) -> Result<RunProgress<T>, MontyException> {
+    let context = RunProgressContext {
+        vm_state,
+        executor,
+        heap,
+        namespaces,
+        observer,
+    };
     match result {
-        Ok(FrameExit::Return(value)) => {
-            #[cfg(feature = "ref-count-panic")]
-            namespaces.drop_global_with_heap(&mut heap);
-
-            let obj = MontyObject::new(value, &mut heap, &executor.interns);
-            Ok(RunProgress::Complete(obj))
-        }
-        Ok(FrameExit::ExternalCall {
-            ext_function_id,
-            args,
-            call_id,
-        }) => {
-            let function_name = executor.interns.get_external_function_name(ext_function_id);
-            build_function_call_progress(FunctionCallProgressInput {
-                function_name,
-                args,
-                call_id,
-                method_call: false,
-                executor,
-                vm_state,
-                heap,
-                namespaces,
-                observer,
-            })
-        }
-        Ok(FrameExit::OsCall {
-            function,
-            args,
-            call_id,
-        }) => {
-            let host_args = args.into_py_objects_with_runtime_ids(&mut heap, &executor.interns);
-            let pending_call_id = call_id.raw();
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: pending_call_id,
-                    kind: ExternalCallKind::Os,
-                    arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-                    kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-                },
-            ));
-            let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("OS call"))?;
-            let state = Snapshot {
-                executor,
-                vm_state,
-                heap,
-                namespaces,
-                pending_call_id,
-                observer,
-            };
-
-            Ok(RunProgress::OsCall {
-                function,
-                args: host_args.args,
-                arg_runtime_ids: host_args.arg_runtime_ids,
-                kwargs: host_args.kwargs,
-                kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: pending_call_id,
-                state,
-            })
-        }
-        Ok(FrameExit::MethodCall {
-            method_name,
-            args,
-            call_id,
-        }) => {
-            let function_name = method_name.into_string(&executor.interns);
-            build_function_call_progress(FunctionCallProgressInput {
-                function_name,
-                args,
-                call_id,
-                method_call: true,
-                executor,
-                vm_state,
-                heap,
-                namespaces,
-                observer,
-            })
-        }
-        Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
-            let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();
-            let vm_state = vm_state.ok_or_else(|| missing_snapshot_error("ResolveFutures"))?;
-            Ok(RunProgress::ResolveFutures(FutureSnapshot {
-                executor,
-                vm_state,
-                heap,
-                namespaces,
-                pending_call_ids,
-                observer,
-            }))
-        }
-        Err(err) => {
-            #[cfg(feature = "ref-count-panic")]
-            namespaces.drop_global_with_heap(&mut heap);
-
-            Err(err.into_python_exception(&executor.interns, &executor.code))
-        }
+        Ok(frame_exit) => dispatch_frame_exit(frame_exit, context),
+        Err(err) => build_run_error_progress(err, context),
     }
 }
 

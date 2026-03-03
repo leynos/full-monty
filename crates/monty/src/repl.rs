@@ -1101,121 +1101,196 @@ impl HostArgs {
     }
 }
 
+fn missing_repl_snapshot_error(context: &str) -> MontyException {
+    MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
+}
+
+struct ReplProgressContext<T: ResourceTracker> {
+    vm_state: Option<VMSnapshot>,
+    executor: ReplExecutor,
+    repl: MontyRepl<T>,
+    observer: RuntimeObserverHandle,
+}
+
+fn emit_external_call_requested(
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    kind: ExternalCallKind,
+    host_args: &HostArgs,
+) {
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id,
+            kind,
+            arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
+            kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
+        },
+    ));
+}
+
+fn build_repl_snapshot<T: ResourceTracker>(
+    context: ReplProgressContext<T>,
+    pending_call_id: u32,
+    snapshot_context: &str,
+) -> Result<ReplSnapshot<T>, Box<ReplStartError<T>>> {
+    let ReplProgressContext {
+        vm_state,
+        executor,
+        repl,
+        observer,
+    } = context;
+    let Some(vm_state) = vm_state else {
+        return Err(Box::new(ReplStartError {
+            repl,
+            error: missing_repl_snapshot_error(snapshot_context),
+        }));
+    };
+    Ok(ReplSnapshot {
+        repl,
+        executor,
+        vm_state,
+        pending_call_id,
+        observer,
+    })
+}
+
+fn commit_repl_executor_metadata<T: ResourceTracker>(repl: &mut MontyRepl<T>, executor: ReplExecutor) {
+    let ReplExecutor { name_map, interns, .. } = executor;
+    repl.global_name_map = name_map;
+    repl.interns = interns;
+}
+
+fn build_repl_complete_progress<T: ResourceTracker>(
+    value: Value,
+    mut context: ReplProgressContext<T>,
+) -> ReplProgress<T> {
+    let output = MontyObject::new(value, &mut context.repl.heap, &context.executor.interns);
+    commit_repl_executor_metadata(&mut context.repl, context.executor);
+    ReplProgress::Complete {
+        repl: context.repl,
+        value: output,
+    }
+}
+
+fn build_repl_external_call_progress<T: ResourceTracker>(
+    ext_function_id: ExtFunctionId,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    mut context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    let function_name = context.executor.interns.get_external_function_name(ext_function_id);
+    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
+    emit_external_call_requested(&context.observer, call_id.raw(), ExternalCallKind::Function, &host_args);
+    let state = build_repl_snapshot(context, call_id.raw(), "external call")?;
+    Ok(host_args.into_function_call_progress(function_name, call_id.raw(), false, state))
+}
+
+fn build_repl_os_call_progress<T: ResourceTracker>(
+    function: OsFunction,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    mut context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
+    emit_external_call_requested(&context.observer, call_id.raw(), ExternalCallKind::Os, &host_args);
+    let state = build_repl_snapshot(context, call_id.raw(), "OS call")?;
+    Ok(host_args.into_os_call_progress(function, call_id.raw(), state))
+}
+
+fn build_repl_method_call_progress<T: ResourceTracker>(
+    method_name: crate::value::EitherStr,
+    args: crate::args::ArgValues,
+    call_id: CallId,
+    mut context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    let function_name = method_name.into_string(&context.executor.interns);
+    let host_args = HostArgs::from_vm_args(args, &mut context.repl.heap, &context.executor.interns);
+    emit_external_call_requested(&context.observer, call_id.raw(), ExternalCallKind::Method, &host_args);
+    let state = build_repl_snapshot(context, call_id.raw(), "method call")?;
+    Ok(host_args.into_function_call_progress(function_name, call_id.raw(), true, state))
+}
+
+fn build_repl_resolve_futures_progress<T: ResourceTracker>(
+    pending_call_ids: Vec<CallId>,
+    context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    let ReplProgressContext {
+        vm_state,
+        executor,
+        repl,
+        observer,
+    } = context;
+    let Some(vm_state) = vm_state else {
+        return Err(Box::new(ReplStartError {
+            repl,
+            error: missing_repl_snapshot_error("ResolveFutures"),
+        }));
+    };
+    let pending_call_ids = pending_call_ids.into_iter().map(CallId::raw).collect();
+    Ok(ReplProgress::ResolveFutures(ReplFutureSnapshot {
+        repl,
+        executor,
+        vm_state,
+        pending_call_ids,
+        observer,
+    }))
+}
+
+fn build_repl_runtime_error_progress<T: ResourceTracker>(
+    err: RunError,
+    mut context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    let error = err.into_python_exception(&context.executor.interns, &context.executor.code);
+    // Commit compiler metadata even on runtime errors, matching feed() behavior.
+    // Snippets can create new variables or functions before raising, and those
+    // values may reference FunctionId/StringId values from the new tables.
+    commit_repl_executor_metadata(&mut context.repl, context.executor);
+    Err(Box::new(ReplStartError {
+        repl: context.repl,
+        error,
+    }))
+}
+
+fn dispatch_repl_frame_exit<T: ResourceTracker>(
+    frame_exit: FrameExit,
+    context: ReplProgressContext<T>,
+) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+    match frame_exit {
+        FrameExit::Return(value) => Ok(build_repl_complete_progress(value, context)),
+        FrameExit::ExternalCall {
+            ext_function_id,
+            args,
+            call_id,
+        } => build_repl_external_call_progress(ext_function_id, args, call_id, context),
+        FrameExit::OsCall {
+            function,
+            args,
+            call_id,
+        } => build_repl_os_call_progress(function, args, call_id, context),
+        FrameExit::MethodCall {
+            method_name,
+            args,
+            call_id,
+        } => build_repl_method_call_progress(method_name, args, call_id, context),
+        FrameExit::ResolveFutures(pending_call_ids) => build_repl_resolve_futures_progress(pending_call_ids, context),
+    }
+}
+
 fn handle_repl_vm_result<T: ResourceTracker>(
     result: RunResult<FrameExit>,
     vm_state: Option<VMSnapshot>,
     executor: ReplExecutor,
-    mut repl: MontyRepl<T>,
+    repl: MontyRepl<T>,
     observer: RuntimeObserverHandle,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
-    fn missing_snapshot_error(context: &str) -> MontyException {
-        MontyException::runtime_error(format!("internal error: missing VM snapshot for {context}"))
-    }
-
-    macro_rules! new_repl_snapshot {
-        ($pending_call_id:expr, $context:expr) => {
-            match vm_state {
-                Some(vm_state) => Ok(ReplSnapshot {
-                    repl,
-                    executor,
-                    vm_state,
-                    pending_call_id: $pending_call_id,
-                    observer: observer.clone(),
-                }),
-                None => Err(Box::new(ReplStartError {
-                    repl,
-                    error: missing_snapshot_error($context),
-                })),
-            }
-        };
-    }
-
+    let context = ReplProgressContext {
+        vm_state,
+        executor,
+        repl,
+        observer,
+    };
     match result {
-        Ok(FrameExit::Return(value)) => {
-            let output = MontyObject::new(value, &mut repl.heap, &executor.interns);
-            let ReplExecutor { name_map, interns, .. } = executor;
-            repl.global_name_map = name_map;
-            repl.interns = interns;
-            Ok(ReplProgress::Complete { repl, value: output })
-        }
-        Ok(FrameExit::ExternalCall {
-            ext_function_id,
-            args,
-            call_id,
-        }) => {
-            let function_name = executor.interns.get_external_function_name(ext_function_id);
-            let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: call_id.raw(),
-                    kind: ExternalCallKind::Function,
-                    arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-                    kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-                },
-            ));
-            let state = new_repl_snapshot!(call_id.raw(), "external call")?;
-            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), false, state))
-        }
-        Ok(FrameExit::OsCall {
-            function,
-            args,
-            call_id,
-        }) => {
-            let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: call_id.raw(),
-                    kind: ExternalCallKind::Os,
-                    arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-                    kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-                },
-            ));
-            let state = new_repl_snapshot!(call_id.raw(), "OS call")?;
-            Ok(host_args.into_os_call_progress(function, call_id.raw(), state))
-        }
-        Ok(FrameExit::MethodCall {
-            method_name,
-            args,
-            call_id,
-        }) => {
-            let function_name = method_name.into_string(&executor.interns);
-            let host_args = HostArgs::from_vm_args(args, &mut repl.heap, &executor.interns);
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: call_id.raw(),
-                    kind: ExternalCallKind::Method,
-                    arg_runtime_ids: host_args.arg_runtime_ids.as_slice(),
-                    kwarg_runtime_ids: host_args.kwarg_runtime_ids.as_slice(),
-                },
-            ));
-            let state = new_repl_snapshot!(call_id.raw(), "method call")?;
-            Ok(host_args.into_function_call_progress(function_name, call_id.raw(), true, state))
-        }
-        Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
-            let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();
-            let Some(vm_state) = vm_state else {
-                return Err(Box::new(ReplStartError {
-                    repl,
-                    error: missing_snapshot_error("ResolveFutures"),
-                }));
-            };
-            Ok(ReplProgress::ResolveFutures(ReplFutureSnapshot {
-                repl,
-                executor,
-                vm_state,
-                pending_call_ids,
-                observer,
-            }))
-        }
-        Err(err) => {
-            let error = err.into_python_exception(&executor.interns, &executor.code);
-            // Commit compiler metadata even on runtime errors, matching feed() behavior.
-            // Snippets can create new variables or functions before raising, and those
-            // values may reference FunctionId/StringId values from the new tables.
-            let ReplExecutor { name_map, interns, .. } = executor;
-            repl.global_name_map = name_map;
-            repl.interns = interns;
-            Err(Box::new(ReplStartError { repl, error }))
-        }
+        Ok(frame_exit) => dispatch_repl_frame_exit(frame_exit, context),
+        Err(err) => build_repl_runtime_error_progress(err, context),
     }
 }

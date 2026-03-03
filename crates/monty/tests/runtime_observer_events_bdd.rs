@@ -77,6 +77,21 @@ struct RuntimeObserverWorld {
     call_id: Option<u32>,
 }
 
+impl RuntimeObserverWorld {
+    fn assert_has_event<F>(&self, predicate: F, error_message: &str)
+    where
+        F: Fn(&RecordedEvent, u32) -> bool,
+    {
+        let Some(call_id) = self.call_id else {
+            panic!("call id should be recorded");
+        };
+        assert!(
+            self.events.iter().any(|event| predicate(event, call_id)),
+            "{error_message}"
+        );
+    }
+}
+
 #[derive(Debug)]
 struct RecordingRunFixture {
     events: Arc<Mutex<Vec<RecordedEvent>>>,
@@ -119,6 +134,34 @@ fn recording_start_with_observer(
     }
 }
 
+/// Starts execution with a recording observer, resumes with a host result, and
+/// stores call/event state on the BDD world.
+fn start_and_resume_generic<R, A>(
+    world: &mut RuntimeObserverWorld,
+    external_functions: Vec<String>,
+    resume_value: R,
+    assert_result: A,
+) where
+    R: Into<monty::ExternalResult>,
+    A: FnOnce(Result<RunProgress<NoLimitTracker>, MontyException>),
+{
+    let fixture = recording_start_with_observer(world.script.clone(), vec![], external_functions, vec![]);
+
+    let RunProgress::FunctionCall { call_id, state, .. } = fixture.progress else {
+        panic!("expected function call progress");
+    };
+
+    world.call_id = Some(call_id);
+
+    let result = state.run(resume_value, &mut PrintWriter::Stdout);
+    assert_result(result);
+
+    drop(fixture.observer);
+    world
+        .events
+        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+}
+
 /// Provides a script that pauses at one external call.
 #[given("a suspendable script with one external function call")]
 fn given_external_function_script(world: &mut RuntimeObserverWorld) {
@@ -134,23 +177,10 @@ fn given_branching_script(world: &mut RuntimeObserverWorld) {
 /// Starts execution with an observer and resumes with a concrete return value.
 #[when("execution starts with a recording observer and resumes with integer return value")]
 fn when_start_and_resume_with_return(world: &mut RuntimeObserverWorld) {
-    let fixture = recording_start_with_observer(world.script.clone(), vec![], vec!["ext_fn".to_owned()], vec![]);
-
-    let RunProgress::FunctionCall { call_id, state, .. } = fixture.progress else {
-        panic!("expected function call progress");
-    };
-
-    world.call_id = Some(call_id);
-
-    let completion = state
-        .run(MontyObject::Int(9), &mut PrintWriter::Stdout)
-        .expect("resume should complete");
-    assert!(matches!(completion, RunProgress::Complete(MontyObject::Int(9))));
-
-    drop(fixture.observer);
-    world
-        .events
-        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    start_and_resume_generic(world, vec!["ext_fn".to_owned()], MontyObject::Int(9), |result| {
+        let completion = result.expect("resume should complete");
+        assert!(matches!(completion, RunProgress::Complete(MontyObject::Int(9))));
+    });
 }
 
 /// Starts execution with an observer and runs a branch snippet to completion.
@@ -174,80 +204,66 @@ fn when_start_and_complete(world: &mut RuntimeObserverWorld) {
 /// Starts execution with an observer and resumes with an external exception.
 #[when("execution starts with a recording observer and resumes with raised exception")]
 fn when_start_and_resume_with_exception(world: &mut RuntimeObserverWorld) {
-    let fixture = recording_start_with_observer(world.script.clone(), vec![], vec!["ext_fn".to_owned()], vec![]);
-
-    let RunProgress::FunctionCall { call_id, state, .. } = fixture.progress else {
-        panic!("expected function call progress");
-    };
-
-    world.call_id = Some(call_id);
-
-    let error = state
-        .run(
-            MontyException::new(ExcType::RuntimeError, Some("bdd failure".to_owned())),
-            &mut PrintWriter::Stdout,
-        )
-        .expect_err("resume should return an error");
-    assert!(error.to_string().contains("bdd failure"));
-
-    drop(fixture.observer);
-    world
-        .events
-        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    start_and_resume_generic(
+        world,
+        vec!["ext_fn".to_owned()],
+        MontyException::new(ExcType::RuntimeError, Some("bdd failure".to_owned())),
+        |result| {
+            let error = result.expect_err("resume should return an error");
+            assert!(error.to_string().contains("bdd failure"));
+        },
+    );
 }
 
 /// Asserts that an external function request event exists for the recorded call.
 #[then("observer events include an external function request")]
 fn then_has_external_request(world: &RuntimeObserverWorld) {
-    let Some(call_id) = world.call_id else {
-        panic!("call id should be recorded");
-    };
-
-    assert!(world.events.iter().any(|event| {
-        matches!(
-            event,
-            RecordedEvent::ExternalCallRequested {
-                call_id: observed_call_id,
-                kind: ExternalCallKind::Function,
-            } if *observed_call_id == call_id
-        )
-    }));
+    world.assert_has_event(
+        |event, call_id| {
+            matches!(
+                event,
+                RecordedEvent::ExternalCallRequested {
+                    call_id: observed_call_id,
+                    kind: ExternalCallKind::Function,
+                } if *observed_call_id == call_id
+            )
+        },
+        "expected ExternalCallRequested event with kind Function",
+    );
 }
 
 /// Asserts that a successful external return event exists for the recorded call.
 #[then("observer events include an external function return")]
 fn then_has_external_return(world: &RuntimeObserverWorld) {
-    let Some(call_id) = world.call_id else {
-        panic!("call id should be recorded");
-    };
-
-    assert!(world.events.iter().any(|event| {
-        matches!(
-            event,
-            RecordedEvent::ExternalCallReturned {
-                call_id: observed_call_id,
-                kind: ExternalCallReturnKind::Return,
-            } if *observed_call_id == call_id
-        )
-    }));
+    world.assert_has_event(
+        |event, call_id| {
+            matches!(
+                event,
+                RecordedEvent::ExternalCallReturned {
+                    call_id: observed_call_id,
+                    kind: ExternalCallReturnKind::Return,
+                } if *observed_call_id == call_id
+            )
+        },
+        "expected ExternalCallReturned event with kind Return",
+    );
 }
 
 /// Asserts that an external error return event exists for the recorded call.
 #[then("observer events include an external error return")]
 fn then_has_external_error_return(world: &RuntimeObserverWorld) {
-    let Some(call_id) = world.call_id else {
-        panic!("call id should be recorded");
-    };
-
-    assert!(world.events.iter().any(|event| {
-        matches!(
-            event,
-            RecordedEvent::ExternalCallReturned {
-                call_id: observed_call_id,
-                kind: ExternalCallReturnKind::Error,
-            } if *observed_call_id == call_id
-        )
-    }));
+    world.assert_has_event(
+        |event, call_id| {
+            matches!(
+                event,
+                RecordedEvent::ExternalCallReturned {
+                    call_id: observed_call_id,
+                    kind: ExternalCallReturnKind::Error,
+                } if *observed_call_id == call_id
+            )
+        },
+        "expected ExternalCallReturned event with kind Error",
+    );
 }
 
 /// Asserts that at least one control-condition event was emitted.

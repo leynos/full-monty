@@ -90,6 +90,32 @@ impl RuntimeObserverWorld {
             "{error_message}"
         );
     }
+
+    fn assert_has_external_call_requested(&self, kind: ExternalCallKind) {
+        self.assert_has_event(
+            |event, cid| {
+                matches!(
+                    event,
+                    RecordedEvent::ExternalCallRequested { call_id: id, kind: k }
+                        if *id == cid && *k == kind
+                )
+            },
+            &format!("expected ExternalCallRequested event with kind {kind:?}"),
+        );
+    }
+
+    fn assert_has_external_call_returned(&self, kind: ExternalCallReturnKind) {
+        self.assert_has_event(
+            |event, cid| {
+                matches!(
+                    event,
+                    RecordedEvent::ExternalCallReturned { call_id: id, kind: k }
+                        if *id == cid && *k == kind
+                )
+            },
+            &format!("expected ExternalCallReturned event with kind {kind:?}"),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -218,52 +244,19 @@ fn when_start_and_resume_with_exception(world: &mut RuntimeObserverWorld) {
 /// Asserts that an external function request event exists for the recorded call.
 #[then("observer events include an external function request")]
 fn then_has_external_request(world: &RuntimeObserverWorld) {
-    world.assert_has_event(
-        |event, call_id| {
-            matches!(
-                event,
-                RecordedEvent::ExternalCallRequested {
-                    call_id: observed_call_id,
-                    kind: ExternalCallKind::Function,
-                } if *observed_call_id == call_id
-            )
-        },
-        "expected ExternalCallRequested event with kind Function",
-    );
+    world.assert_has_external_call_requested(ExternalCallKind::Function);
 }
 
 /// Asserts that a successful external return event exists for the recorded call.
 #[then("observer events include an external function return")]
 fn then_has_external_return(world: &RuntimeObserverWorld) {
-    world.assert_has_event(
-        |event, call_id| {
-            matches!(
-                event,
-                RecordedEvent::ExternalCallReturned {
-                    call_id: observed_call_id,
-                    kind: ExternalCallReturnKind::Return,
-                } if *observed_call_id == call_id
-            )
-        },
-        "expected ExternalCallReturned event with kind Return",
-    );
+    world.assert_has_external_call_returned(ExternalCallReturnKind::Return);
 }
 
 /// Asserts that an external error return event exists for the recorded call.
 #[then("observer events include an external error return")]
 fn then_has_external_error_return(world: &RuntimeObserverWorld) {
-    world.assert_has_event(
-        |event, call_id| {
-            matches!(
-                event,
-                RecordedEvent::ExternalCallReturned {
-                    call_id: observed_call_id,
-                    kind: ExternalCallReturnKind::Error,
-                } if *observed_call_id == call_id
-            )
-        },
-        "expected ExternalCallReturned event with kind Error",
-    );
+    world.assert_has_external_call_returned(ExternalCallReturnKind::Error);
 }
 
 /// Asserts that at least one control-condition event was emitted.

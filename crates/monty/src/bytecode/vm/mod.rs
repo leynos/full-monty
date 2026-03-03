@@ -1357,20 +1357,12 @@ impl<'a, T: ResourceTracker> VM<'a, '_, T> {
         let input_id = self.observer.is_enabled().then(|| RuntimeValueId::new(value.id()));
         match value {
             Value::Int(n) => {
-                if let Some(negated) = n.checked_neg() {
-                    let output = Value::Int(negated);
-                    self.emit_unary_op_result(input_id, &output);
-                    self.push_created(output);
-                } else {
-                    let li = -LongInt::from(n);
-                    match li.into_value(self.heap) {
-                        Ok(v) => {
-                            self.emit_unary_op_result(input_id, &v);
-                            self.push_created(v);
-                        }
-                        Err(e) => return Err(RunError::from(e)),
-                    }
-                }
+                let output = n
+                    .checked_neg()
+                    .map(Value::Int)
+                    .map_or_else(|| (-LongInt::from(n)).into_value(self.heap).map_err(RunError::from), Ok)?;
+                self.emit_unary_op_result(input_id, &output);
+                self.push_created(output);
             }
             Value::Float(f) => {
                 let output = Value::Float(-f);
@@ -1383,24 +1375,22 @@ impl<'a, T: ResourceTracker> VM<'a, '_, T> {
                 self.push_created(output);
             }
             Value::Ref(id) => {
-                if let HeapData::LongInt(li) = self.heap.get(id) {
-                    let negated = -LongInt::new(li.inner().clone());
-                    match negated.into_value(self.heap) {
-                        Ok(v) => {
-                            self.emit_unary_op_result(input_id, &v);
-                            value.drop_with_heap(self.heap);
-                            self.push_created(v);
-                        }
-                        Err(e) => {
-                            value.drop_with_heap(self.heap);
-                            return Err(RunError::from(e));
-                        }
-                    }
-                } else {
+                let HeapData::LongInt(li) = self.heap.get(id) else {
                     let value_type = value.py_type(self.heap);
                     value.drop_with_heap(self.heap);
                     return Err(ExcType::unary_type_error("-", value_type));
-                }
+                };
+                let negated = -LongInt::new(li.inner().clone());
+                let v = match negated.into_value(self.heap).map_err(RunError::from) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        value.drop_with_heap(self.heap);
+                        return Err(error);
+                    }
+                };
+                self.emit_unary_op_result(input_id, &v);
+                value.drop_with_heap(self.heap);
+                self.push_created(v);
             }
             _ => {
                 let value_type = value.py_type(self.heap);

@@ -30,14 +30,6 @@ mod sorting;
 mod types;
 mod value;
 
-pub mod vm {
-    //! VM-facing runtime execution context re-exports.
-    //!
-    //! This module exposes [`VMContext`] for consumers that need to construct
-    //! or restore VM instances through stable crate-level APIs.
-    pub use crate::bytecode::VMContext;
-}
-
 #[cfg(feature = "ref-count-return")]
 pub use crate::run::RefCountOutput;
 pub use crate::{
@@ -60,5 +52,4 @@ pub use crate::{
     },
     run::{ExternalResult, FutureSnapshot, MontyFuture, MontyRun, RunProgress, Snapshot},
     runtime_id::RuntimeValueId,
-    vm::VMContext,
 };

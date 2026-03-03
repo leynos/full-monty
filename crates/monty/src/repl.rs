@@ -1036,6 +1036,10 @@ impl<T: ResourceTracker> ReplFutureSnapshot<T> {
 /// This mirrors `handle_vm_result` but preserves REPL heap/namespaces on
 /// completion by returning `ReplProgress::Complete { repl, value }`.
 /// On runtime errors, the REPL is preserved inside a `ReplStartError`.
+///
+/// `HostArgs` stores converted host-call payloads:
+/// `args`/`kwargs` are host-facing values and `arg_runtime_ids`/`kwarg_runtime_ids`
+/// preserve runtime identity metadata aligned to those argument lists.
 struct HostArgs {
     args: Vec<MontyObject>,
     arg_runtime_ids: Vec<RuntimeValueId>,
@@ -1044,6 +1048,12 @@ struct HostArgs {
 }
 
 impl HostArgs {
+    /// Converts VM argument storage into host-call payloads with runtime IDs.
+    ///
+    /// Takes VM-side `args: ArgValues` plus `heap: &mut Heap<T>` and
+    /// `interns: &Interns` (`T: ResourceTracker`), and returns `HostArgs` where:
+    /// `args` are positional values, `arg_runtime_ids` match those positions,
+    /// `kwargs` are key/value pairs, and `kwarg_runtime_ids` align to each pair.
     fn from_vm_args<T: ResourceTracker>(args: crate::args::ArgValues, heap: &mut Heap<T>, interns: &Interns) -> Self {
         let host_args = args.into_py_objects_with_runtime_ids(heap, interns);
         Self {

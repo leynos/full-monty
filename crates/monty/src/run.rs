@@ -5,7 +5,7 @@ use crate::{
     ExcType, MontyException,
     asyncio::CallId,
     bytecode::{Code, Compiler, FrameExit, VM, VMContext, VMSnapshot},
-    exception_private::RunResult,
+    exception_private::{RunError, RunResult},
     heap::{DropWithHeap, Heap},
     intern::{ExtFunctionId, Interns},
     io::PrintWriter,
@@ -723,8 +723,6 @@ impl<T: ResourceTracker> FutureSnapshot<T> {
         print: &mut PrintWriter<'_>,
         observer: RuntimeObserverHandle,
     ) -> Result<RunProgress<T>, MontyException> {
-        use crate::exception_private::RunError;
-
         // Destructure self to avoid partial move issues
         let Self {
             executor,

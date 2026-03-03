@@ -129,6 +129,8 @@ struct FunctionCallPayload<T: ResourceTracker> {
     function_name: String,
     args: Vec<MontyObject>,
     kwargs: Vec<(String, MontyObject)>,
+    call_id: u32,
+    method_call: bool,
     state: Snapshot<T>,
 }
 
@@ -152,6 +154,8 @@ fn extract_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: 
         function_name,
         args,
         kwargs,
+        call_id,
+        method_call,
         state,
         ..
     } = progress
@@ -171,6 +175,8 @@ fn extract_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: 
         function_name,
         args,
         kwargs,
+        call_id,
+        method_call,
         state,
     }
 }
@@ -180,6 +186,8 @@ fn assert_function_calls_equal<T: ResourceTracker>(left: &FunctionCallPayload<T>
     assert_eq!(left.function_name, right.function_name);
     assert_eq!(left.args, right.args);
     assert_eq!(left.kwargs, right.kwargs);
+    assert_eq!(left.call_id, right.call_id);
+    assert_eq!(left.method_call, right.method_call);
 }
 
 #[rstest]

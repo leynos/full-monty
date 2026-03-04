@@ -682,6 +682,19 @@ pub struct ReplFunctionCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplFunctionCall<T> {
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: Vec<u8>) -> Self {
+        self.snapshot = self.snapshot.with_snapshot_extension(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&[u8]> {
+        self.snapshot.snapshot_extension()
+    }
+
     /// Resumes snippet execution with an external result.
     pub fn resume(
         self,
@@ -726,6 +739,19 @@ pub struct ReplOsCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplOsCall<T> {
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: Vec<u8>) -> Self {
+        self.snapshot = self.snapshot.with_snapshot_extension(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&[u8]> {
+        self.snapshot.snapshot_extension()
+    }
+
     /// Resumes snippet execution with the OS call result.
     pub fn resume(
         self,
@@ -759,6 +785,19 @@ pub struct ReplNameLookup<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplNameLookup<T> {
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: Vec<u8>) -> Self {
+        self.snapshot = self.snapshot.with_snapshot_extension(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&[u8]> {
+        self.snapshot.snapshot_extension()
+    }
+
     /// Resumes execution after name resolution.
     ///
     /// Caches the resolved value in the namespace slot before restoring the VM,
@@ -782,6 +821,7 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
             observer,
             pending_call_id: _,
             pending_call_kind: _,
+            extension_bytes,
         } = snapshot;
 
         // Resolve the name lookup result BEFORE restoring the VM, since the VM
@@ -835,7 +875,7 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
             vm.resume_with_exception(err)
         };
         let vm_state = vm.check_snapshot(&vm_result);
-        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer)
+        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes)
     }
 }
 
@@ -857,12 +897,28 @@ pub struct ReplResolveFutures<T: ResourceTracker> {
     vm_state: VMSnapshot,
     /// Pending call IDs expected by this snapshot.
     pending_call_ids: Vec<u32>,
+    /// Optional embedder-owned bytes persisted with this snapshot.
+    #[serde(default, rename = "snapshot_extension")]
+    extension_bytes: Option<Vec<u8>>,
     /// Runtime observer carried across suspend/resume boundaries.
     #[serde(skip, default)]
     observer: RuntimeObserverHandle,
 }
 
 impl<T: ResourceTracker> ReplResolveFutures<T> {
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: Vec<u8>) -> Self {
+        self.extension_bytes = Some(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&[u8]> {
+        self.extension_bytes.as_deref()
+    }
+
     /// Returns unresolved call IDs for this suspended state.
     #[must_use]
     pub fn pending_call_ids(&self) -> &[u32] {
@@ -887,6 +943,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
             executor,
             vm_state,
             pending_call_ids,
+            extension_bytes,
             observer,
         } = self;
 
@@ -960,6 +1017,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
                     executor,
                     vm_state,
                     pending_call_ids,
+                    extension_bytes: extension_bytes.clone(),
                     observer,
                 }));
             }
@@ -968,7 +1026,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
         let vm_result = vm.run();
         let vm_state = vm.check_snapshot(&vm_result);
 
-        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer)
+        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes)
     }
 }
 
@@ -989,6 +1047,9 @@ pub(crate) struct ReplSnapshot<T: ResourceTracker> {
     executor: ReplExecutor,
     /// VM stack/frame state at suspension.
     vm_state: VMSnapshot,
+    /// Optional embedder-owned bytes persisted with this snapshot.
+    #[serde(default, rename = "snapshot_extension")]
+    extension_bytes: Option<Vec<u8>>,
     /// Runtime observer carried across suspend/resume boundaries.
     #[serde(skip)]
     observer: RuntimeObserverHandle,
@@ -998,6 +1059,19 @@ pub(crate) struct ReplSnapshot<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplSnapshot<T> {
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    fn with_snapshot_extension(mut self, snapshot_extension: Vec<u8>) -> Self {
+        self.extension_bytes = Some(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    fn snapshot_extension(&self) -> Option<&[u8]> {
+        self.extension_bytes.as_deref()
+    }
+
     /// Continues snippet execution with an external result.
     fn run(
         self,
@@ -1011,6 +1085,7 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
             observer,
             pending_call_id,
             pending_call_kind,
+            extension_bytes,
         } = self;
 
         let ext_result = result.into();
@@ -1047,7 +1122,7 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
 
         let vm_state = vm.check_snapshot(&vm_result);
 
-        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer)
+        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes)
     }
 }
 
@@ -1066,6 +1141,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
     executor: ReplExecutor,
     mut repl: MontyRepl<T>,
     observer: RuntimeObserverHandle,
+    extension_bytes: Option<Vec<u8>>,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
     macro_rules! new_repl_snapshot {
         ($pending_call_id:expr, $pending_call_kind:expr) => {
@@ -1073,6 +1149,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 repl,
                 executor,
                 vm_state: vm_state.expect("snapshot should exist"),
+                extension_bytes: extension_bytes.clone(),
                 observer: observer.clone(),
                 pending_call_id: $pending_call_id,
                 pending_call_kind: $pending_call_kind,
@@ -1175,6 +1252,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 executor,
                 vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
                 pending_call_ids,
+                extension_bytes: extension_bytes.clone(),
                 observer,
             }))
         }

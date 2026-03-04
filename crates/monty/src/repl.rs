@@ -20,6 +20,10 @@ use crate::{
     io::PrintWriter,
     namespace::NamespaceId,
     object::MontyObject,
+    observer::{
+        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, ExternalCallReturnedEvent,
+        RuntimeObserverEvent, RuntimeObserverHandle,
+    },
     os::OsFunction,
     parse::parse_with_interner,
     prepare::prepare_with_existing_names,
@@ -102,6 +106,17 @@ impl<T: ResourceTracker> MontyRepl<T> {
         inputs: Vec<(String, MontyObject)>,
         print: PrintWriter<'_>,
     ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+        self.feed_start_with_observer(code, inputs, print, RuntimeObserverHandle::disabled())
+    }
+
+    /// Starts executing a new snippet with a runtime observer attached.
+    pub fn feed_start_with_observer(
+        self,
+        code: &str,
+        inputs: Vec<(String, MontyObject)>,
+        print: PrintWriter<'_>,
+        observer: RuntimeObserverHandle,
+    ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
         let mut this = self;
         if code.is_empty() {
             return Ok(ReplProgress::Complete {
@@ -126,7 +141,13 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         this.ensure_globals_size(executor.namespace_size);
 
-        let mut vm = VM::new(mem::take(&mut this.globals), &mut this.heap, &executor.interns, print);
+        let mut vm = VM::new_with_observer(
+            mem::take(&mut this.globals),
+            &mut this.heap,
+            &executor.interns,
+            print,
+            observer.clone(),
+        );
 
         // Inject inputs with VM alive
         if let Err(error) = inject_inputs_into_vm(&executor, input_values, &mut vm) {
@@ -141,12 +162,22 @@ impl<T: ResourceTracker> MontyRepl<T> {
         let converted = convert_frame_exit(vm_result, &mut vm);
         if converted.needs_snapshot() {
             let vm_state = vm.snapshot();
-            build_repl_progress(converted, Some(vm_state), executor, this)
+            build_repl_progress(converted, Some(vm_state), executor, this, observer)
         } else {
             this.globals = vm.take_globals();
             vm.cleanup();
-            build_repl_progress(converted, None, executor, this)
+            build_repl_progress(converted, None, executor, this, observer)
         }
+    }
+
+    /// Convenience wrapper that starts a snippet with an observer and no explicit inputs.
+    pub fn start_with_observer(
+        self,
+        code: &str,
+        print: PrintWriter<'_>,
+        observer: RuntimeObserverHandle,
+    ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+        self.feed_start_with_observer(code, Vec::new(), print, observer)
     }
 
     /// Feeds and executes a new snippet against the current REPL state to completion.
@@ -555,15 +586,18 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
             mut repl,
             executor,
             vm_state,
+            observer,
+            ..
         } = snapshot;
 
         // Restore the VM first, then convert inside its lifetime
-        let mut vm = VM::restore(
+        let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
             &mut repl.heap,
             &executor.interns,
             print,
+            observer.clone(),
         );
 
         // Resolve the name lookup result with the VM alive
@@ -605,11 +639,11 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
         let converted = convert_frame_exit(vm_result, &mut vm);
         if converted.needs_snapshot() {
             let vm_state = vm.snapshot();
-            build_repl_progress(converted, Some(vm_state), executor, repl)
+            build_repl_progress(converted, Some(vm_state), executor, repl, observer)
         } else {
             repl.globals = vm.take_globals();
             vm.cleanup();
-            build_repl_progress(converted, None, executor, repl)
+            build_repl_progress(converted, None, executor, repl, observer)
         }
     }
 }
@@ -630,6 +664,9 @@ pub struct ReplResolveFutures<T: ResourceTracker> {
     executor: ReplExecutor,
     /// VM stack/frame state at suspension.
     vm_state: VMSnapshot,
+    /// Runtime observer to reattach across restore/resume boundaries.
+    #[serde(skip, default = "RuntimeObserverHandle::disabled")]
+    observer: RuntimeObserverHandle,
     /// Pending call IDs expected by this snapshot.
     pending_call_ids: Vec<u32>,
 }
@@ -664,6 +701,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
             mut repl,
             executor,
             vm_state,
+            observer,
             pending_call_ids,
         } = self;
 
@@ -672,12 +710,13 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
             .find(|(call_id, _)| !pending_call_ids.contains(call_id))
             .map(|(call_id, _)| *call_id);
 
-        let mut vm = VM::restore(
+        let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
             &mut repl.heap,
             &executor.interns,
             print,
+            observer.clone(),
         );
 
         if let Some(call_id) = invalid_call_id {
@@ -736,6 +775,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
                     repl,
                     executor,
                     vm_state,
+                    observer,
                     pending_call_ids,
                 }));
             }
@@ -747,11 +787,11 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
         let converted = convert_frame_exit(vm_result, &mut vm);
         if converted.needs_snapshot() {
             let vm_state = vm.snapshot();
-            build_repl_progress(converted, Some(vm_state), executor, repl)
+            build_repl_progress(converted, Some(vm_state), executor, repl, observer)
         } else {
             repl.globals = vm.take_globals();
             vm.cleanup();
-            build_repl_progress(converted, None, executor, repl)
+            build_repl_progress(converted, None, executor, repl, observer)
         }
     }
 }
@@ -910,6 +950,11 @@ pub(crate) struct ReplSnapshot<T: ResourceTracker> {
     executor: ReplExecutor,
     /// VM stack/frame state at suspension.
     vm_state: VMSnapshot,
+    /// Runtime observer to reattach across restore/resume boundaries.
+    #[serde(skip, default = "RuntimeObserverHandle::disabled")]
+    observer: RuntimeObserverHandle,
+    /// Host-visible call identifier for return-event emission on resume.
+    pending_call_id: u32,
 }
 
 impl<T: ResourceTracker> ReplSnapshot<T> {
@@ -934,16 +979,21 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
             mut repl,
             executor,
             vm_state,
+            observer,
+            pending_call_id,
         } = self;
 
         let ext_result = result.into();
 
-        let mut vm = VM::restore(
+        emit_external_call_returned(pending_call_id, &ext_result, &observer);
+
+        let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
             &mut repl.heap,
             &executor.interns,
             print,
+            observer.clone(),
         );
 
         let vm_result = match ext_result {
@@ -964,11 +1014,11 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
         let converted = convert_frame_exit(vm_result, &mut vm);
         if converted.needs_snapshot() {
             let vm_state = vm.snapshot();
-            build_repl_progress(converted, Some(vm_state), executor, repl)
+            build_repl_progress(converted, Some(vm_state), executor, repl, observer)
         } else {
             repl.globals = vm.take_globals();
             vm.cleanup();
-            build_repl_progress(converted, None, executor, repl)
+            build_repl_progress(converted, None, executor, repl, observer)
         }
     }
 }
@@ -1046,6 +1096,43 @@ fn frame_exit_to_object(
     }
 }
 
+/// Emits an external-call request event when observation is enabled.
+fn emit_external_call_requested(
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    kind: ExternalCallKind,
+    arg_runtime_ids: &[RuntimeValueId],
+    kwarg_runtime_ids: &[(RuntimeValueId, RuntimeValueId)],
+) {
+    if !observer.is_enabled() {
+        return;
+    }
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id,
+            kind,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
+        },
+    ));
+}
+
+/// Emits an external-call return event when observation is enabled.
+fn emit_external_call_returned(call_id: u32, result: &ExtFunctionResult, observer: &RuntimeObserverHandle) {
+    if !observer.is_enabled() {
+        return;
+    }
+    let kind = match result {
+        ExtFunctionResult::Return(_) => ExternalCallReturnKind::Return,
+        ExtFunctionResult::Error(_) | ExtFunctionResult::NotFound(_) => ExternalCallReturnKind::Error,
+        ExtFunctionResult::Future(_) => ExternalCallReturnKind::Future,
+    };
+    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+        call_id,
+        kind,
+    }));
+}
+
 /// Assembles a `ReplProgress` from already-converted data.
 ///
 /// This is the REPL equivalent of `build_run_progress`. On completion/error,
@@ -1056,13 +1143,16 @@ fn build_repl_progress<T: ResourceTracker>(
     vm_state: Option<VMSnapshot>,
     executor: ReplExecutor,
     mut repl: MontyRepl<T>,
+    observer: RuntimeObserverHandle,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
     macro_rules! new_repl_snapshot {
-        () => {
+        ($call_id:expr) => {
             ReplSnapshot {
                 repl,
                 executor,
                 vm_state: vm_state.expect("snapshot should exist"),
+                observer: observer.clone(),
+                pending_call_id: $call_id,
             }
         };
     }
@@ -1082,16 +1172,24 @@ fn build_repl_progress<T: ResourceTracker>(
             kwarg_runtime_ids,
             call_id,
             method_call,
-        } => Ok(ReplProgress::FunctionCall(ReplFunctionCall {
-            function_name,
-            args,
-            kwargs,
-            arg_runtime_ids,
-            kwarg_runtime_ids,
-            call_id,
-            method_call,
-            snapshot: new_repl_snapshot!(),
-        })),
+        } => {
+            let kind = if method_call {
+                ExternalCallKind::Method
+            } else {
+                ExternalCallKind::Function
+            };
+            emit_external_call_requested(&observer, call_id, kind, &arg_runtime_ids, &kwarg_runtime_ids);
+            Ok(ReplProgress::FunctionCall(ReplFunctionCall {
+                function_name,
+                args,
+                kwargs,
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                call_id,
+                method_call,
+                snapshot: new_repl_snapshot!(call_id),
+            }))
+        }
         ConvertedExit::OsCall {
             function,
             args,
@@ -1099,19 +1197,29 @@ fn build_repl_progress<T: ResourceTracker>(
             arg_runtime_ids,
             kwarg_runtime_ids,
             call_id,
-        } => Ok(ReplProgress::OsCall(ReplOsCall {
-            function,
-            args,
-            kwargs,
-            arg_runtime_ids,
-            kwarg_runtime_ids,
-            call_id,
-            snapshot: new_repl_snapshot!(),
-        })),
+        } => {
+            emit_external_call_requested(
+                &observer,
+                call_id,
+                ExternalCallKind::Os,
+                &arg_runtime_ids,
+                &kwarg_runtime_ids,
+            );
+            Ok(ReplProgress::OsCall(ReplOsCall {
+                function,
+                args,
+                kwargs,
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                call_id,
+                snapshot: new_repl_snapshot!(call_id),
+            }))
+        }
         ConvertedExit::ResolveFutures(pending_call_ids) => Ok(ReplProgress::ResolveFutures(ReplResolveFutures {
             repl,
             executor,
             vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
+            observer,
             pending_call_ids,
         })),
         ConvertedExit::NameLookup {
@@ -1122,7 +1230,7 @@ fn build_repl_progress<T: ResourceTracker>(
             name,
             namespace_slot,
             is_global,
-            snapshot: new_repl_snapshot!(),
+            snapshot: new_repl_snapshot!(0),
         })),
         ConvertedExit::Error(err) => {
             let error = err.into_python_exception(&executor.interns, &executor.code);

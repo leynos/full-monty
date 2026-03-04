@@ -20,7 +20,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         defer_drop!(lhs, this);
 
         let result = lhs.py_eq(rhs, this)?;
-        this.push(Value::Bool(result));
+        let output = Value::Bool(result);
+        this.emit_binary_op_result(lhs, rhs, &output);
+        this.push_created(output);
         Ok(())
     }
 
@@ -34,7 +36,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         defer_drop!(lhs, this);
 
         let result = !lhs.py_eq(rhs, this)?;
-        this.push(Value::Bool(result));
+        let output = Value::Bool(result);
+        this.emit_binary_op_result(lhs, rhs, &output);
+        this.push_created(output);
         Ok(())
     }
 
@@ -51,7 +55,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         defer_drop!(lhs, this);
 
         let result = lhs.py_cmp(rhs, this)?.is_some_and(check);
-        this.push(Value::Bool(result));
+        let output = Value::Bool(result);
+        this.emit_binary_op_result(lhs, rhs, &output);
+        this.push_created(output);
         Ok(())
     }
 
@@ -73,7 +79,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         defer_drop!(lhs, this);
 
         let result = lhs.is(rhs);
-        this.push(Value::Bool(if negate { !result } else { result }));
+        let output = Value::Bool(if negate { !result } else { result });
+        this.emit_binary_op_result(lhs, rhs, &output);
+        this.push_created(output);
     }
 
     /// Membership test (in/not in).
@@ -86,7 +94,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         defer_drop!(item, this);
 
         let contained = container.py_contains(item, this)?;
-        this.push(Value::Bool(if negate { !contained } else { contained }));
+        let output = Value::Bool(if negate { !contained } else { contained });
+        this.emit_binary_op_result(item, container, &output);
+        this.push_created(output);
         Ok(())
     }
 
@@ -114,7 +124,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         if let Some(is_equal) = mod_result {
             // Fast path succeeded
-            this.push(Value::Bool(is_equal));
+            let output = Value::Bool(is_equal);
+            this.emit_binary_op_result(lhs, rhs, &output);
+            this.push_created(output);
             Ok(())
         } else {
             // Fallback: compute py_mod then compare with py_eq
@@ -136,7 +148,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                     defer_drop!(k_value, this);
 
                     let is_equal = v.py_eq(k_value, this)?;
-                    this.push(Value::Bool(is_equal));
+                    let output = Value::Bool(is_equal);
+                    this.emit_binary_op_result(lhs, rhs, &output);
+                    this.push_created(output);
                     Ok(())
                 }
                 Ok(None) => Err(ExcType::type_error("unsupported operand type(s) for %")),

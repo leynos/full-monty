@@ -25,7 +25,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_add(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -63,7 +64,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_sub(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -88,7 +90,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_mult(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -113,7 +116,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_div(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -138,7 +142,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_floordiv(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -163,7 +168,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_mod(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -189,7 +195,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         match lhs.py_pow(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {
@@ -231,7 +238,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         }
 
         let result = lhs.py_bitwise(rhs, op, this.heap)?;
-        this.push(result);
+        this.emit_binary_op_result(lhs, rhs, &result);
+        this.push_created(result);
         Ok(())
     }
 
@@ -333,13 +341,15 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         if lhs.py_iadd(rhs, this, lhs.ref_id())? {
             // In-place operation succeeded - push lhs back
             let (lhs, this) = lhs_guard.into_parts();
+            this.emit_binary_op_result(&lhs, rhs, &lhs);
             this.push(lhs);
             return Ok(());
         }
 
         // Next try regular addition
         if let Some(v) = lhs.py_add(rhs, this)? {
-            this.push(v);
+            this.emit_binary_op_result(lhs, rhs, &v);
+            this.push_created(v);
             return Ok(());
         }
 

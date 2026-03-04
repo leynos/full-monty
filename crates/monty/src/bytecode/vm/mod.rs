@@ -11,6 +11,7 @@ mod collections;
 mod compare;
 mod exceptions;
 mod format;
+pub mod observer_hooks;
 mod scheduler;
 
 use std::cmp::Ordering;
@@ -29,6 +30,7 @@ use crate::{
     intern::{FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::BuiltinModule,
+    observer::RuntimeObserverHandle,
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
@@ -583,6 +585,9 @@ pub struct VM<'a, 'p, T: ResourceTracker> {
     /// need a reference to the module code when being restored after task switching.
     module_code: Option<&'a Code>,
 
+    /// Optional runtime observer for host instrumentation.
+    observer: RuntimeObserverHandle,
+
     /// Bytecode IP of the most recent `LoadGlobalCallable`/`LoadLocalCallable` that
     /// pushed an `ExtFunction` for an undefined name.
     ///
@@ -600,6 +605,17 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         interns: &'a Interns,
         print_writer: PrintWriter<'p>,
     ) -> Self {
+        Self::new_with_observer(globals, heap, interns, print_writer, RuntimeObserverHandle::disabled())
+    }
+
+    /// Creates a new VM with an explicit runtime observer.
+    pub fn new_with_observer(
+        globals: Vec<Value>,
+        heap: &'a mut Heap<T>,
+        interns: &'a Interns,
+        print_writer: PrintWriter<'p>,
+        observer: RuntimeObserverHandle,
+    ) -> Self {
         Self {
             stack: Vec::with_capacity(64),
             globals,
@@ -613,27 +629,18 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             scheduler: None,            // Lazy - no allocation for sync code
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
+            observer,
         }
     }
 
-    /// Reconstructs a VM from a snapshot.
-    ///
-    /// The heap must already be deserialized. `FunctionId` values
-    /// in frames are used to look up pre-compiled `Code` objects from the `Interns`.
-    /// The `module_code` is used for frames with `function_id = None`.
-    ///
-    /// # Arguments
-    /// * `snapshot` - The VM snapshot to restore
-    /// * `module_code` - Compiled module code (for frames with function_id = None)
-    /// * `heap` - The deserialized heap
-    /// * `interns` - Interns for looking up function code
-    /// * `print_writer` - Writer for print output
-    pub fn restore(
+    /// Reconstructs a VM from a snapshot with an explicit runtime observer.
+    pub fn restore_with_observer(
         snapshot: VMSnapshot,
         module_code: &'a Code,
         heap: &'a mut Heap<T>,
         interns: &'a Interns,
         print_writer: PrintWriter<'p>,
+        observer: RuntimeObserverHandle,
     ) -> Self {
         // Reconstruct call frames from serialized form
         let frames: Vec<CallFrame<'_>> = snapshot
@@ -675,6 +682,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             scheduler: snapshot.scheduler,
             module_code: Some(module_code),
             ext_function_load_ip: None,
+            observer,
         }
     }
     /// Consumes the VM and creates a snapshot for pause/resume.
@@ -1182,7 +1190,9 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 Opcode::JumpIfTrue => {
                     let offset = fetch_i16!(cached_frame);
                     let cond = self.pop();
-                    if cond.py_bool(self) {
+                    let branch_taken = cond.py_bool(self);
+                    self.emit_control_condition(&cond, branch_taken);
+                    if branch_taken {
                         jump_relative!(cached_frame.ip, offset);
                     }
                     cond.drop_with_heap(self);
@@ -1190,14 +1200,18 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 Opcode::JumpIfFalse => {
                     let offset = fetch_i16!(cached_frame);
                     let cond = self.pop();
-                    if !cond.py_bool(self) {
+                    let branch_taken = !cond.py_bool(self);
+                    self.emit_control_condition(&cond, branch_taken);
+                    if branch_taken {
                         jump_relative!(cached_frame.ip, offset);
                     }
                     cond.drop_with_heap(self);
                 }
                 Opcode::JumpIfTrueOrPop => {
                     let offset = fetch_i16!(cached_frame);
-                    if self.peek().py_bool(self) {
+                    let branch_taken = self.peek().py_bool(self);
+                    self.emit_control_condition(self.peek(), branch_taken);
+                    if branch_taken {
                         jump_relative!(cached_frame.ip, offset);
                     } else {
                         let value = self.pop();
@@ -1206,11 +1220,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 }
                 Opcode::JumpIfFalseOrPop => {
                     let offset = fetch_i16!(cached_frame);
-                    if self.peek().py_bool(self) {
+                    let branch_taken = !self.peek().py_bool(self);
+                    self.emit_control_condition(self.peek(), branch_taken);
+                    if branch_taken {
+                        jump_relative!(cached_frame.ip, offset);
+                    } else {
                         let value = self.pop();
                         value.drop_with_heap(self);
-                    } else {
-                        jump_relative!(cached_frame.ip, offset);
                     }
                 }
                 // Iteration - route through exception handling
@@ -1567,6 +1583,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         let value = obj
             .to_value(self)
             .map_err(|e| SimpleException::new(ExcType::RuntimeError, Some(format!("invalid return type: {e}"))))?;
+        self.emit_op_result(&value, crate::observer::OpInputIds::none());
         self.push(value);
         self.run()
     }

@@ -25,7 +25,8 @@ impl<T: ResourceTracker> VM<'_, T> {
 
         match lhs.py_add(rhs, this) {
             Ok(Some(v)) => {
-                this.push(v);
+                this.emit_binary_op_result(lhs, rhs, &v);
+                this.push_created(v);
                 Ok(())
             }
             Ok(None) => {

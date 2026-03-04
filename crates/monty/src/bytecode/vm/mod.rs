@@ -11,6 +11,7 @@ mod collections;
 mod compare;
 mod exceptions;
 mod format;
+mod observer_hooks;
 mod scheduler;
 
 use std::{cmp::Ordering, mem};
@@ -32,6 +33,7 @@ use crate::{
     intern::{FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::{StandardLib, json::JsonStringCache},
+    observer::RuntimeObserverHandle,
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
@@ -586,6 +588,9 @@ pub struct VM<'h, T: ResourceTracker> {
     /// across multiple `json.loads()` calls within a single execution. Lazily
     /// initialized on first use, cleaned up when the VM is dropped.
     pub(crate) json_string_cache: JsonStringCache,
+
+    /// Optional runtime observer for host instrumentation.
+    observer: RuntimeObserverHandle,
 }
 
 impl<'h, T: ResourceTracker> VM<'h, T> {
@@ -595,6 +600,23 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         heap: &'h mut HeapReader<'h, T>,
         interns: &'h Interns,
         print_writer: PrintWriter<'h>,
+    ) -> Self {
+        Self::new_with_observer(
+            globals,
+            heap,
+            interns,
+            print_writer,
+            RuntimeObserverHandle::disabled(),
+        )
+    }
+
+    /// Creates a new VM with an explicit runtime observer.
+    pub fn new_with_observer(
+        globals: Vec<Value>,
+        heap: &'h mut HeapReader<'h, T>,
+        interns: &'h Interns,
+        print_writer: PrintWriter<'h>,
+        observer: RuntimeObserverHandle,
     ) -> Self {
         Self {
             stack: Vec::with_capacity(64),
@@ -609,6 +631,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
             json_string_cache: JsonStringCache::default(),
+            observer,
         }
     }
 
@@ -630,6 +653,25 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         heap: &'h mut HeapReader<'h, T>,
         interns: &'h Interns,
         print_writer: PrintWriter<'h>,
+    ) -> Self {
+        Self::restore_with_observer(
+            snapshot,
+            module_code,
+            heap,
+            interns,
+            print_writer,
+            RuntimeObserverHandle::disabled(),
+        )
+    }
+
+    /// Reconstructs a VM from a snapshot with an explicit runtime observer.
+    pub fn restore_with_observer(
+        snapshot: VMSnapshot,
+        module_code: &'h Code,
+        heap: &'h mut HeapReader<'h, T>,
+        interns: &'h Interns,
+        print_writer: PrintWriter<'h>,
+        observer: RuntimeObserverHandle,
     ) -> Self {
         // Reconstruct call frames from serialized form
         let frames: Vec<CallFrame<'_>> = snapshot
@@ -671,6 +713,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
             module_code: Some(module_code),
             ext_function_load_ip: None,
             json_string_cache: JsonStringCache::default(),
+            observer,
         }
     }
 
@@ -1167,7 +1210,9 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 Opcode::JumpIfTrue => {
                     let offset = fetch_i16!(cached_frame);
                     let cond = self.pop();
-                    if cond.py_bool(self) {
+                    let branch_taken = cond.py_bool(self);
+                    self.emit_control_condition(&cond, branch_taken);
+                    if branch_taken {
                         jump_relative!(cached_frame.ip, offset);
                     }
                     cond.drop_with_heap(self);
@@ -1175,7 +1220,9 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 Opcode::JumpIfFalse => {
                     let offset = fetch_i16!(cached_frame);
                     let cond = self.pop();
-                    if !cond.py_bool(self) {
+                    let branch_taken = !cond.py_bool(self);
+                    self.emit_control_condition(&cond, branch_taken);
+                    if branch_taken {
                         jump_relative!(cached_frame.ip, offset);
                     }
                     cond.drop_with_heap(self);
@@ -1183,7 +1230,9 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 Opcode::JumpIfTrueOrPop => {
                     let offset = fetch_i16!(cached_frame);
                     let value = self.pop();
-                    if value.py_bool(self) {
+                    let branch_taken = value.py_bool(self);
+                    self.emit_control_condition(&value, branch_taken);
+                    if branch_taken {
                         self.push(value);
                         jump_relative!(cached_frame.ip, offset);
                     } else {
@@ -1193,7 +1242,9 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 Opcode::JumpIfFalseOrPop => {
                     let offset = fetch_i16!(cached_frame);
                     let value = self.pop();
-                    if value.py_bool(self) {
+                    let branch_taken = !value.py_bool(self);
+                    self.emit_control_condition(&value, branch_taken);
+                    if !branch_taken {
                         value.drop_with_heap(self);
                     } else {
                         self.push(value);

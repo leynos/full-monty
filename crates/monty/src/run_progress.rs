@@ -18,11 +18,15 @@ use crate::{
     heap::{Heap, HeapReader},
     io::PrintWriter,
     object::MontyObject,
+    observer::{
+        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, ExternalCallReturnedEvent,
+        RuntimeObserverEvent, RuntimeObserverHandle,
+    },
     os::OsFunction,
     resource::ResourceTracker,
     run::Executor,
-    value::Value,
     runtime_id::RuntimeValueId,
+    value::Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,23 +57,70 @@ pub enum RunProgress<T: ResourceTracker> {
     Complete(MontyObject),
 }
 
-impl<T: ResourceTracker + DeserializeOwned> RunProgress<T> {
-    /// Deserializes execution state from binary format.
-    ///
-    /// # Errors
-    /// Returns an error if deserialization fails.
-    pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+impl<T: ResourceTracker> RunProgress<T> {
+    /// Consumes the progress and returns the `FunctionCall` struct if this is a function call.
+    #[must_use]
+    pub fn into_function_call(self) -> Option<FunctionCall<T>> {
+        match self {
+            Self::FunctionCall(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// Consumes the progress and returns the `OsCall` struct if this is an OS call.
+    #[must_use]
+    pub fn into_os_call(self) -> Option<OsCall<T>> {
+        match self {
+            Self::OsCall(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// Consumes the progress and returns the final value if execution completed.
+    #[must_use]
+    pub fn into_complete(self) -> Option<MontyObject> {
+        match self {
+            Self::Complete(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Consumes the progress and returns the `ResolveFutures` struct.
+    #[must_use]
+    pub fn into_resolve_futures(self) -> Option<ResolveFutures<T>> {
+        match self {
+            Self::ResolveFutures(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Consumes the progress and returns the `NameLookup` struct.
+    #[must_use]
+    pub fn into_name_lookup(self) -> Option<NameLookup<T>> {
+        match self {
+            Self::NameLookup(lookup) => Some(lookup),
+            _ => None,
+        }
+    }
+
+    /// Returns runtime-ID slices for suspendable call variants.
+    #[must_use]
+    pub fn runtime_ids(&self) -> Option<RuntimeIdSlices<'_>> {
+        match self {
+            Self::FunctionCall(call) => Some((&call.arg_runtime_ids, &call.kwarg_runtime_ids)),
+            Self::OsCall(call) => Some((&call.arg_runtime_ids, &call.kwarg_runtime_ids)),
+            _ => None,
+        }
     }
 }
 
-impl<T: ResourceTracker + DeserializeOwned> RunProgress<T> {
-    /// Deserializes execution state from binary format.
+impl<T: ResourceTracker + serde::Serialize> RunProgress<T> {
+    /// Serializes the execution state to a binary format.
     ///
     /// # Errors
-    /// Returns an error if deserialization fails.
-    pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+    /// Returns an error if serialization fails.
+    pub fn dump(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
     }
 }
 
@@ -259,6 +310,8 @@ impl<T: ResourceTracker> NameLookup<T> {
             mut heap,
             executor,
             vm_state: snapshot_vm_state,
+            observer,
+            ..
         } = self.snapshot;
         let namespace_slot = self.namespace_slot;
         let is_global = self.is_global;
@@ -267,12 +320,13 @@ impl<T: ResourceTracker> NameLookup<T> {
         let (converted, vm_state) =
             HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
                 // Restore the VM first, then convert inside its lifetime
-                let mut vm = VM::restore(
+                let mut vm = VM::restore_with_observer(
                     snapshot_vm_state,
                     &executor.module_code,
                     reader,
                     &executor.interns,
                     print.reborrow(),
+                    observer.clone(),
                 );
 
                 // Resolve the name lookup result with the VM alive
@@ -295,7 +349,7 @@ impl<T: ResourceTracker> NameLookup<T> {
                             old.drop_with_heap(&mut vm);
                         }
 
-                        vm.push(value);
+                        vm.push_created(value);
                         vm.run()
                     }
                     NameLookupResult::Undefined => {
@@ -309,7 +363,7 @@ impl<T: ResourceTracker> NameLookup<T> {
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 Ok((converted, vm_state))
             })?;
-        build_run_progress(converted, vm_state, executor, heap)
+        build_run_progress(converted, vm_state, executor, heap, observer)
     }
 }
 
@@ -333,17 +387,27 @@ pub struct ResolveFutures<T: ResourceTracker> {
     vm_state: VMSnapshot,
     /// The heap containing all allocated objects.
     heap: Heap<T>,
+    /// Runtime observer to reattach across restore/resume boundaries.
+    #[serde(skip, default = "RuntimeObserverHandle::disabled")]
+    observer: RuntimeObserverHandle,
     /// The pending call_ids that this snapshot is waiting on.
     pending_call_ids: Vec<u32>,
 }
 
 impl<T: ResourceTracker> ResolveFutures<T> {
     /// Creates a new `ResolveFutures` from its parts.
-    fn new(executor: Executor, vm_state: VMSnapshot, heap: Heap<T>, pending_call_ids: Vec<u32>) -> Self {
+    fn new(
+        executor: Executor,
+        vm_state: VMSnapshot,
+        heap: Heap<T>,
+        observer: RuntimeObserverHandle,
+        pending_call_ids: Vec<u32>,
+    ) -> Self {
         Self {
             executor,
             vm_state,
             heap,
+            observer,
             pending_call_ids,
         }
     }
@@ -368,22 +432,24 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             executor,
             vm_state,
             mut heap,
+            observer,
             pending_call_ids,
         } = self;
 
-        let vm_state = HeapReader::with(&mut heap, &mut &executor, |reader, executor| {
-            let mut vm = VM::restore(
+        let vm_state = HeapReader::with(&mut heap, &mut (&executor, &observer), |reader, (executor, observer)| {
+            let mut vm = VM::restore_with_observer(
                 vm_state,
                 &executor.module_code,
                 reader,
                 &executor.interns,
                 PrintWriter::Stdout,
+                (*observer).clone(),
             );
             vm.__force_gc_for_tests();
             vm.snapshot()
         });
 
-        Self::new(executor, vm_state, heap, pending_call_ids)
+        Self::new(executor, vm_state, heap, observer, pending_call_ids)
     }
 
     /// Resumes execution with results for some or all pending futures.
@@ -410,8 +476,13 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             executor,
             vm_state,
             mut heap,
+            observer,
             pending_call_ids,
         } = self;
+
+        for (call_id, result) in &results {
+            emit_external_call_returned(*call_id, result, &observer);
+        }
 
         // Validate that all provided call_ids are in the pending set before restoring VM.
         let invalid_call_id = results
@@ -422,12 +493,13 @@ impl<T: ResourceTracker> ResolveFutures<T> {
         let (converted, vm_state) =
             HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
                 // Restore the VM from the snapshot (must happen before any error return to clean up properly).
-                let mut vm = VM::restore(
+                let mut vm = VM::restore_with_observer(
                     vm_state,
                     &executor.module_code,
                     reader,
                     &executor.interns,
                     print.reborrow(),
+                    observer.clone(),
                 );
 
                 // Now check for invalid call_ids after VM is restored.
@@ -444,7 +516,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 Ok((converted, vm_state))
             })?;
-        build_run_progress(converted, vm_state, executor, heap)
+        build_run_progress(converted, vm_state, executor, heap, observer)
     }
 }
 
@@ -466,6 +538,11 @@ pub(crate) struct Snapshot<T: ResourceTracker> {
     pub(crate) vm_state: VMSnapshot,
     /// The heap containing all allocated objects.
     pub(crate) heap: Heap<T>,
+    /// Runtime observer to reattach across restore/resume boundaries.
+    #[serde(skip, default = "RuntimeObserverHandle::disabled")]
+    pub(crate) observer: RuntimeObserverHandle,
+    /// Host-visible call identifier for return-event emission on resume.
+    pending_call_id: u32,
 }
 
 impl<T: ResourceTracker> Snapshot<T> {
@@ -481,16 +558,21 @@ impl<T: ResourceTracker> Snapshot<T> {
             executor,
             vm_state,
             mut heap,
+            observer,
+            pending_call_id,
         } = self;
 
+        emit_external_call_returned(pending_call_id, &ext_result, &observer);
+
         let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
-                let mut vm = VM::restore(
+            HeapReader::with(&mut heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
+                let mut vm = VM::restore_with_observer(
                     vm_state,
                     &executor.module_code,
                     reader,
                     &executor.interns,
                     print.reborrow(),
+                    (*observer).clone(),
                 );
 
                 let vm_result = match ext_result {
@@ -499,7 +581,7 @@ impl<T: ResourceTracker> Snapshot<T> {
                     ExtFunctionResult::Future(raw_call_id) => {
                         let call_id = CallId::new(raw_call_id);
                         vm.add_pending_call(call_id);
-                        vm.push(Value::ExternalFuture(call_id));
+                        vm.push_created(Value::ExternalFuture(call_id));
                         vm.run()
                     }
                     ExtFunctionResult::NotFound(function_name) => {
@@ -512,7 +594,7 @@ impl<T: ResourceTracker> Snapshot<T> {
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 (converted, vm_state)
             });
-        build_run_progress(converted, vm_state, executor, heap)
+        build_run_progress(converted, vm_state, executor, heap, observer)
     }
 }
 
@@ -721,13 +803,16 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
     vm_state: Option<VMSnapshot>,
     executor: Executor,
     heap: Heap<T>,
+    observer: RuntimeObserverHandle,
 ) -> Result<RunProgress<T>, MontyException> {
     macro_rules! new_snapshot {
-        () => {
+        ($call_id:expr) => {
             Snapshot {
                 executor,
                 vm_state: vm_state.expect("snapshot should exist"),
                 heap,
+                observer: observer.clone(),
+                pending_call_id: $call_id,
             }
         };
     }
@@ -742,16 +827,24 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             kwarg_runtime_ids,
             call_id,
             method_call,
-        } => Ok(RunProgress::FunctionCall(FunctionCall {
-            function_name,
-            args,
-            kwargs,
-            arg_runtime_ids,
-            kwarg_runtime_ids,
-            call_id,
-            method_call,
-            snapshot: new_snapshot!(),
-        })),
+        } => {
+            let kind = if method_call {
+                ExternalCallKind::Method
+            } else {
+                ExternalCallKind::Function
+            };
+            emit_external_call_requested(&observer, call_id, kind, &arg_runtime_ids, &kwarg_runtime_ids);
+            Ok(RunProgress::FunctionCall(FunctionCall {
+                function_name,
+                args,
+                kwargs,
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                call_id,
+                method_call,
+                snapshot: new_snapshot!(call_id),
+            }))
+        }
         ConvertedExit::OsCall {
             function,
             args,
@@ -759,19 +852,29 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             arg_runtime_ids,
             kwarg_runtime_ids,
             call_id,
-        } => Ok(RunProgress::OsCall(OsCall {
-            function,
-            args,
-            kwargs,
-            arg_runtime_ids,
-            kwarg_runtime_ids,
-            call_id,
-            snapshot: new_snapshot!(),
-        })),
+        } => {
+            emit_external_call_requested(
+                &observer,
+                call_id,
+                ExternalCallKind::Os,
+                &arg_runtime_ids,
+                &kwarg_runtime_ids,
+            );
+            Ok(RunProgress::OsCall(OsCall {
+                function,
+                args,
+                kwargs,
+                arg_runtime_ids,
+                kwarg_runtime_ids,
+                call_id,
+                snapshot: new_snapshot!(call_id),
+            }))
+        }
         ConvertedExit::ResolveFutures(pending_call_ids) => Ok(RunProgress::ResolveFutures(ResolveFutures::new(
             executor,
             vm_state.expect("snapshot should exist for ResolveFutures"),
             heap,
+            observer,
             pending_call_ids,
         ))),
         ConvertedExit::NameLookup {
@@ -782,7 +885,7 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             name,
             namespace_slot,
             is_global,
-            new_snapshot!(),
+            new_snapshot!(0),
         ))),
         ConvertedExit::Error(err) => {
             Err(err.into_python_exception(&executor.interns, |_| Some(executor.code.as_str())))
@@ -791,3 +894,40 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
 }
 
 type RuntimeIdSlices<'a> = (&'a [RuntimeValueId], &'a [(RuntimeValueId, RuntimeValueId)]);
+
+/// Emits an external-call request event when observation is enabled.
+fn emit_external_call_requested(
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    kind: ExternalCallKind,
+    arg_runtime_ids: &[RuntimeValueId],
+    kwarg_runtime_ids: &[(RuntimeValueId, RuntimeValueId)],
+) {
+    if !observer.is_enabled() {
+        return;
+    }
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id,
+            kind,
+            arg_runtime_ids,
+            kwarg_runtime_ids,
+        },
+    ));
+}
+
+/// Emits an external-call return event when observation is enabled.
+fn emit_external_call_returned(call_id: u32, result: &ExtFunctionResult, observer: &RuntimeObserverHandle) {
+    if !observer.is_enabled() {
+        return;
+    }
+    let kind = match result {
+        ExtFunctionResult::Return(_) => ExternalCallReturnKind::Return,
+        ExtFunctionResult::Error(_) | ExtFunctionResult::NotFound(_) => ExternalCallReturnKind::Error,
+        ExtFunctionResult::Future(_) => ExternalCallReturnKind::Future,
+    };
+    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+        call_id,
+        kind,
+    }));
+}

@@ -13,6 +13,7 @@ use crate::{
     io::PrintWriter,
     namespace::NamespaceId,
     object::MontyObject,
+    observer::RuntimeObserverHandle,
     parse::{parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
     resource::{NoLimitTracker, ResourceTracker},
@@ -157,14 +158,31 @@ impl MontyRun {
         resource_tracker: T,
         print: PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
+        self.start_with_observer(inputs, resource_tracker, print, RuntimeObserverHandle::disabled())
+    }
+
+    /// Starts execution with a runtime observer for host instrumentation.
+    pub fn start_with_observer<T: ResourceTracker>(
+        self,
+        inputs: Vec<MontyObject>,
+        resource_tracker: T,
+        print: PrintWriter<'_>,
+        observer: RuntimeObserverHandle,
+    ) -> Result<RunProgress<T>, MontyException> {
         let executor = self.executor;
 
         // Create heap and VM with empty globals, then populate inputs with VM alive
         let mut heap = Heap::new(executor.namespace_size, resource_tracker);
         let globals = executor.empty_globals();
         let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
-                let mut vm = VM::new(globals, reader, &executor.interns, print.reborrow());
+            HeapReader::with(&mut heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
+                let mut vm = VM::new_with_observer(
+                    globals,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    (*observer).clone(),
+                );
                 executor.populate_inputs(inputs, &mut vm)?;
 
                 // Start execution
@@ -175,7 +193,7 @@ impl MontyRun {
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 Ok((converted, vm_state))
             })?;
-        build_run_progress(converted, vm_state, executor, heap)
+        build_run_progress(converted, vm_state, executor, heap, observer)
     }
 }
 

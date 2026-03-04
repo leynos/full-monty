@@ -21,6 +21,7 @@ mod modules;
 mod namespace;
 mod object;
 mod object_json;
+mod observer;
 mod os;
 mod parse;
 mod prepare;
@@ -42,6 +43,11 @@ pub use crate::{
     io::{PrintStream, PrintWriter, PrintWriterCallback},
     object::{DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta, MontyTimeZone},
     object_json::{JsonMontyArray, JsonMontyObject, JsonMontyPairs},
+    observer::{
+        ControlConditionEvent, ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind,
+        ExternalCallReturnedEvent, NoopRuntimeObserver, OpInputIds, OpResultEvent, RuntimeObserver,
+        RuntimeObserverEvent, RuntimeObserverHandle, ValueCreatedEvent,
+    },
     os::{OsFunction, dir_stat, file_stat, stat_result, symlink_stat},
     repl::{
         MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,

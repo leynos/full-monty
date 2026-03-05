@@ -18,9 +18,10 @@ trait ProgressSnapshotExt: Sized {
 /// forwarding snapshot-extension access through suspendable variants. The
 /// `$complete_pat` and `$complete_expr` parameters preserve whichever complete
 /// variant shape the enum uses so completed progress remains unchanged when
-/// `attach_snapshot_extension` is called.
+/// `attach_snapshot_extension` is called, while `$complete_get_pat` makes the
+/// read path exhaustive when complete progress has no snapshot extension.
 macro_rules! impl_progress_snapshot_ext {
-    ($Progress:ident, $complete_pat:pat => $complete_expr:expr) => {
+    ($Progress:ident, $complete_pat:pat => $complete_expr:expr, $complete_get_pat:pat) => {
         impl ProgressSnapshotExt for $Progress<NoLimitTracker> {
             fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
                 match self {
@@ -40,7 +41,7 @@ macro_rules! impl_progress_snapshot_ext {
                     Self::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
                     Self::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
                     Self::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
-                    _ => None,
+                    $complete_get_pat => None,
                 }
             }
         }
@@ -49,11 +50,13 @@ macro_rules! impl_progress_snapshot_ext {
 
 impl_progress_snapshot_ext!(
     RunProgress,
-    Self::Complete(value) => Self::Complete(value)
+    Self::Complete(value) => Self::Complete(value),
+    Self::Complete(_)
 );
 impl_progress_snapshot_ext!(
     ReplProgress,
-    Self::Complete { repl, value } => Self::Complete { repl, value }
+    Self::Complete { repl, value } => Self::Complete { repl, value },
+    Self::Complete { .. }
 );
 
 #[expect(
@@ -79,26 +82,32 @@ struct SnapshotExtensionsWorld {
     load_failed: bool,
 }
 
+/// Creates the per-scenario world that records script inputs and load results.
 #[fixture]
 fn world() -> SnapshotExtensionsWorld {
     SnapshotExtensionsWorld::default()
 }
 
+/// Sets the run script to a suspendable program with a single external call.
 #[given("a suspendable script with one external call")]
 fn given_suspendable_script(world: &mut SnapshotExtensionsWorld) {
     world.script = String::from("ext_fn([])");
 }
 
+/// Sets the REPL snippet to a suspendable expression with one external call.
 #[given("a REPL snippet with one external call")]
 fn given_repl_snippet(world: &mut SnapshotExtensionsWorld) {
     world.repl_snippet = String::from("ext_fn([])");
 }
 
+/// Provides the raw snapshot-extension bytes attached before serialization.
 #[given("snapshot extension bytes")]
 fn given_snapshot_extension_bytes(world: &mut SnapshotExtensionsWorld) {
     world.snapshot_extension = vec![1, 3, 5, 7];
 }
 
+/// Starts run progress, attaches the test extension bytes, and records the
+/// bytes recovered after a dump/load round trip.
 #[when("run progress is dumped and loaded with snapshot extension bytes")]
 fn when_run_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
     let runner = MontyRun::new(world.script.clone(), "test.py", vec![]).expect("runner creation should succeed");
@@ -112,6 +121,8 @@ fn when_run_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
     world.loaded_snapshot_extension = loaded.get_snapshot_extension().map(<[u8]>::to_vec);
 }
 
+/// Dumps run progress with attached extension bytes, corrupts the payload, and
+/// records that deserialization fails.
 #[when("run progress payload is corrupted")]
 fn when_run_progress_payload_corrupted(world: &mut SnapshotExtensionsWorld) {
     let runner = MontyRun::new(world.script.clone(), "test.py", vec![]).expect("runner creation should succeed");
@@ -128,6 +139,8 @@ fn when_run_progress_payload_corrupted(world: &mut SnapshotExtensionsWorld) {
     world.load_failed = RunProgress::<NoLimitTracker>::load(&bytes).is_err();
 }
 
+/// Starts REPL progress, attaches the test extension bytes, and records the
+/// bytes recovered after a dump/load round trip.
 #[when("REPL progress is dumped and loaded with snapshot extension bytes")]
 fn when_repl_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
     let repl = create_repl();
@@ -142,6 +155,7 @@ fn when_repl_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
     world.loaded_snapshot_extension = loaded.get_snapshot_extension().map(<[u8]>::to_vec);
 }
 
+/// Verifies that the loaded snapshot-extension bytes match the original input.
 #[then("the loaded snapshot extension bytes match")]
 fn then_loaded_snapshot_extension_matches(world: &SnapshotExtensionsWorld) {
     assert_eq!(
@@ -151,11 +165,14 @@ fn then_loaded_snapshot_extension_matches(world: &SnapshotExtensionsWorld) {
     );
 }
 
+/// Verifies that loading the corrupted run-progress payload failed as expected.
 #[then("loading the run progress fails")]
 fn then_loading_run_progress_fails(world: &SnapshotExtensionsWorld) {
     assert!(world.load_failed, "expected corrupted payload to fail load");
 }
 
+/// Runs the BDD scenario that proves run snapshots preserve extension bytes
+/// across dump/load.
 #[scenario(
     path = "tests/features/snapshot_extensions.feature",
     name = "Run progress preserves snapshot extension bytes across dump/load"
@@ -164,6 +181,8 @@ fn run_snapshot_extension_round_trip(world: SnapshotExtensionsWorld) {
     drop(world);
 }
 
+/// Runs the BDD scenario that expects corrupted run-progress payloads to fail
+/// deserialization.
 #[scenario(
     path = "tests/features/snapshot_extensions.feature",
     name = "Corrupted run progress payload fails to load"
@@ -172,6 +191,8 @@ fn corrupted_run_progress_payload(world: SnapshotExtensionsWorld) {
     drop(world);
 }
 
+/// Runs the BDD scenario that proves REPL snapshots preserve extension bytes
+/// across dump/load.
 #[scenario(
     path = "tests/features/snapshot_extensions.feature",
     name = "REPL progress preserves snapshot extension bytes across dump/load"

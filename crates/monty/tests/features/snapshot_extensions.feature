@@ -8,6 +8,7 @@ Feature: Snapshot extension bytes
 
   Scenario: Corrupted run progress payload fails to load
     Given a suspendable script with one external call
+    And snapshot extension bytes
     When run progress payload is corrupted
     Then loading the run progress fails
 

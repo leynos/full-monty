@@ -63,8 +63,11 @@ fn when_run_progress_payload_corrupted(world: &mut SnapshotExtensionsWorld) {
     let progress = runner
         .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
         .expect("run should suspend");
+    let progress = attach_run_snapshot_extension(progress, world.snapshot_extension.clone());
 
-    let mut bytes = progress.dump().expect("run progress dump should succeed");
+    let mut bytes = progress
+        .dump()
+        .expect("run progress dump with snapshot extension should succeed");
     bytes.pop();
 
     world.load_failed = RunProgress::<NoLimitTracker>::load(&bytes).is_err();

@@ -5,11 +5,20 @@ use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
 use snapshot_test_utils::create_repl;
 
+/// Test-focused API for attaching and reading optional snapshot-extension bytes
+/// on progress snapshots. `attach_snapshot_extension` returns `Self` for
+/// chaining, while `get_snapshot_extension` exposes the loaded bytes as an
+/// optional slice for assertions.
 trait ProgressSnapshotExt: Sized {
     fn attach_snapshot_extension(self, ext: Vec<u8>) -> Self;
     fn get_snapshot_extension(&self) -> Option<&[u8]>;
 }
 
+/// Generates `ProgressSnapshotExt` impls for `NoLimitTracker` progress types by
+/// forwarding snapshot-extension access through suspendable variants. The
+/// `$complete_pat` and `$complete_expr` parameters preserve whichever complete
+/// variant shape the enum uses so completed progress remains unchanged when
+/// `attach_snapshot_extension` is called.
 macro_rules! impl_progress_snapshot_ext {
     ($Progress:ident, $complete_pat:pat => $complete_expr:expr) => {
         impl ProgressSnapshotExt for $Progress<NoLimitTracker> {
@@ -54,6 +63,13 @@ impl_progress_snapshot_ext!(
 #[path = "support/snapshot_test_utils.rs"]
 mod snapshot_test_utils;
 
+/// Shared world state for snapshot-extension BDD scenarios.
+///
+/// `script` stores the Python source for run-based tests. `repl_snippet`
+/// stores the REPL input under test. `snapshot_extension` holds the raw binary
+/// metadata to attach before serialization. `loaded_snapshot_extension` is
+/// populated with the bytes recovered after a successful load. `load_failed`
+/// records scenarios where deserialization is expected to fail.
 #[derive(Default)]
 struct SnapshotExtensionsWorld {
     script: String,
@@ -70,12 +86,12 @@ fn world() -> SnapshotExtensionsWorld {
 
 #[given("a suspendable script with one external call")]
 fn given_suspendable_script(world: &mut SnapshotExtensionsWorld) {
-    "ext_fn([])".clone_into(&mut world.script);
+    world.script = String::from("ext_fn([])");
 }
 
 #[given("a REPL snippet with one external call")]
 fn given_repl_snippet(world: &mut SnapshotExtensionsWorld) {
-    "ext_fn([])".clone_into(&mut world.repl_snippet);
+    world.repl_snippet = String::from("ext_fn([])");
 }
 
 #[given("snapshot extension bytes")]

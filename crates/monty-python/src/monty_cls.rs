@@ -692,25 +692,28 @@ pub struct PyFunctionSnapshot {
     pub call_id: u32,
     /// Stable runtime IDs for positional args in `args` order.
     #[pyo3(get)]
-    pub arg_runtime_ids: Vec<usize>,
+    pub arg_runtime_ids: Vec<u64>,
     /// Stable runtime IDs for keyword `(key, value)` pairs in `kwargs` order.
     #[pyo3(get)]
-    pub kwarg_runtime_ids: Vec<(usize, usize)>,
+    pub kwarg_runtime_ids: Vec<(u64, u64)>,
 }
 
 /// Converts runtime-id wrappers to raw stable IDs for Python-facing snapshots.
 fn map_runtime_ids(
     arg_ids: &[RuntimeValueId],
     kwarg_ids: &[(RuntimeValueId, RuntimeValueId)],
-) -> (Vec<usize>, Vec<(usize, usize)>) {
+) -> (Vec<u64>, Vec<(u64, u64)>) {
     (
-        arg_ids.iter().map(|id| id.raw()).collect(),
-        kwarg_ids.iter().map(|(key, value)| (key.raw(), value.raw())).collect(),
+        arg_ids.iter().map(|id| id.raw() as u64).collect(),
+        kwarg_ids
+            .iter()
+            .map(|(key, value)| (key.raw() as u64, value.raw() as u64))
+            .collect(),
     )
 }
 
 /// Extracts runtime IDs from any function-snapshot variant.
-fn snapshot_runtime_ids(snapshot: &EitherFunctionSnapshot) -> (Vec<usize>, Vec<(usize, usize)>) {
+fn snapshot_runtime_ids(snapshot: &EitherFunctionSnapshot) -> (Vec<u64>, Vec<(u64, u64)>) {
     match snapshot {
         EitherFunctionSnapshot::NoLimitFn(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),
         EitherFunctionSnapshot::NoLimitOs(call) => map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids),

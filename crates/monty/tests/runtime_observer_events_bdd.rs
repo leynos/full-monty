@@ -2,16 +2,19 @@
 
 use std::sync::{Arc, Mutex};
 
-#[path = "support/test_utils.rs"]
-mod test_utils;
-
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRun, NoLimitTracker,
     OpInputIds, PrintWriter, RunInputs, RunProgress, RuntimeObserver, RuntimeObserverEvent, RuntimeObserverHandle,
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use test_utils::{as_function_call, as_os_call, assert_function_calls_equal};
+
+#[expect(
+    dead_code,
+    reason = "shared helper module defines utilities consumed by sibling integration tests"
+)]
+#[path = "support/test_utils.rs"]
+mod test_utils;
 
 /// Test-friendly observer event projection used by BDD steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,14 +184,15 @@ where
     let fixture = recording_start_with_observer(world.script.clone(), vec![], vec![]);
 
     let function_call = match fixture.progress {
-        progress @ RunProgress::FunctionCall(_) => as_function_call(progress, "start and resume generic"),
-        progress @ RunProgress::OsCall(_) => {
-            let _ = as_os_call(progress, "start and resume generic");
-            panic!("start and resume generic: expected function-call progress, got os-call progress");
+        progress @ RunProgress::FunctionCall(_) => test_utils::as_function_call(progress, "start and resume generic"),
+        RunProgress::OsCall(_) => {
+            panic!("start and resume generic: expected function-call progress, got os-call progress")
         }
         other => panic!("start and resume generic: expected function-call progress, got {other:?}"),
     };
-    assert_function_calls_equal(&function_call, &function_call);
+    assert_eq!(function_call.function_name, "ext_fn");
+    assert_eq!(function_call.args, vec![MontyObject::Int(1)]);
+    assert!(function_call.kwargs.is_empty());
     world.call_id = Some(function_call.call_id);
 
     let result = function_call.resume(resume_value, &mut PrintWriter::Stdout);

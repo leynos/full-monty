@@ -1,10 +1,11 @@
 //! Tests for snapshot extension byte round-trips.
 
-use monty::{
-    ExtFunctionResult, MontyObject, NoLimitTracker, PrintWriter, ReplProgress, RunProgress, SnapshotExtension,
-};
+use monty::{MontyObject, NoLimitTracker, PrintWriter, ReplProgress, RunProgress, SnapshotExtension};
 use rstest::{fixture, rstest};
-use snapshot_test_utils::{SnapshotBehavior, SnapshotProgressVariant, create_repl, create_run_progress};
+use snapshot_test_utils::{
+    SnapshotBehavior, SnapshotProgressVariant, complete_repl_resolve_futures, complete_resolve_futures, create_repl,
+    create_run_progress,
+};
 
 #[expect(
     dead_code,
@@ -13,11 +14,23 @@ use snapshot_test_utils::{SnapshotBehavior, SnapshotProgressVariant, create_repl
 #[path = "support/snapshot_test_utils.rs"]
 mod snapshot_test_utils;
 
+/// Test-local API for attaching and reading snapshot-extension bytes from
+/// progress values without repeating variant matching in every assertion.
+///
+/// The helpers consume `self` when attaching bytes so tests can chain calls on
+/// newly created progress values, and they expose snapshot metadata as an
+/// optional byte slice because complete progress variants do not carry
+/// snapshots.
 trait ProgressSnapshotExt: Sized {
     fn attach_snapshot_extension(self, ext: Vec<u8>) -> Self;
     fn get_snapshot_extension(&self) -> Option<&[u8]>;
 }
 
+/// Adds snapshot-extension chaining for run progress values.
+///
+/// Suspended variants forward to their underlying snapshot wrappers, while the
+/// `Complete` variant is returned unchanged because it has no snapshot to
+/// decorate.
 impl ProgressSnapshotExt for RunProgress<NoLimitTracker> {
     fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
         match self {
@@ -40,6 +53,10 @@ impl ProgressSnapshotExt for RunProgress<NoLimitTracker> {
     }
 }
 
+/// Adds snapshot-extension chaining for REPL progress values.
+///
+/// This mirrors the run-progress behavior, with the same assumption that
+/// completed REPL results have no suspendable snapshot metadata to expose.
 impl ProgressSnapshotExt for ReplProgress<NoLimitTracker> {
     fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
         match self {
@@ -62,27 +79,6 @@ impl ProgressSnapshotExt for ReplProgress<NoLimitTracker> {
     }
 }
 
-macro_rules! impl_complete_resolve_futures {
-    ($fn_name:ident, $Progress:ident) => {
-        fn $fn_name(progress: $Progress<NoLimitTracker>, return_value: &MontyObject) -> $Progress<NoLimitTracker> {
-            let $Progress::ResolveFutures(state) = progress else {
-                panic!("expected resolve futures progress");
-            };
-            let results = state
-                .pending_call_ids()
-                .iter()
-                .map(|call_id| (*call_id, ExtFunctionResult::Return(return_value.clone())))
-                .collect();
-            state
-                .resume(results, &mut PrintWriter::Stdout)
-                .expect("resume should succeed")
-        }
-    };
-}
-
-impl_complete_resolve_futures!(complete_resolve_futures, RunProgress);
-impl_complete_resolve_futures!(complete_repl_resolve_futures, ReplProgress);
-
 const EXTERNAL_CALL_SCRIPT: &str = "ext_fn([])";
 const OS_CALL_SCRIPT: &str = "from pathlib import Path; Path('/tmp/test.txt').exists()";
 const COMPLETE_SCRIPT: &str = "1 + 2";
@@ -95,13 +91,21 @@ async def main():
 await main()
 ";
 
-/// Shared snapshot extension payload used by round-trip tests.
+/// Shared snapshot-extension payload used by round-trip tests.
+///
+/// The bytes are intentionally small and opaque because the tests only care
+/// that serialization preserves exact binary metadata rather than interpreting
+/// the payload.
 #[fixture]
 fn snapshot_extension() -> Vec<u8> {
     vec![1, 2, 3, 4]
 }
 
-/// Maps a progress variant to its expected snapshot-extension visibility.
+/// Maps a progress variant to the snapshot-extension visibility expected after
+/// dump/load.
+///
+/// Complete progress values do not expose snapshot metadata, while suspended
+/// variants should preserve any attached bytes.
 fn variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, SnapshotBehavior) {
     (
         variant,
@@ -113,7 +117,12 @@ fn variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, S
     )
 }
 
-/// Asserts the observed snapshot bytes match the expected visibility.
+/// Asserts that observed snapshot bytes match the expected preservation
+/// behavior.
+///
+/// Tests use this helper to keep the per-variant cases focused on setup while
+/// centralizing the rule that absent metadata is only valid for completed
+/// progress values.
 fn assert_snapshot_behavior(actual: Option<&[u8]>, snapshot_extension: &[u8], expected: SnapshotBehavior) {
     match expected {
         SnapshotBehavior::Preserved => {
@@ -129,6 +138,13 @@ fn assert_snapshot_behavior(actual: Option<&[u8]>, snapshot_extension: &[u8], ex
     }
 }
 
+/// Generates helpers that drive progress values forward until they suspend on
+/// `ResolveFutures`.
+///
+/// The generated functions repeatedly consume progress values, resume pending
+/// function calls, and stop once a futures-resolving snapshot is reached. They
+/// panic on other suspension kinds because the fixture scripts are expected to
+/// reach `ResolveFutures` deterministically.
 macro_rules! impl_drive_to_resolve_futures {
     ($fn_name:ident, $Progress:ident) => {
         fn $fn_name(mut progress: $Progress<NoLimitTracker>) -> $Progress<NoLimitTracker> {
@@ -156,6 +172,11 @@ macro_rules! impl_drive_to_resolve_futures {
 impl_drive_to_resolve_futures!(drive_to_resolve_futures, RunProgress);
 impl_drive_to_resolve_futures!(drive_repl_to_resolve_futures, ReplProgress);
 
+/// Builds the requested run-progress variant used in snapshot-extension tests.
+///
+/// This keeps the variant matrix in one place and uses `drive_to_resolve_futures`
+/// when a fixture needs to advance through an initial external call before the
+/// snapshot under test is available.
 fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunProgress<NoLimitTracker> {
     match variant {
         SnapshotProgressVariant::FunctionCall => create_run_progress(EXTERNAL_CALL_SCRIPT),
@@ -167,6 +188,11 @@ fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunProgr
     }
 }
 
+/// Builds the requested REPL-progress variant used in snapshot-extension tests.
+///
+/// The helper owns REPL setup so each test gets a fresh interpreter state, and
+/// it drives the `ResolveFutures` case far enough to expose the snapshot whose
+/// extension bytes are being asserted.
 fn create_repl_progress_for_variant(variant: SnapshotProgressVariant) -> ReplProgress<NoLimitTracker> {
     let repl = create_repl();
     let snippet = match variant {

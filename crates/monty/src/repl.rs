@@ -383,7 +383,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
             (vm_result, vm_state)
         };
 
-        handle_repl_vm_result(vm_result, vm_state, executor, this, observer)
+        handle_repl_vm_result(vm_result, vm_state, executor, this, observer, None)
     }
 
     /// Starts snippet execution with `PrintWriter::Stdout` and no additional host output wiring.
@@ -875,7 +875,7 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
             vm.resume_with_exception(err)
         };
         let vm_state = vm.check_snapshot(&vm_result);
-        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes)
+        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes.as_ref())
     }
 }
 
@@ -1017,7 +1017,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
                     executor,
                     vm_state,
                     pending_call_ids,
-                    extension_bytes: extension_bytes.clone(),
+                    extension_bytes,
                     observer,
                 }));
             }
@@ -1026,7 +1026,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
         let vm_result = vm.run();
         let vm_state = vm.check_snapshot(&vm_result);
 
-        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes)
+        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes.as_ref())
     }
 }
 
@@ -1122,7 +1122,7 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
 
         let vm_state = vm.check_snapshot(&vm_result);
 
-        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes)
+        handle_repl_vm_result(vm_result, vm_state, executor, repl, observer, extension_bytes.as_ref())
     }
 }
 
@@ -1141,7 +1141,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
     executor: ReplExecutor,
     mut repl: MontyRepl<T>,
     observer: RuntimeObserverHandle,
-    extension_bytes: Option<Vec<u8>>,
+    extension_bytes: Option<&Vec<u8>>,
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
     macro_rules! new_repl_snapshot {
         ($pending_call_id:expr, $pending_call_kind:expr) => {
@@ -1149,7 +1149,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 repl,
                 executor,
                 vm_state: vm_state.expect("snapshot should exist"),
-                extension_bytes: extension_bytes.clone(),
+                extension_bytes: extension_bytes.cloned(),
                 observer: observer.clone(),
                 pending_call_id: $pending_call_id,
                 pending_call_kind: $pending_call_kind,
@@ -1252,7 +1252,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 executor,
                 vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
                 pending_call_ids,
-                extension_bytes: extension_bytes.clone(),
+                extension_bytes: extension_bytes.cloned(),
                 observer,
             }))
         }

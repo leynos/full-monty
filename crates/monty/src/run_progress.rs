@@ -422,6 +422,7 @@ impl<T: ResourceTracker> NameLookup<T> {
             self.snapshot.heap,
             self.snapshot.namespaces,
             self.snapshot.observer,
+            self.snapshot.extension_bytes.as_ref(),
         )
     }
 }
@@ -603,7 +604,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
                     heap,
                     namespaces,
                     pending_call_ids,
-                    extension_bytes: extension_bytes.clone(),
+                    extension_bytes,
                     observer,
                 }));
             }
@@ -618,7 +619,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             heap,
             namespaces,
             observer,
-            extension_bytes,
+            extension_bytes.as_ref(),
         )
     }
 }
@@ -716,7 +717,7 @@ impl<T: ResourceTracker> Snapshot<T> {
             self.heap,
             self.namespaces,
             self.observer,
-            self.extension_bytes,
+            self.extension_bytes.as_ref(),
         )
     }
 }
@@ -816,7 +817,7 @@ pub(crate) fn handle_vm_result<T: ResourceTracker>(
     mut heap: Heap<T>,
     mut namespaces: Namespaces,
     observer: RuntimeObserverHandle,
-    extension_bytes: Option<Vec<u8>>,
+    extension_bytes: Option<&Vec<u8>>,
 ) -> Result<RunProgress<T>, MontyException> {
     macro_rules! new_snapshot {
         ($pending_call_id:expr, $pending_call_kind:expr) => {
@@ -825,7 +826,7 @@ pub(crate) fn handle_vm_result<T: ResourceTracker>(
                 vm_state: vm_state.expect("snapshot should exist"),
                 heap,
                 namespaces,
-                extension_bytes: extension_bytes.clone(),
+                extension_bytes: extension_bytes.cloned(),
                 observer: observer.clone(),
                 pending_call_id: $pending_call_id,
                 pending_call_kind: $pending_call_kind,

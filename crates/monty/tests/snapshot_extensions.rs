@@ -1,6 +1,8 @@
 //! Tests for snapshot extension byte round-trips.
 
-use monty::{ExtFunctionResult, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress};
+use monty::{
+    ExtFunctionResult, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress,
+};
 
 fn create_function_call_progress(script: &str) -> RunProgress<NoLimitTracker> {
     let runner = MontyRun::new(script.to_owned(), "test.py", vec![]).expect("runner creation should succeed");
@@ -29,7 +31,9 @@ fn attach_run_snapshot_extension(
     match progress {
         RunProgress::FunctionCall(call) => RunProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
         RunProgress::OsCall(call) => RunProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::ResolveFutures(state) => RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension)),
+        RunProgress::ResolveFutures(state) => {
+            RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
+        }
         RunProgress::NameLookup(lookup) => RunProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
         RunProgress::Complete(value) => RunProgress::Complete(value),
     }
@@ -40,10 +44,16 @@ fn attach_repl_snapshot_extension(
     snapshot_extension: Vec<u8>,
 ) -> ReplProgress<NoLimitTracker> {
     match progress {
-        ReplProgress::FunctionCall(call) => ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
+        ReplProgress::FunctionCall(call) => {
+            ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension))
+        }
         ReplProgress::OsCall(call) => ReplProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::ResolveFutures(state) => ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::NameLookup(lookup) => ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
+        ReplProgress::ResolveFutures(state) => {
+            ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
+        }
+        ReplProgress::NameLookup(lookup) => {
+            ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension))
+        }
         ReplProgress::Complete { repl, value } => ReplProgress::Complete { repl, value },
     }
 }
@@ -72,7 +82,9 @@ fn drive_to_resolve_futures(mut progress: RunProgress<NoLimitTracker>) -> RunPro
     loop {
         match progress {
             RunProgress::FunctionCall(call) => {
-                progress = call.resume_pending(&mut PrintWriter::Stdout).expect("run_pending should succeed");
+                progress = call
+                    .resume_pending(&mut PrintWriter::Stdout)
+                    .expect("run_pending should succeed");
             }
             RunProgress::ResolveFutures(_) => return progress,
             RunProgress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
@@ -86,7 +98,9 @@ fn drive_repl_to_resolve_futures(mut progress: ReplProgress<NoLimitTracker>) -> 
     loop {
         match progress {
             ReplProgress::FunctionCall(call) => {
-                progress = call.resume_pending(&mut PrintWriter::Stdout).expect("run_pending should succeed");
+                progress = call
+                    .resume_pending(&mut PrintWriter::Stdout)
+                    .expect("run_pending should succeed");
             }
             ReplProgress::ResolveFutures(_) => return progress,
             ReplProgress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
@@ -252,7 +266,10 @@ await main()
         panic!("expected resolve futures progress");
     };
 
-    let results = vec![(state.pending_call_ids()[0], ExtFunctionResult::Return(MontyObject::Int(3)))];
+    let results = vec![(
+        state.pending_call_ids()[0],
+        ExtFunctionResult::Return(MontyObject::Int(3)),
+    )];
     let progress = state
         .resume(results, &mut PrintWriter::Stdout)
         .expect("resume should succeed");

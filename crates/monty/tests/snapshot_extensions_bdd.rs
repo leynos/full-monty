@@ -103,7 +103,9 @@ fn attach_run_snapshot_extension(
     match progress {
         RunProgress::FunctionCall(call) => RunProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
         RunProgress::OsCall(call) => RunProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::ResolveFutures(state) => RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension)),
+        RunProgress::ResolveFutures(state) => {
+            RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
+        }
         RunProgress::NameLookup(lookup) => RunProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
         RunProgress::Complete(value) => RunProgress::Complete(value),
     }
@@ -114,10 +116,16 @@ fn attach_repl_snapshot_extension(
     snapshot_extension: Vec<u8>,
 ) -> ReplProgress<NoLimitTracker> {
     match progress {
-        ReplProgress::FunctionCall(call) => ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
+        ReplProgress::FunctionCall(call) => {
+            ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension))
+        }
         ReplProgress::OsCall(call) => ReplProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::ResolveFutures(state) => ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::NameLookup(lookup) => ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
+        ReplProgress::ResolveFutures(state) => {
+            ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
+        }
+        ReplProgress::NameLookup(lookup) => {
+            ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension))
+        }
         ReplProgress::Complete { repl, value } => ReplProgress::Complete { repl, value },
     }
 }

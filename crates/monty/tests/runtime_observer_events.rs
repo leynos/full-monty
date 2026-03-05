@@ -7,8 +7,8 @@ mod test_utils;
 
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRepl, MontyRun,
-    NoLimitTracker, NoopRuntimeObserver, OpInputIds, PrintWriter, RunProgress, RuntimeObserver, RuntimeObserverEvent,
-    RuntimeObserverHandle,
+    NoLimitTracker, NoopRuntimeObserver, OpInputIds, PrintWriter, RunInputs, RunProgress, RuntimeObserver,
+    RuntimeObserverEvent, RuntimeObserverHandle,
 };
 use rstest::{fixture, rstest};
 use test_utils::{as_function_call, as_os_call, assert_function_calls_equal};
@@ -150,7 +150,14 @@ fn runtime_observer_emits_external_return_kinds(
     let run = MontyRun::new("ext_fn(1)".to_owned(), "test.py", vec![]).expect("runner creation should succeed");
 
     let progress = run
-        .start_with_observer(vec![], NoLimitTracker, &mut PrintWriter::Stdout, observer)
+        .start_with_observer(
+            RunInputs {
+                inputs: vec![],
+                resource_tracker: NoLimitTracker,
+            },
+            &mut PrintWriter::Stdout,
+            observer,
+        )
         .expect("start should pause at external call");
 
     let function_call = as_function_call(progress, "external return kinds");
@@ -212,7 +219,14 @@ fn runtime_observer_tracks_os_call_requests(recording: (RuntimeObserverHandle, A
     .expect("runner creation should succeed");
 
     let progress = run
-        .start_with_observer(vec![], NoLimitTracker, &mut PrintWriter::Stdout, observer)
+        .start_with_observer(
+            RunInputs {
+                inputs: vec![],
+                resource_tracker: NoLimitTracker,
+            },
+            &mut PrintWriter::Stdout,
+            observer,
+        )
         .expect("start should pause at OS call");
 
     let os_call = as_os_call(progress, "OS call request");
@@ -252,8 +266,10 @@ fn runtime_observer_tracks_method_call_requests(recording: (RuntimeObserverHandl
 
     let progress = run
         .start_with_observer(
-            vec![build_dataclass_point()],
-            NoLimitTracker,
+            RunInputs {
+                inputs: vec![build_dataclass_point()],
+                resource_tracker: NoLimitTracker,
+            },
             &mut PrintWriter::Stdout,
             observer,
         )
@@ -298,8 +314,10 @@ fn runtime_observer_emits_control_and_operation_events_for_branching_code(
 
     let progress = run
         .start_with_observer(
-            vec![MontyObject::Int(1)],
-            NoLimitTracker,
+            RunInputs {
+                inputs: vec![MontyObject::Int(1)],
+                resource_tracker: NoLimitTracker,
+            },
             &mut PrintWriter::Stdout,
             observer,
         )
@@ -417,8 +435,10 @@ fn noop_observer_preserves_suspend_resume_semantics() {
     let first_with_noop = as_function_call(
         run_with_noop
             .start_with_observer(
-                vec![],
-                NoLimitTracker,
+                RunInputs {
+                    inputs: vec![],
+                    resource_tracker: NoLimitTracker,
+                },
                 &mut PrintWriter::Stdout,
                 RuntimeObserverHandle::new(NoopRuntimeObserver),
             )

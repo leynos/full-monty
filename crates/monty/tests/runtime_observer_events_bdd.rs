@@ -7,7 +7,7 @@ mod test_utils;
 
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRun, NoLimitTracker,
-    OpInputIds, PrintWriter, RunProgress, RuntimeObserver, RuntimeObserverEvent, RuntimeObserverHandle,
+    OpInputIds, PrintWriter, RunInputs, RunProgress, RuntimeObserver, RuntimeObserverEvent, RuntimeObserverHandle,
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
@@ -154,7 +154,14 @@ fn recording_start_with_observer(
     let (observer, events) = recording_observer_fixture();
     let run = MontyRun::new(script, "test.py", input_names).expect("runner creation should succeed");
     let progress = run
-        .start_with_observer(inputs, NoLimitTracker, &mut PrintWriter::Stdout, observer.clone())
+        .start_with_observer(
+            RunInputs {
+                inputs,
+                resource_tracker: NoLimitTracker,
+            },
+            &mut PrintWriter::Stdout,
+            observer.clone(),
+        )
         .expect("start_with_observer should succeed");
 
     RecordingRunFixture {

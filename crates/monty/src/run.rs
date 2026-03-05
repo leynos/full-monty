@@ -18,6 +18,17 @@ use crate::{
     value::Value,
 };
 
+/// Bundles the owned inputs required to start a [`MontyRun`] execution.
+///
+/// Keeping them together reduces argument lists and makes the relationship
+/// between the data and its resource budget explicit.
+pub struct RunInputs<T: ResourceTracker> {
+    /// Initial input values (must match the length of `input_names` from [`MontyRun::new`]).
+    pub inputs: Vec<MontyObject>,
+    /// Resource tracker controlling allocation limits and GC scheduling.
+    pub resource_tracker: T,
+}
+
 /// Primary interface for running Monty code.
 ///
 /// `MontyRun` supports two execution modes:
@@ -144,18 +155,28 @@ impl MontyRun {
         resource_tracker: T,
         print: &mut PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
-        self.start_with_observer(inputs, resource_tracker, print, RuntimeObserverHandle::disabled())
+        self.start_with_observer(
+            RunInputs {
+                inputs,
+                resource_tracker,
+            },
+            print,
+            RuntimeObserverHandle::disabled(),
+        )
     }
 
     /// Starts execution with a runtime observer for host instrumentation.
     pub fn start_with_observer<T: ResourceTracker>(
         self,
-        inputs: Vec<MontyObject>,
-        resource_tracker: T,
+        run_inputs: RunInputs<T>,
         print: &mut PrintWriter<'_>,
         observer: RuntimeObserverHandle,
     ) -> Result<RunProgress<T>, MontyException> {
         let executor = self.executor;
+        let RunInputs {
+            inputs,
+            resource_tracker,
+        } = run_inputs;
 
         // Create heap and prepare namespaces
         let mut heap = Heap::new(executor.namespace_size, resource_tracker);

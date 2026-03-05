@@ -1,8 +1,19 @@
 //! Behavioural coverage for snapshot extension byte persistence.
 
-use monty::{MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress};
+use monty::{MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress};
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
+use snapshot_test_utils::{
+    attach_repl_snapshot_extension, attach_run_snapshot_extension, create_repl, repl_progress_snapshot_extension,
+    run_progress_snapshot_extension,
+};
+
+#[expect(
+    dead_code,
+    reason = "BDD scenarios share a helper module with non-BDD snapshot tests"
+)]
+#[path = "support/snapshot_test_utils.rs"]
+mod snapshot_test_utils;
 
 #[derive(Default)]
 struct SnapshotExtensionsWorld {
@@ -61,16 +72,7 @@ fn when_run_progress_payload_corrupted(world: &mut SnapshotExtensionsWorld) {
 
 #[when("REPL progress is dumped and loaded with snapshot extension bytes")]
 fn when_repl_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
-    let (repl, _result) = MontyRepl::new(
-        "pass".to_owned(),
-        "init.py",
-        vec![],
-        vec![],
-        NoLimitTracker,
-        &mut PrintWriter::Stdout,
-    )
-    .expect("repl creation should succeed");
-
+    let repl = create_repl();
     let progress = repl
         .start(&world.repl_snippet, &mut PrintWriter::Stdout)
         .expect("repl should suspend");
@@ -94,60 +96,6 @@ fn then_loaded_snapshot_extension_matches(world: &SnapshotExtensionsWorld) {
 #[then("loading the run progress fails")]
 fn then_loading_run_progress_fails(world: &SnapshotExtensionsWorld) {
     assert!(world.load_failed, "expected corrupted payload to fail load");
-}
-
-fn attach_run_snapshot_extension(
-    progress: RunProgress<NoLimitTracker>,
-    snapshot_extension: Vec<u8>,
-) -> RunProgress<NoLimitTracker> {
-    match progress {
-        RunProgress::FunctionCall(call) => RunProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::OsCall(call) => RunProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::ResolveFutures(state) => {
-            RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
-        }
-        RunProgress::NameLookup(lookup) => RunProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
-        RunProgress::Complete(value) => RunProgress::Complete(value),
-    }
-}
-
-fn attach_repl_snapshot_extension(
-    progress: ReplProgress<NoLimitTracker>,
-    snapshot_extension: Vec<u8>,
-) -> ReplProgress<NoLimitTracker> {
-    match progress {
-        ReplProgress::FunctionCall(call) => {
-            ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::OsCall(call) => ReplProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::ResolveFutures(state) => {
-            ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::NameLookup(lookup) => {
-            ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::Complete { repl, value } => ReplProgress::Complete { repl, value },
-    }
-}
-
-fn run_progress_snapshot_extension(progress: &RunProgress<NoLimitTracker>) -> Option<&[u8]> {
-    match progress {
-        RunProgress::FunctionCall(call) => call.snapshot_extension(),
-        RunProgress::OsCall(call) => call.snapshot_extension(),
-        RunProgress::ResolveFutures(state) => state.snapshot_extension(),
-        RunProgress::NameLookup(lookup) => lookup.snapshot_extension(),
-        RunProgress::Complete(_) => None,
-    }
-}
-
-fn repl_progress_snapshot_extension(progress: &ReplProgress<NoLimitTracker>) -> Option<&[u8]> {
-    match progress {
-        ReplProgress::FunctionCall(call) => call.snapshot_extension(),
-        ReplProgress::OsCall(call) => call.snapshot_extension(),
-        ReplProgress::ResolveFutures(state) => state.snapshot_extension(),
-        ReplProgress::NameLookup(lookup) => lookup.snapshot_extension(),
-        ReplProgress::Complete { .. } => None,
-    }
 }
 
 #[scenario(

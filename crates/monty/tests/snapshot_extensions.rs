@@ -1,281 +1,175 @@
 //! Tests for snapshot extension byte round-trips.
 
-use monty::{
-    ExtFunctionResult, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress,
+#[path = "support/snapshot_test_utils.rs"]
+mod snapshot_test_utils;
+
+use monty::{MontyObject, NoLimitTracker, ReplProgress, RunProgress};
+use rstest::{fixture, rstest};
+use snapshot_test_utils::{
+    SnapshotBehavior, SnapshotProgressVariant, attach_repl_snapshot_extension, attach_run_snapshot_extension,
+    complete_repl_resolve_futures, complete_resolve_futures, create_repl_progress_for_variant,
+    create_run_progress_for_variant, repl_progress_snapshot_extension, run_progress_snapshot_extension,
 };
 
-fn create_function_call_progress(script: &str) -> RunProgress<NoLimitTracker> {
-    let runner = MontyRun::new(script.to_owned(), "test.py", vec![]).expect("runner creation should succeed");
-    runner
-        .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should suspend")
+/// Shared snapshot extension payload used by round-trip tests.
+#[fixture]
+fn snapshot_extension() -> Vec<u8> {
+    vec![1, 2, 3, 4]
 }
 
-fn create_repl() -> MontyRepl<NoLimitTracker> {
-    let (repl, _result) = MontyRepl::new(
-        "pass".to_owned(),
-        "init.py",
-        vec![],
-        vec![],
-        NoLimitTracker,
-        &mut PrintWriter::Stdout,
+/// Maps a run progress variant to its expected snapshot-extension visibility.
+fn run_variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, SnapshotBehavior) {
+    (
+        variant,
+        if variant == SnapshotProgressVariant::Complete {
+            SnapshotBehavior::Absent
+        } else {
+            SnapshotBehavior::Preserved
+        },
     )
-    .expect("repl creation should succeed");
-    repl
 }
 
-fn attach_run_snapshot_extension(
-    progress: RunProgress<NoLimitTracker>,
-    snapshot_extension: Vec<u8>,
-) -> RunProgress<NoLimitTracker> {
-    match progress {
-        RunProgress::FunctionCall(call) => RunProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::OsCall(call) => RunProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::ResolveFutures(state) => {
-            RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
+/// Maps a REPL progress variant to its expected snapshot-extension visibility.
+fn repl_variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, SnapshotBehavior) {
+    (
+        variant,
+        if variant == SnapshotProgressVariant::Complete {
+            SnapshotBehavior::Absent
+        } else {
+            SnapshotBehavior::Preserved
+        },
+    )
+}
+
+/// Asserts the observed snapshot bytes match the expected visibility.
+fn assert_snapshot_behavior(actual: Option<&[u8]>, snapshot_extension: &[u8], expected: SnapshotBehavior) {
+    match expected {
+        SnapshotBehavior::Preserved => {
+            assert_eq!(
+                actual,
+                Some(snapshot_extension),
+                "expected snapshot extension bytes to round-trip"
+            );
         }
-        RunProgress::NameLookup(lookup) => RunProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
-        RunProgress::Complete(value) => RunProgress::Complete(value),
-    }
-}
-
-fn attach_repl_snapshot_extension(
-    progress: ReplProgress<NoLimitTracker>,
-    snapshot_extension: Vec<u8>,
-) -> ReplProgress<NoLimitTracker> {
-    match progress {
-        ReplProgress::FunctionCall(call) => {
-            ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::OsCall(call) => ReplProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::ResolveFutures(state) => {
-            ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::NameLookup(lookup) => {
-            ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::Complete { repl, value } => ReplProgress::Complete { repl, value },
-    }
-}
-
-fn run_progress_snapshot_extension(progress: &RunProgress<NoLimitTracker>) -> Option<&[u8]> {
-    match progress {
-        RunProgress::FunctionCall(call) => call.snapshot_extension(),
-        RunProgress::OsCall(call) => call.snapshot_extension(),
-        RunProgress::ResolveFutures(state) => state.snapshot_extension(),
-        RunProgress::NameLookup(lookup) => lookup.snapshot_extension(),
-        RunProgress::Complete(_) => None,
-    }
-}
-
-fn repl_progress_snapshot_extension(progress: &ReplProgress<NoLimitTracker>) -> Option<&[u8]> {
-    match progress {
-        ReplProgress::FunctionCall(call) => call.snapshot_extension(),
-        ReplProgress::OsCall(call) => call.snapshot_extension(),
-        ReplProgress::ResolveFutures(state) => state.snapshot_extension(),
-        ReplProgress::NameLookup(lookup) => lookup.snapshot_extension(),
-        ReplProgress::Complete { .. } => None,
-    }
-}
-
-fn drive_to_resolve_futures(mut progress: RunProgress<NoLimitTracker>) -> RunProgress<NoLimitTracker> {
-    loop {
-        match progress {
-            RunProgress::FunctionCall(call) => {
-                progress = call
-                    .resume_pending(&mut PrintWriter::Stdout)
-                    .expect("run_pending should succeed");
-            }
-            RunProgress::ResolveFutures(_) => return progress,
-            RunProgress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
-            RunProgress::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
-            RunProgress::Complete(_) => panic!("unexpected Complete before ResolveFutures"),
+        SnapshotBehavior::Absent => {
+            assert!(actual.is_none(), "expected no visible snapshot extension");
         }
     }
 }
 
-fn drive_repl_to_resolve_futures(mut progress: ReplProgress<NoLimitTracker>) -> ReplProgress<NoLimitTracker> {
-    loop {
-        match progress {
-            ReplProgress::FunctionCall(call) => {
-                progress = call
-                    .resume_pending(&mut PrintWriter::Stdout)
-                    .expect("run_pending should succeed");
-            }
-            ReplProgress::ResolveFutures(_) => return progress,
-            ReplProgress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
-            ReplProgress::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
-            ReplProgress::Complete { .. } => panic!("unexpected Complete before ResolveFutures"),
-        }
-    }
-}
+#[rstest]
+#[case::function_call(SnapshotProgressVariant::FunctionCall)]
+#[case::os_call(SnapshotProgressVariant::OsCall)]
+#[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
+#[case::complete(SnapshotProgressVariant::Complete)]
+fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
+    let (fixture_variant, expected_behavior) = run_variant_case(variant);
+    assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
 
-fn complete_resolve_futures(progress: RunProgress<NoLimitTracker>) -> RunProgress<NoLimitTracker> {
-    let RunProgress::ResolveFutures(state) = progress else {
-        panic!("expected resolve futures progress");
-    };
-    let results = state
-        .pending_call_ids()
-        .iter()
-        .map(|call_id| (*call_id, ExtFunctionResult::Return(MontyObject::Int(1))))
-        .collect();
-    state
-        .resume(results, &mut PrintWriter::Stdout)
-        .expect("resume should succeed")
-}
-
-fn complete_repl_resolve_futures(progress: ReplProgress<NoLimitTracker>) -> ReplProgress<NoLimitTracker> {
-    let ReplProgress::ResolveFutures(state) = progress else {
-        panic!("expected resolve futures progress");
-    };
-    let results = state
-        .pending_call_ids()
-        .iter()
-        .map(|call_id| (*call_id, ExtFunctionResult::Return(MontyObject::Int(1))))
-        .collect();
-    state
-        .resume(results, &mut PrintWriter::Stdout)
-        .expect("resume should succeed")
-}
-
-#[test]
-fn run_progress_snapshot_extension_round_trips() {
-    let progress = create_function_call_progress("ext_fn([])");
-    let snapshot_extension = vec![1, 2, 3, 4];
+    let progress = create_run_progress_for_variant(variant);
     let progress = attach_run_snapshot_extension(progress, snapshot_extension.clone());
-
     let bytes = progress.dump().expect("run progress dump should succeed");
     let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
 
-    let loaded_extension = run_progress_snapshot_extension(&loaded).expect("expected snapshot extension");
-    assert_eq!(loaded_extension, snapshot_extension.as_slice());
-}
-
-#[test]
-fn future_snapshot_extension_round_trips() {
-    let code = r"
-import asyncio
-
-async def main():
-    return await foo()
-
-await main()
-";
-    let progress = create_function_call_progress(code);
-    let progress = drive_to_resolve_futures(progress);
-    let snapshot_extension = vec![9, 8, 7];
-    let progress = attach_run_snapshot_extension(progress, snapshot_extension.clone());
-
-    let bytes = progress.dump().expect("run progress dump should succeed");
-    let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
-
-    let loaded_extension = run_progress_snapshot_extension(&loaded).expect("expected snapshot extension");
-    assert_eq!(loaded_extension, snapshot_extension.as_slice());
-
-    let completed = complete_resolve_futures(progress);
-    assert!(matches!(completed, RunProgress::Complete(_)));
-
-    let completed_loaded = complete_resolve_futures(loaded);
-    assert!(matches!(completed_loaded, RunProgress::Complete(_)));
-}
-
-#[test]
-fn run_progress_snapshot_extension_defaults_to_none() {
-    let progress = create_function_call_progress("ext_fn([])");
-    let bytes = progress.dump().expect("run progress dump should succeed");
-    let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
-
-    assert!(
-        run_progress_snapshot_extension(&loaded).is_none(),
-        "expected no snapshot extension by default"
+    assert_snapshot_behavior(
+        run_progress_snapshot_extension(&loaded),
+        snapshot_extension.as_slice(),
+        expected_behavior,
     );
+
+    if variant == SnapshotProgressVariant::ResolveFutures {
+        let completed = complete_resolve_futures(progress, &MontyObject::Int(1));
+        assert_eq!(
+            completed
+                .into_complete()
+                .expect("expected completion after resolving futures"),
+            MontyObject::Int(1)
+        );
+
+        let completed_loaded = complete_resolve_futures(loaded, &MontyObject::Int(1));
+        assert_eq!(
+            completed_loaded
+                .into_complete()
+                .expect("expected loaded completion after resolving futures"),
+            MontyObject::Int(1)
+        );
+    }
 }
 
-#[test]
-fn repl_progress_snapshot_extension_round_trips() {
-    let repl = create_repl();
-    let progress = repl
-        .start("ext_fn([])", &mut PrintWriter::Stdout)
-        .expect("repl should suspend");
-    let snapshot_extension = vec![5, 6, 7, 8];
-    let progress = attach_repl_snapshot_extension(progress, snapshot_extension.clone());
+#[rstest]
+#[case::function_call(SnapshotProgressVariant::FunctionCall)]
+#[case::os_call(SnapshotProgressVariant::OsCall)]
+#[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
+#[case::complete(SnapshotProgressVariant::Complete)]
+fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotProgressVariant) {
+    let progress = create_run_progress_for_variant(variant);
+    let bytes = progress.dump().expect("run progress dump should succeed");
+    let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
 
+    assert_snapshot_behavior(run_progress_snapshot_extension(&loaded), &[], SnapshotBehavior::Absent);
+
+    if variant == SnapshotProgressVariant::ResolveFutures {
+        let completed = complete_resolve_futures(progress, &MontyObject::Int(1));
+        assert_eq!(
+            completed
+                .into_complete()
+                .expect("expected completion after resolving defaulted futures"),
+            MontyObject::Int(1)
+        );
+
+        let completed_loaded = complete_resolve_futures(loaded, &MontyObject::Int(1));
+        assert_eq!(
+            completed_loaded
+                .into_complete()
+                .expect("expected loaded completion after resolving defaulted futures"),
+            MontyObject::Int(1)
+        );
+    }
+}
+
+#[rstest]
+#[case::function_call(SnapshotProgressVariant::FunctionCall)]
+#[case::os_call(SnapshotProgressVariant::OsCall)]
+#[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
+#[case::complete(SnapshotProgressVariant::Complete)]
+fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
+    let (fixture_variant, expected_behavior) = repl_variant_case(variant);
+    assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
+
+    let progress = create_repl_progress_for_variant(variant);
+    let progress = attach_repl_snapshot_extension(progress, snapshot_extension.clone());
     let bytes = progress.dump().expect("repl progress dump should succeed");
     let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).expect("repl progress load should succeed");
 
-    let loaded_extension = repl_progress_snapshot_extension(&loaded).expect("expected snapshot extension");
-    assert_eq!(loaded_extension, snapshot_extension.as_slice());
+    assert_snapshot_behavior(
+        repl_progress_snapshot_extension(&loaded),
+        snapshot_extension.as_slice(),
+        expected_behavior,
+    );
+
+    if variant == SnapshotProgressVariant::ResolveFutures {
+        let completed = complete_repl_resolve_futures(progress, &MontyObject::Int(3));
+        let ReplProgress::Complete { value, .. } = completed else {
+            panic!("expected completion after resolving REPL futures");
+        };
+        assert_eq!(value, MontyObject::Int(3));
+
+        let completed_loaded = complete_repl_resolve_futures(loaded, &MontyObject::Int(3));
+        let ReplProgress::Complete { value, .. } = completed_loaded else {
+            panic!("expected loaded completion after resolving REPL futures");
+        };
+        assert_eq!(value, MontyObject::Int(3));
+    }
 }
 
-#[test]
-fn repl_future_snapshot_extension_round_trips() {
-    let repl = create_repl();
-    let code = r"
-import asyncio
-
-async def main():
-    return await foo()
-
-await main()
-";
-    let progress = repl.start(code, &mut PrintWriter::Stdout).expect("repl should suspend");
-    let progress = drive_repl_to_resolve_futures(progress);
-    let snapshot_extension = vec![11, 12, 13];
-    let progress = attach_repl_snapshot_extension(progress, snapshot_extension.clone());
-
-    let bytes = progress.dump().expect("repl progress dump should succeed");
-    let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).expect("repl progress load should succeed");
-
-    let loaded_extension = repl_progress_snapshot_extension(&loaded).expect("expected snapshot extension");
-    assert_eq!(loaded_extension, snapshot_extension.as_slice());
-
-    let completed = complete_repl_resolve_futures(progress);
-    assert!(matches!(completed, ReplProgress::Complete { .. }));
-
-    let completed_loaded = complete_repl_resolve_futures(loaded);
-    assert!(matches!(completed_loaded, ReplProgress::Complete { .. }));
-}
-
-#[test]
-fn corrupted_run_progress_payload_fails_to_load() {
-    let progress = create_function_call_progress("ext_fn([])");
-    let progress = attach_run_snapshot_extension(progress, vec![1, 2]);
+#[rstest]
+#[case::function_call(SnapshotProgressVariant::FunctionCall)]
+fn corrupted_run_progress_payload_fails_to_load(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
+    let progress = create_run_progress_for_variant(variant);
+    let progress = attach_run_snapshot_extension(progress, snapshot_extension);
     let mut bytes = progress.dump().expect("run progress dump should succeed");
 
     bytes.pop();
 
     assert!(RunProgress::<NoLimitTracker>::load(&bytes).is_err());
-}
-
-#[test]
-fn repl_future_snapshot_resume_ignores_extension_bytes() {
-    let repl = create_repl();
-    let code = r"
-import asyncio
-
-async def main():
-    return await foo()
-
-await main()
-";
-    let progress = repl.start(code, &mut PrintWriter::Stdout).expect("repl should suspend");
-    let progress = drive_repl_to_resolve_futures(progress);
-    let progress = attach_repl_snapshot_extension(progress, vec![99]);
-
-    let ReplProgress::ResolveFutures(state) = progress else {
-        panic!("expected resolve futures progress");
-    };
-
-    let results = vec![(
-        state.pending_call_ids()[0],
-        ExtFunctionResult::Return(MontyObject::Int(3)),
-    )];
-    let progress = state
-        .resume(results, &mut PrintWriter::Stdout)
-        .expect("resume should succeed");
-
-    let ReplProgress::Complete { value, .. } = progress else {
-        panic!("expected completion after resume");
-    };
-    assert_eq!(value, MontyObject::Int(3));
 }

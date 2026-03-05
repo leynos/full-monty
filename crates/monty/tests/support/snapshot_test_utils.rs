@@ -2,6 +2,7 @@
 
 use monty::{
     ExtFunctionResult, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress,
+    SnapshotExtension,
 };
 
 /// Progress variants relevant to snapshot-extension round-trip coverage.
@@ -136,10 +137,10 @@ pub fn attach_repl_snapshot_extension(
 /// Reads snapshot-extension bytes from a run progress value when available.
 pub fn run_progress_snapshot_extension(progress: &RunProgress<NoLimitTracker>) -> Option<&[u8]> {
     match progress {
-        RunProgress::FunctionCall(call) => call.snapshot_extension(),
-        RunProgress::OsCall(call) => call.snapshot_extension(),
-        RunProgress::ResolveFutures(state) => state.snapshot_extension(),
-        RunProgress::NameLookup(lookup) => lookup.snapshot_extension(),
+        RunProgress::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
+        RunProgress::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
+        RunProgress::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
+        RunProgress::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
         RunProgress::Complete(_) => None,
     }
 }
@@ -147,10 +148,10 @@ pub fn run_progress_snapshot_extension(progress: &RunProgress<NoLimitTracker>) -
 /// Reads snapshot-extension bytes from a REPL progress value when available.
 pub fn repl_progress_snapshot_extension(progress: &ReplProgress<NoLimitTracker>) -> Option<&[u8]> {
     match progress {
-        ReplProgress::FunctionCall(call) => call.snapshot_extension(),
-        ReplProgress::OsCall(call) => call.snapshot_extension(),
-        ReplProgress::ResolveFutures(state) => state.snapshot_extension(),
-        ReplProgress::NameLookup(lookup) => lookup.snapshot_extension(),
+        ReplProgress::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
+        ReplProgress::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
+        ReplProgress::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
+        ReplProgress::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
         ReplProgress::Complete { .. } => None,
     }
 }

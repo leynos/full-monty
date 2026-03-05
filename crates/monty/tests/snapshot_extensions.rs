@@ -173,3 +173,14 @@ fn corrupted_run_progress_payload_fails_to_load(#[case] variant: SnapshotProgres
 
     assert!(RunProgress::<NoLimitTracker>::load(&bytes).is_err());
 }
+
+#[test]
+fn corrupted_repl_progress_payload_fails_to_load() {
+    let progress = create_repl_progress_for_variant(SnapshotProgressVariant::FunctionCall);
+    let progress = attach_repl_snapshot_extension(progress, vec![9, 8, 7]);
+    let mut bytes = progress.dump().expect("repl progress dump should succeed");
+
+    bytes.pop();
+
+    assert!(ReplProgress::<NoLimitTracker>::load(&bytes).is_err());
+}

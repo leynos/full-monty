@@ -1,10 +1,9 @@
 //! Tests for snapshot extension byte round-trips.
 
-use monty::{MontyObject, NoLimitTracker, PrintWriter, ReplProgress, RunProgress, SnapshotExtension};
+use monty::{MontyObject, NoLimitTracker, PrintWriter, ReplProgress, RunProgress};
 use rstest::{fixture, rstest};
 use snapshot_test_utils::{
-    SnapshotBehavior, SnapshotProgressVariant, complete_repl_resolve_futures, complete_resolve_futures, create_repl,
-    create_run_progress,
+    ProgressSnapshotExt, SnapshotBehavior, SnapshotProgressVariant, create_repl, create_run_progress,
 };
 
 #[expect(
@@ -13,71 +12,6 @@ use snapshot_test_utils::{
 )]
 #[path = "support/snapshot_test_utils.rs"]
 mod snapshot_test_utils;
-
-/// Test-local API for attaching and reading snapshot-extension bytes from
-/// progress values without repeating variant matching in every assertion.
-///
-/// The helpers consume `self` when attaching bytes so tests can chain calls on
-/// newly created progress values, and they expose snapshot metadata as an
-/// optional byte slice because complete progress variants do not carry
-/// snapshots.
-trait ProgressSnapshotExt: Sized {
-    fn attach_snapshot_extension(self, ext: Vec<u8>) -> Self;
-    fn get_snapshot_extension(&self) -> Option<&[u8]>;
-}
-
-/// Adds snapshot-extension chaining for run progress values.
-///
-/// Suspended variants forward to their underlying snapshot wrappers, while the
-/// `Complete` variant is returned unchanged because it has no snapshot to
-/// decorate.
-impl ProgressSnapshotExt for RunProgress<NoLimitTracker> {
-    fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
-        match self {
-            Self::FunctionCall(call) => Self::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
-            Self::OsCall(call) => Self::OsCall(call.with_snapshot_extension(snapshot_extension)),
-            Self::ResolveFutures(s) => Self::ResolveFutures(s.with_snapshot_extension(snapshot_extension)),
-            Self::NameLookup(l) => Self::NameLookup(l.with_snapshot_extension(snapshot_extension)),
-            Self::Complete(v) => Self::Complete(v),
-        }
-    }
-
-    fn get_snapshot_extension(&self) -> Option<&[u8]> {
-        match self {
-            Self::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::ResolveFutures(s) => s.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::NameLookup(l) => l.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::Complete(_) => None,
-        }
-    }
-}
-
-/// Adds snapshot-extension chaining for REPL progress values.
-///
-/// This mirrors the run-progress behavior, with the same assumption that
-/// completed REPL results have no suspendable snapshot metadata to expose.
-impl ProgressSnapshotExt for ReplProgress<NoLimitTracker> {
-    fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
-        match self {
-            Self::FunctionCall(call) => Self::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
-            Self::OsCall(call) => Self::OsCall(call.with_snapshot_extension(snapshot_extension)),
-            Self::ResolveFutures(s) => Self::ResolveFutures(s.with_snapshot_extension(snapshot_extension)),
-            Self::NameLookup(l) => Self::NameLookup(l.with_snapshot_extension(snapshot_extension)),
-            Self::Complete { repl, value } => Self::Complete { repl, value },
-        }
-    }
-
-    fn get_snapshot_extension(&self) -> Option<&[u8]> {
-        match self {
-            Self::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::ResolveFutures(s) => s.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::NameLookup(l) => l.snapshot_extension().map(SnapshotExtension::as_slice),
-            Self::Complete { .. } => None,
-        }
-    }
-}
 
 /// Triggers an external function call suspension.
 const EXTERNAL_CALL_SCRIPT: &str = "ext_fn([])";
@@ -142,43 +76,9 @@ fn assert_snapshot_behavior(actual: Option<&[u8]>, snapshot_extension: &[u8], ex
     }
 }
 
-/// Generates helpers that drive progress values forward until they suspend on
-/// `ResolveFutures`.
-///
-/// The generated functions repeatedly consume progress values, resume pending
-/// function calls, and stop once a futures-resolving snapshot is reached. They
-/// panic on other suspension kinds because the fixture scripts are expected to
-/// reach `ResolveFutures` deterministically.
-macro_rules! impl_drive_to_resolve_futures {
-    ($fn_name:ident, $Progress:ident) => {
-        fn $fn_name(mut progress: $Progress<NoLimitTracker>) -> $Progress<NoLimitTracker> {
-            loop {
-                match progress {
-                    $Progress::FunctionCall(call) => {
-                        progress = call
-                            .resume_pending(&mut PrintWriter::Stdout)
-                            .expect("run_pending should succeed");
-                    }
-                    $Progress::ResolveFutures(_) => return progress,
-                    $Progress::OsCall(call) => {
-                        panic!("unexpected OsCall: {:?}", call.function)
-                    }
-                    $Progress::NameLookup(lookup) => {
-                        panic!("unexpected NameLookup: {}", lookup.name)
-                    }
-                    _ => panic!("unexpected Complete before ResolveFutures"),
-                }
-            }
-        }
-    };
-}
-
-impl_drive_to_resolve_futures!(drive_to_resolve_futures, RunProgress);
-impl_drive_to_resolve_futures!(drive_repl_to_resolve_futures, ReplProgress);
-
 /// Builds the requested run-progress variant used in snapshot-extension tests.
 ///
-/// This keeps the variant matrix in one place and uses `drive_to_resolve_futures`
+/// This keeps the variant matrix in one place and uses `ProgressSnapshotExt::drive_to_resolve_futures`
 /// when a fixture needs to advance through an initial external call before the
 /// snapshot under test is available.
 fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunProgress<NoLimitTracker> {
@@ -186,7 +86,7 @@ fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunProgr
         SnapshotProgressVariant::FunctionCall => create_run_progress(EXTERNAL_CALL_SCRIPT),
         SnapshotProgressVariant::OsCall => create_run_progress(OS_CALL_SCRIPT),
         SnapshotProgressVariant::ResolveFutures => {
-            drive_to_resolve_futures(create_run_progress(RESOLVE_FUTURES_SCRIPT))
+            create_run_progress(RESOLVE_FUTURES_SCRIPT).drive_to_resolve_futures()
         }
         SnapshotProgressVariant::Complete => create_run_progress(COMPLETE_SCRIPT),
     }
@@ -209,7 +109,7 @@ fn create_repl_progress_for_variant(variant: SnapshotProgressVariant) -> ReplPro
         .start(snippet, &mut PrintWriter::Stdout)
         .expect("repl should produce progress");
     if variant == SnapshotProgressVariant::ResolveFutures {
-        drive_repl_to_resolve_futures(progress)
+        progress.drive_to_resolve_futures()
     } else {
         progress
     }
@@ -236,7 +136,7 @@ fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgress
     );
 
     if variant == SnapshotProgressVariant::ResolveFutures {
-        let completed = complete_resolve_futures(progress, &MontyObject::Int(1));
+        let completed = progress.complete_resolve_futures(&MontyObject::Int(1));
         assert_eq!(
             completed
                 .into_complete()
@@ -244,7 +144,7 @@ fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgress
             MontyObject::Int(1)
         );
 
-        let completed_loaded = complete_resolve_futures(loaded, &MontyObject::Int(1));
+        let completed_loaded = loaded.complete_resolve_futures(&MontyObject::Int(1));
         assert_eq!(
             completed_loaded
                 .into_complete()
@@ -267,7 +167,7 @@ fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotPro
     assert_snapshot_behavior(loaded.get_snapshot_extension(), &[], SnapshotBehavior::Absent);
 
     if variant == SnapshotProgressVariant::ResolveFutures {
-        let completed = complete_resolve_futures(progress, &MontyObject::Int(1));
+        let completed = progress.complete_resolve_futures(&MontyObject::Int(1));
         assert_eq!(
             completed
                 .into_complete()
@@ -275,7 +175,7 @@ fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotPro
             MontyObject::Int(1)
         );
 
-        let completed_loaded = complete_resolve_futures(loaded, &MontyObject::Int(1));
+        let completed_loaded = loaded.complete_resolve_futures(&MontyObject::Int(1));
         assert_eq!(
             completed_loaded
                 .into_complete()
@@ -306,13 +206,13 @@ fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgres
     );
 
     if variant == SnapshotProgressVariant::ResolveFutures {
-        let completed = complete_repl_resolve_futures(progress, &MontyObject::Int(3));
+        let completed = progress.complete_resolve_futures(&MontyObject::Int(3));
         let ReplProgress::Complete { value, .. } = completed else {
             panic!("expected completion after resolving REPL futures");
         };
         assert_eq!(value, MontyObject::Int(3));
 
-        let completed_loaded = complete_repl_resolve_futures(loaded, &MontyObject::Int(3));
+        let completed_loaded = loaded.complete_resolve_futures(&MontyObject::Int(3));
         let ReplProgress::Complete { value, .. } = completed_loaded else {
             panic!("expected loaded completion after resolving REPL futures");
         };

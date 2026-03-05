@@ -12,7 +12,7 @@ use ruff_python_parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErr
 
 use crate::{
     ExcType, MontyException,
-    args::HostCallArgs,
+    args::{ArgValues, HostCallArgs},
     asyncio::CallId,
     bytecode::{Code, Compiler, FrameExit, VM, VMSnapshot, VmComponents},
     exception_private::{RunError, RunResult},
@@ -1185,7 +1185,7 @@ fn handle_repl_vm_result<T: ResourceTracker>(
 /// Converts VM call arguments into host objects with runtime IDs and emits
 /// the corresponding observer event in one place.
 fn build_observed_host_call_args<T: ResourceTracker>(
-    args: crate::args::ArgValues,
+    args: ArgValues,
     heap: &mut Heap<T>,
     interns: &Interns,
     observer: &RuntimeObserverHandle,

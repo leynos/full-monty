@@ -606,6 +606,20 @@ impl<T: ResourceTracker> ReplProgress<T> {
             _ => None,
         }
     }
+
+    /// Attaches a runtime observer to suspended progress variants.
+    ///
+    /// This is used after deserialization because observer handles are skipped
+    /// in snapshots and must be re-injected by the host.
+    fn attach_observer(&mut self, observer: RuntimeObserverHandle) {
+        match self {
+            Self::FunctionCall(call) => call.snapshot.observer = observer,
+            Self::OsCall(call) => call.snapshot.observer = observer,
+            Self::ResolveFutures(state) => state.observer = observer,
+            Self::NameLookup(lookup) => lookup.snapshot.observer = observer,
+            Self::Complete { .. } => {}
+        }
+    }
 }
 
 impl<T: ResourceTracker + serde::Serialize> ReplProgress<T> {
@@ -625,6 +639,16 @@ impl<T: ResourceTracker + serde::de::DeserializeOwned> ReplProgress<T> {
     /// Returns an error if deserialization fails.
     pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
         postcard::from_bytes(bytes)
+    }
+
+    /// Deserializes REPL execution progress and reattaches a runtime observer.
+    ///
+    /// # Errors
+    /// Returns an error if deserialization fails.
+    pub fn load_with_observer(bytes: &[u8], observer: RuntimeObserverHandle) -> Result<Self, postcard::Error> {
+        let mut progress: Self = postcard::from_bytes(bytes)?;
+        progress.attach_observer(observer);
+        Ok(progress)
     }
 }
 
@@ -966,12 +990,10 @@ pub(crate) struct ReplSnapshot<T: ResourceTracker> {
     /// VM stack/frame state at suspension.
     vm_state: VMSnapshot,
     /// Runtime observer carried across suspend/resume boundaries.
-    #[serde(skip, default)]
+    #[serde(skip)]
     observer: RuntimeObserverHandle,
     /// Metadata for the host call currently being resumed, when applicable.
-    #[serde(skip, default)]
     pending_call_id: Option<u32>,
-    #[serde(skip, default)]
     pending_call_kind: Option<ExternalCallKind>,
 }
 

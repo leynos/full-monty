@@ -7,11 +7,11 @@ mod test_utils;
 
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRepl, MontyRun,
-    NoLimitTracker, NoopRuntimeObserver, OpInputIds, PrintWriter, ResourceTracker, RunProgress, RuntimeObserver,
-    RuntimeObserverEvent, RuntimeObserverHandle,
+    NoLimitTracker, NoopRuntimeObserver, OpInputIds, PrintWriter, RunProgress, RuntimeObserver, RuntimeObserverEvent,
+    RuntimeObserverHandle,
 };
 use rstest::{fixture, rstest};
-use test_utils::{as_function_call, as_os_call};
+use test_utils::{as_function_call, as_os_call, assert_function_calls_equal};
 
 /// Captured observer events in test-friendly form.
 ///
@@ -107,16 +107,6 @@ fn build_recording_observer() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedE
 /// Clones the current recorded event stream.
 fn read_events(events: &Arc<Mutex<Vec<RecordedEvent>>>) -> Vec<RecordedEvent> {
     events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
-}
-
-fn assert_function_calls_equal<T: ResourceTracker>(left: &monty::FunctionCall<T>, right: &monty::FunctionCall<T>) {
-    assert_eq!(left.function_name, right.function_name);
-    assert_eq!(left.args, right.args);
-    assert_eq!(left.kwargs, right.kwargs);
-    assert_eq!(left.call_id, right.call_id);
-    assert_eq!(left.method_call, right.method_call);
-    assert_eq!(left.arg_runtime_ids, right.arg_runtime_ids);
-    assert_eq!(left.kwarg_runtime_ids, right.kwarg_runtime_ids);
 }
 
 #[fixture]

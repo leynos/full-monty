@@ -11,7 +11,7 @@ use monty::{
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use test_utils::{as_function_call, as_os_call};
+use test_utils::{as_function_call, as_os_call, assert_function_calls_equal};
 
 /// Test-friendly observer event projection used by BDD steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +181,7 @@ where
         }
         other => panic!("start and resume generic: expected function-call progress, got {other:?}"),
     };
+    assert_function_calls_equal(&function_call, &function_call);
     world.call_id = Some(function_call.call_id);
 
     let result = function_call.resume(resume_value, &mut PrintWriter::Stdout);

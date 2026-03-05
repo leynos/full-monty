@@ -12,6 +12,7 @@ use ruff_python_parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErr
 
 use crate::{
     ExcType, MontyException,
+    args::HostCallArgs,
     asyncio::CallId,
     bytecode::{Code, Compiler, FrameExit, VM, VMSnapshot, VmComponents},
     exception_private::{RunError, RunResult},
@@ -1072,15 +1073,15 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             ..
         }) => {
             let function_name = function_name.into_string(&executor.interns);
-            let host_args = args.into_py_objects_with_runtime_ids(&mut repl.heap, &executor.interns);
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: call_id.raw(),
-                    kind: ExternalCallKind::Function,
-                    arg_runtime_ids: &host_args.arg_runtime_ids,
-                    kwarg_runtime_ids: &host_args.kwarg_runtime_ids,
-                },
-            ));
+            let call_id = call_id.raw();
+            let host_args = build_observed_host_call_args(
+                args,
+                &mut repl.heap,
+                &executor.interns,
+                &observer,
+                call_id,
+                ExternalCallKind::Function,
+            );
 
             Ok(ReplProgress::FunctionCall(ReplFunctionCall {
                 function_name,
@@ -1088,9 +1089,9 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 kwargs: host_args.kwargs,
                 arg_runtime_ids: host_args.arg_runtime_ids,
                 kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
+                call_id,
                 method_call: false,
-                snapshot: new_repl_snapshot!(Some(call_id.raw()), Some(ExternalCallKind::Function)),
+                snapshot: new_repl_snapshot!(Some(call_id), Some(ExternalCallKind::Function)),
             }))
         }
         Ok(FrameExit::OsCall {
@@ -1098,15 +1099,15 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             args,
             call_id,
         }) => {
-            let host_args = args.into_py_objects_with_runtime_ids(&mut repl.heap, &executor.interns);
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: call_id.raw(),
-                    kind: ExternalCallKind::Os,
-                    arg_runtime_ids: &host_args.arg_runtime_ids,
-                    kwarg_runtime_ids: &host_args.kwarg_runtime_ids,
-                },
-            ));
+            let call_id = call_id.raw();
+            let host_args = build_observed_host_call_args(
+                args,
+                &mut repl.heap,
+                &executor.interns,
+                &observer,
+                call_id,
+                ExternalCallKind::Os,
+            );
 
             Ok(ReplProgress::OsCall(ReplOsCall {
                 function,
@@ -1114,8 +1115,8 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 kwargs: host_args.kwargs,
                 arg_runtime_ids: host_args.arg_runtime_ids,
                 kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
-                snapshot: new_repl_snapshot!(Some(call_id.raw()), Some(ExternalCallKind::Os)),
+                call_id,
+                snapshot: new_repl_snapshot!(Some(call_id), Some(ExternalCallKind::Os)),
             }))
         }
         Ok(FrameExit::MethodCall {
@@ -1124,15 +1125,15 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             call_id,
         }) => {
             let function_name = method_name.into_string(&executor.interns);
-            let host_args = args.into_py_objects_with_runtime_ids(&mut repl.heap, &executor.interns);
-            observer.emit(RuntimeObserverEvent::ExternalCallRequested(
-                ExternalCallRequestedEvent {
-                    call_id: call_id.raw(),
-                    kind: ExternalCallKind::Method,
-                    arg_runtime_ids: &host_args.arg_runtime_ids,
-                    kwarg_runtime_ids: &host_args.kwarg_runtime_ids,
-                },
-            ));
+            let call_id = call_id.raw();
+            let host_args = build_observed_host_call_args(
+                args,
+                &mut repl.heap,
+                &executor.interns,
+                &observer,
+                call_id,
+                ExternalCallKind::Method,
+            );
 
             Ok(ReplProgress::FunctionCall(ReplFunctionCall {
                 function_name,
@@ -1140,9 +1141,9 @@ fn handle_repl_vm_result<T: ResourceTracker>(
                 kwargs: host_args.kwargs,
                 arg_runtime_ids: host_args.arg_runtime_ids,
                 kwarg_runtime_ids: host_args.kwarg_runtime_ids,
-                call_id: call_id.raw(),
+                call_id,
                 method_call: true,
-                snapshot: new_repl_snapshot!(Some(call_id.raw()), Some(ExternalCallKind::Method)),
+                snapshot: new_repl_snapshot!(Some(call_id), Some(ExternalCallKind::Method)),
             }))
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
@@ -1179,4 +1180,26 @@ fn handle_repl_vm_result<T: ResourceTracker>(
             Err(Box::new(ReplStartError { repl, error }))
         }
     }
+}
+
+/// Converts VM call arguments into host objects with runtime IDs and emits
+/// the corresponding observer event in one place.
+fn build_observed_host_call_args<T: ResourceTracker>(
+    args: crate::args::ArgValues,
+    heap: &mut Heap<T>,
+    interns: &Interns,
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    kind: ExternalCallKind,
+) -> HostCallArgs {
+    let host_args = args.into_py_objects_with_runtime_ids(heap, interns);
+    observer.emit(RuntimeObserverEvent::ExternalCallRequested(
+        ExternalCallRequestedEvent {
+            call_id,
+            kind,
+            arg_runtime_ids: &host_args.arg_runtime_ids,
+            kwarg_runtime_ids: &host_args.kwarg_runtime_ids,
+        },
+    ));
+    host_args
 }

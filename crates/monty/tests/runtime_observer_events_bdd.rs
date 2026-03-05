@@ -2,12 +2,16 @@
 
 use std::sync::{Arc, Mutex};
 
+#[path = "support/test_utils.rs"]
+mod test_utils;
+
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRun, NoLimitTracker,
     OpInputIds, PrintWriter, RunProgress, RuntimeObserver, RuntimeObserverEvent, RuntimeObserverHandle,
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
+use test_utils::{as_function_call, as_os_call};
 
 /// Test-friendly observer event projection used by BDD steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,13 +145,6 @@ fn recording_observer_fixture() -> (RuntimeObserverHandle, Arc<Mutex<Vec<Recorde
     (observer, events)
 }
 
-fn as_function_call(progress: RunProgress<NoLimitTracker>, context: &str) -> monty::FunctionCall<NoLimitTracker> {
-    match progress {
-        RunProgress::FunctionCall(call) => call,
-        other => panic!("{context}: expected function call progress, got {other:?}"),
-    }
-}
-
 /// Starts a run with a recording observer and returns progress plus event handles.
 fn recording_start_with_observer(
     script: String,
@@ -176,7 +173,14 @@ where
 {
     let fixture = recording_start_with_observer(world.script.clone(), vec![], vec![]);
 
-    let function_call = as_function_call(fixture.progress, "start and resume generic");
+    let function_call = match fixture.progress {
+        progress @ RunProgress::FunctionCall(_) => as_function_call(progress, "start and resume generic"),
+        progress @ RunProgress::OsCall(_) => {
+            let _ = as_os_call(progress, "start and resume generic");
+            panic!("start and resume generic: expected function-call progress, got os-call progress");
+        }
+        other => panic!("start and resume generic: expected function-call progress, got {other:?}"),
+    };
     world.call_id = Some(function_call.call_id);
 
     let result = function_call.resume(resume_value, &mut PrintWriter::Stdout);

@@ -2,12 +2,16 @@
 
 use std::sync::{Arc, Mutex};
 
+#[path = "support/test_utils.rs"]
+mod test_utils;
+
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRepl, MontyRun,
     NoLimitTracker, NoopRuntimeObserver, OpInputIds, PrintWriter, ResourceTracker, RunProgress, RuntimeObserver,
     RuntimeObserverEvent, RuntimeObserverHandle,
 };
 use rstest::{fixture, rstest};
+use test_utils::{as_function_call, as_os_call};
 
 /// Captured observer events in test-friendly form.
 ///
@@ -103,20 +107,6 @@ fn build_recording_observer() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedE
 /// Clones the current recorded event stream.
 fn read_events(events: &Arc<Mutex<Vec<RecordedEvent>>>) -> Vec<RecordedEvent> {
     events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
-}
-
-fn as_function_call<T: ResourceTracker>(progress: RunProgress<T>, context: &str) -> monty::FunctionCall<T> {
-    match progress {
-        RunProgress::FunctionCall(call) => call,
-        other => panic!("{context}: expected function-call progress, got {other:?}"),
-    }
-}
-
-fn as_os_call<T: ResourceTracker>(progress: RunProgress<T>, context: &str) -> monty::OsCall<T> {
-    match progress {
-        RunProgress::OsCall(call) => call,
-        other => panic!("{context}: expected OS-call progress, got {other:?}"),
-    }
 }
 
 fn assert_function_calls_equal<T: ResourceTracker>(left: &monty::FunctionCall<T>, right: &monty::FunctionCall<T>) {

@@ -859,6 +859,17 @@ pub struct PyFunctionSnapshot {
     pub kwarg_runtime_ids: Vec<(usize, usize)>,
 }
 
+/// Converts runtime-id wrappers to raw stable IDs for Python-facing snapshots.
+fn map_runtime_ids(
+    arg_ids: &[::monty::RuntimeValueId],
+    kwarg_ids: &[(::monty::RuntimeValueId, ::monty::RuntimeValueId)],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    (
+        arg_ids.iter().map(|id| id.raw()).collect(),
+        kwarg_ids.iter().map(|(key, value)| (key.raw(), value.raw())).collect(),
+    )
+}
+
 impl PyFunctionSnapshot {
     /// Creates a `PyFunctionSnapshot` for an external function call.
     ///
@@ -875,12 +886,7 @@ impl PyFunctionSnapshot {
         let function_name = call.function_name.clone();
         let call_id = call.call_id;
         let method_call = call.method_call;
-        let arg_runtime_ids = call.arg_runtime_ids.iter().map(|id| id.raw()).collect();
-        let kwarg_runtime_ids = call
-            .kwarg_runtime_ids
-            .iter()
-            .map(|(key, value)| (key.raw(), value.raw()))
-            .collect();
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let items: PyResult<Vec<Py<PyAny>>> = call
             .args
             .iter()
@@ -922,12 +928,7 @@ impl PyFunctionSnapshot {
     ) -> PyResult<Bound<'_, PyAny>> {
         let function_name = call.function.to_string();
         let call_id = call.call_id;
-        let arg_runtime_ids = call.arg_runtime_ids.iter().map(|id| id.raw()).collect();
-        let kwarg_runtime_ids = call
-            .kwarg_runtime_ids
-            .iter()
-            .map(|(key, value)| (key.raw(), value.raw()))
-            .collect();
+        let (arg_runtime_ids, kwarg_runtime_ids) = map_runtime_ids(&call.arg_runtime_ids, &call.kwarg_runtime_ids);
         let items: PyResult<Vec<Py<PyAny>>> = call
             .args
             .iter()

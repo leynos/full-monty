@@ -384,8 +384,17 @@ impl<T: ResourceTracker> MontyRepl<T> {
     }
 
     /// Starts snippet execution with `PrintWriter::Stdout` and no additional host output wiring.
+    pub fn start_no_print_with_observer(
+        self,
+        code: &str,
+        observer: RuntimeObserverHandle,
+    ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
+        self.start_with_observer(code, &mut PrintWriter::Stdout, observer)
+    }
+
+    /// Starts snippet execution with `PrintWriter::Stdout` and no additional host output wiring.
     pub fn start_no_print(self, code: &str) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
-        self.start(code, &mut PrintWriter::Stdout)
+        self.start_no_print_with_observer(code, RuntimeObserverHandle::disabled())
     }
 
     /// Feeds and executes a new snippet against the current REPL state.

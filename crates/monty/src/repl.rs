@@ -20,16 +20,13 @@ use crate::{
     io::PrintWriter,
     namespace::{GLOBAL_NS_IDX, NamespaceId, Namespaces},
     object::MontyObject,
-    observer::{
-        ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind, ExternalCallReturnedEvent,
-        RuntimeObserverEvent, RuntimeObserverHandle,
-    },
+    observer::{ExternalCallKind, ExternalCallRequestedEvent, RuntimeObserverEvent, RuntimeObserverHandle},
     os::OsFunction,
     parse::{parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
     progress_runtime_ids::RuntimeIdSlices,
     resource::ResourceTracker,
-    run_progress::{ExtFunctionResult, NameLookupResult},
+    run_progress::{ExtFunctionResult, NameLookupResult, emit_external_call_returned},
     runtime_id::RuntimeValueId,
     value::Value,
 };
@@ -981,14 +978,7 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
         let ext_result = result.into();
 
         if let (Some(call_id), Some(_kind)) = (pending_call_id, pending_call_kind) {
-            observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                call_id,
-                kind: match ext_result {
-                    ExtFunctionResult::Return(_) => ExternalCallReturnKind::Return,
-                    ExtFunctionResult::Future(_) => ExternalCallReturnKind::Future,
-                    ExtFunctionResult::Error(_) | ExtFunctionResult::NotFound(_) => ExternalCallReturnKind::Error,
-                },
-            }));
+            emit_external_call_returned(&observer, call_id, &ext_result);
         }
 
         let mut vm = VM::restore_with_observer(

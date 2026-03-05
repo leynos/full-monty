@@ -28,9 +28,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         print_writer: &'a mut PrintWriter<'p>,
         observer: RuntimeObserverHandle,
     ) -> Self {
-        let mut vm = Self::new(heap, namespaces, interns, print_writer);
-        vm.observer = observer;
-        vm
+        Self::new_internal(heap, namespaces, interns, print_writer, observer)
     }
 
     /// Reconstructs a VM from a snapshot with an optional runtime observer.
@@ -43,9 +41,11 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         print_writer: &'a mut PrintWriter<'p>,
         observer: RuntimeObserverHandle,
     ) -> Self {
-        let mut vm = Self::restore(snapshot, module_code, heap, namespaces, interns, print_writer);
-        vm.observer = observer;
-        vm
+        if observer.is_enabled() {
+            Self::restore_internal(snapshot, module_code, heap, namespaces, interns, print_writer, observer)
+        } else {
+            Self::restore(snapshot, module_code, heap, namespaces, interns, print_writer)
+        }
     }
 
     /// Pushes a value while emitting a `ValueCreated` event when observation is enabled.

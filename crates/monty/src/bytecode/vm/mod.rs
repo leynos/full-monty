@@ -606,6 +606,26 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         interns: &'a Interns,
         print_writer: &'a mut PrintWriter<'p>,
     ) -> Self {
+        Self::new_internal(
+            heap,
+            namespaces,
+            interns,
+            print_writer,
+            RuntimeObserverHandle::disabled(),
+        )
+    }
+
+    /// Internal VM constructor that accepts an explicit runtime observer.
+    ///
+    /// Keeping initialization in one place avoids constructor drift when `VM`
+    /// fields evolve.
+    fn new_internal(
+        heap: &'a mut Heap<T>,
+        namespaces: &'a mut Namespaces,
+        interns: &'a Interns,
+        print_writer: &'a mut PrintWriter<'p>,
+        observer: RuntimeObserverHandle,
+    ) -> Self {
         Self {
             stack: Vec::with_capacity(64),
             frames: Vec::with_capacity(16),
@@ -619,7 +639,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             scheduler: None,            // Lazy - no allocation for sync code
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
-            observer: RuntimeObserverHandle::disabled(),
+            observer,
         }
     }
 
@@ -643,6 +663,30 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         namespaces: &'a mut Namespaces,
         interns: &'a Interns,
         print_writer: &'a mut PrintWriter<'p>,
+    ) -> Self {
+        Self::restore_internal(
+            snapshot,
+            module_code,
+            heap,
+            namespaces,
+            interns,
+            print_writer,
+            RuntimeObserverHandle::disabled(),
+        )
+    }
+
+    /// Internal restore path that accepts an explicit runtime observer.
+    ///
+    /// This mirrors `new_internal` so observer-enabled restore stays in sync with
+    /// standard restore behavior.
+    fn restore_internal(
+        snapshot: VMSnapshot,
+        module_code: &'a Code,
+        heap: &'a mut Heap<T>,
+        namespaces: &'a mut Namespaces,
+        interns: &'a Interns,
+        print_writer: &'a mut PrintWriter<'p>,
+        observer: RuntimeObserverHandle,
     ) -> Self {
         // Reconstruct call frames from serialized form
         let frames: Vec<CallFrame<'_>> = snapshot
@@ -685,7 +729,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             scheduler: snapshot.scheduler,
             module_code: Some(module_code),
             ext_function_load_ip: None,
-            observer: RuntimeObserverHandle::disabled(),
+            observer,
         }
     }
     /// Consumes the VM and creates a snapshot for pause/resume if needed.

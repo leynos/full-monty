@@ -589,15 +589,7 @@ impl<T: ResourceTracker> Snapshot<T> {
         let ext_result = result.into();
 
         if let (Some(call_id), Some(_kind)) = (self.pending_call_id, self.pending_call_kind) {
-            self.observer
-                .emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
-                    call_id,
-                    kind: match ext_result {
-                        ExtFunctionResult::Return(_) => ExternalCallReturnKind::Return,
-                        ExtFunctionResult::Future(_) => ExternalCallReturnKind::Future,
-                        ExtFunctionResult::Error(_) | ExtFunctionResult::NotFound(_) => ExternalCallReturnKind::Error,
-                    },
-                }));
+            emit_external_call_returned(&self.observer, call_id, &ext_result);
         }
 
         let mut vm = VM::restore_with_observer(
@@ -670,6 +662,26 @@ pub enum ExtFunctionResult {
     Future(u32),
     /// The function was not found, should result in a `NameError` exception.
     NotFound(String),
+}
+
+/// Emits an `ExternalCallReturned` observer event for a host call result.
+///
+/// This centralizes the mapping from `ExtFunctionResult` to `ExternalCallReturnKind`
+/// so run and REPL suspend/resume paths stay behaviorally identical.
+#[inline]
+pub(crate) fn emit_external_call_returned(
+    observer: &RuntimeObserverHandle,
+    call_id: u32,
+    ext_result: &ExtFunctionResult,
+) {
+    observer.emit(RuntimeObserverEvent::ExternalCallReturned(ExternalCallReturnedEvent {
+        call_id,
+        kind: match ext_result {
+            ExtFunctionResult::Return(_) => ExternalCallReturnKind::Return,
+            ExtFunctionResult::Future(_) => ExternalCallReturnKind::Future,
+            ExtFunctionResult::Error(_) | ExtFunctionResult::NotFound(_) => ExternalCallReturnKind::Error,
+        },
+    }));
 }
 
 impl ExtFunctionResult {

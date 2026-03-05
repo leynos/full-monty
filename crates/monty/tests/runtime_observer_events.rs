@@ -236,6 +236,7 @@ fn runtime_observer_tracks_os_call_requests(recording: (RuntimeObserverHandle, A
         .expect("start should pause at OS call");
 
     let os_call = as_os_call(progress, "OS call request");
+    let call_id = os_call.call_id;
     let completion = os_call
         .resume(MontyObject::Bool(false), &mut PrintWriter::Stdout)
         .expect("OS call resume should complete");
@@ -246,9 +247,19 @@ fn runtime_observer_tracks_os_call_requests(recording: (RuntimeObserverHandle, A
         matches!(
             event,
             RecordedEvent::ExternalCallRequested {
+                call_id: observed_call_id,
                 kind: ExternalCallKind::Os,
                 ..
-            }
+            } if *observed_call_id == call_id
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            RecordedEvent::ExternalCallReturned {
+                call_id: observed_call_id,
+                kind: ExternalCallReturnKind::Return,
+            } if *observed_call_id == call_id
         )
     }));
 }

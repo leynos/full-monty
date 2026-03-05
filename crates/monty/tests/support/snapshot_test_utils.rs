@@ -5,6 +5,54 @@ use monty::{
     SnapshotExtension,
 };
 
+/// Test-focused API for attaching and reading optional snapshot-extension bytes
+/// on progress snapshots.
+pub trait ProgressSnapshotExt: Sized {
+    fn attach_snapshot_extension(self, ext: Vec<u8>) -> Self;
+    fn get_snapshot_extension(&self) -> Option<&[u8]>;
+}
+
+/// Generates `ProgressSnapshotExt` impls for progress enums that differ only in
+/// the shape of their complete variant.
+macro_rules! impl_progress_snapshot_ext {
+    ($Progress:ident, $complete_pat:pat => $complete_expr:expr, $complete_get_pat:pat) => {
+        impl ProgressSnapshotExt for $Progress<NoLimitTracker> {
+            fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
+                match self {
+                    Self::FunctionCall(call) => Self::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
+                    Self::OsCall(call) => Self::OsCall(call.with_snapshot_extension(snapshot_extension)),
+                    Self::ResolveFutures(state) => {
+                        Self::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
+                    }
+                    Self::NameLookup(lookup) => Self::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
+                    $complete_pat => $complete_expr,
+                }
+            }
+
+            fn get_snapshot_extension(&self) -> Option<&[u8]> {
+                match self {
+                    Self::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
+                    Self::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
+                    Self::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
+                    Self::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
+                    $complete_get_pat => None,
+                }
+            }
+        }
+    };
+}
+
+impl_progress_snapshot_ext!(
+    RunProgress,
+    Self::Complete(value) => Self::Complete(value),
+    Self::Complete(_)
+);
+impl_progress_snapshot_ext!(
+    ReplProgress,
+    Self::Complete { repl, value } => Self::Complete { repl, value },
+    Self::Complete { .. }
+);
+
 /// Progress variants relevant to snapshot-extension round-trip coverage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotProgressVariant {
@@ -98,130 +146,52 @@ pub fn create_repl_progress_for_variant(variant: SnapshotProgressVariant) -> Rep
     }
 }
 
-/// Attaches snapshot-extension bytes to a run progress value when it carries a snapshot.
-pub fn attach_run_snapshot_extension(
-    progress: RunProgress<NoLimitTracker>,
-    snapshot_extension: Vec<u8>,
-) -> RunProgress<NoLimitTracker> {
-    match progress {
-        RunProgress::FunctionCall(call) => RunProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::OsCall(call) => RunProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        RunProgress::ResolveFutures(state) => {
-            RunProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
-        }
-        RunProgress::NameLookup(lookup) => RunProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
-        RunProgress::Complete(value) => RunProgress::Complete(value),
-    }
-}
-
-/// Attaches snapshot-extension bytes to a REPL progress value when it carries a snapshot.
-pub fn attach_repl_snapshot_extension(
-    progress: ReplProgress<NoLimitTracker>,
-    snapshot_extension: Vec<u8>,
-) -> ReplProgress<NoLimitTracker> {
-    match progress {
-        ReplProgress::FunctionCall(call) => {
-            ReplProgress::FunctionCall(call.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::OsCall(call) => ReplProgress::OsCall(call.with_snapshot_extension(snapshot_extension)),
-        ReplProgress::ResolveFutures(state) => {
-            ReplProgress::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::NameLookup(lookup) => {
-            ReplProgress::NameLookup(lookup.with_snapshot_extension(snapshot_extension))
-        }
-        ReplProgress::Complete { repl, value } => ReplProgress::Complete { repl, value },
-    }
-}
-
-/// Reads snapshot-extension bytes from a run progress value when available.
-pub fn run_progress_snapshot_extension(progress: &RunProgress<NoLimitTracker>) -> Option<&[u8]> {
-    match progress {
-        RunProgress::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-        RunProgress::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-        RunProgress::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
-        RunProgress::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
-        RunProgress::Complete(_) => None,
-    }
-}
-
-/// Reads snapshot-extension bytes from a REPL progress value when available.
-pub fn repl_progress_snapshot_extension(progress: &ReplProgress<NoLimitTracker>) -> Option<&[u8]> {
-    match progress {
-        ReplProgress::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-        ReplProgress::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-        ReplProgress::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
-        ReplProgress::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
-        ReplProgress::Complete { .. } => None,
-    }
-}
-
-/// Drives a run progress value until it reaches `ResolveFutures`.
-pub fn drive_to_resolve_futures(mut progress: RunProgress<NoLimitTracker>) -> RunProgress<NoLimitTracker> {
-    loop {
-        match progress {
-            RunProgress::FunctionCall(call) => {
-                progress = call
-                    .resume_pending(&mut PrintWriter::Stdout)
-                    .expect("run_pending should succeed");
+/// Generates helpers that drive progress values forward until they suspend on
+/// `ResolveFutures`.
+macro_rules! impl_drive_to_resolve_futures {
+    ($fn_name:ident, $Progress:ident) => {
+        #[doc = "Drives a progress value forward until it reaches `ResolveFutures`."]
+        pub fn $fn_name(mut progress: $Progress<NoLimitTracker>) -> $Progress<NoLimitTracker> {
+            loop {
+                match progress {
+                    $Progress::FunctionCall(call) => {
+                        progress = call
+                            .resume_pending(&mut PrintWriter::Stdout)
+                            .expect("resume_pending should succeed");
+                    }
+                    $Progress::ResolveFutures(_) => return progress,
+                    $Progress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
+                    $Progress::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
+                    _ => panic!("unexpected Complete before ResolveFutures"),
+                }
             }
-            RunProgress::ResolveFutures(_) => return progress,
-            RunProgress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
-            RunProgress::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
-            RunProgress::Complete(_) => panic!("unexpected Complete before ResolveFutures"),
         }
-    }
+    };
 }
 
-/// Drives a REPL progress value until it reaches `ResolveFutures`.
-pub fn drive_repl_to_resolve_futures(mut progress: ReplProgress<NoLimitTracker>) -> ReplProgress<NoLimitTracker> {
-    loop {
-        match progress {
-            ReplProgress::FunctionCall(call) => {
-                progress = call
-                    .resume_pending(&mut PrintWriter::Stdout)
-                    .expect("run_pending should succeed");
-            }
-            ReplProgress::ResolveFutures(_) => return progress,
-            ReplProgress::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
-            ReplProgress::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
-            ReplProgress::Complete { .. } => panic!("unexpected Complete before ResolveFutures"),
+impl_drive_to_resolve_futures!(drive_to_resolve_futures, RunProgress);
+impl_drive_to_resolve_futures!(drive_repl_to_resolve_futures, ReplProgress);
+
+/// Generates helpers that resume `ResolveFutures` progress values with the same
+/// return value for every pending call.
+macro_rules! impl_complete_resolve_futures {
+    ($fn_name:ident, $Progress:ident) => {
+        #[doc = "Completes a `ResolveFutures` progress value with a repeated return value."]
+        pub fn $fn_name(progress: $Progress<NoLimitTracker>, return_value: &MontyObject) -> $Progress<NoLimitTracker> {
+            let $Progress::ResolveFutures(state) = progress else {
+                panic!("expected ResolveFutures progress");
+            };
+            let results = state
+                .pending_call_ids()
+                .iter()
+                .map(|call_id| (*call_id, ExtFunctionResult::Return(return_value.clone())))
+                .collect();
+            state
+                .resume(results, &mut PrintWriter::Stdout)
+                .expect("resume should succeed")
         }
-    }
+    };
 }
 
-/// Completes a `ResolveFutures` run progress with a repeated return value.
-pub fn complete_resolve_futures(
-    progress: RunProgress<NoLimitTracker>,
-    return_value: &MontyObject,
-) -> RunProgress<NoLimitTracker> {
-    let RunProgress::ResolveFutures(state) = progress else {
-        panic!("expected resolve futures progress");
-    };
-    let results = state
-        .pending_call_ids()
-        .iter()
-        .map(|call_id| (*call_id, ExtFunctionResult::Return(return_value.clone())))
-        .collect();
-    state
-        .resume(results, &mut PrintWriter::Stdout)
-        .expect("resume should succeed")
-}
-
-/// Completes a `ResolveFutures` REPL progress with a repeated return value.
-pub fn complete_repl_resolve_futures(
-    progress: ReplProgress<NoLimitTracker>,
-    return_value: &MontyObject,
-) -> ReplProgress<NoLimitTracker> {
-    let ReplProgress::ResolveFutures(state) = progress else {
-        panic!("expected resolve futures progress");
-    };
-    let results = state
-        .pending_call_ids()
-        .iter()
-        .map(|call_id| (*call_id, ExtFunctionResult::Return(return_value.clone())))
-        .collect();
-    state
-        .resume(results, &mut PrintWriter::Stdout)
-        .expect("resume should succeed")
-}
+impl_complete_resolve_futures!(complete_resolve_futures, RunProgress);
+impl_complete_resolve_futures!(complete_repl_resolve_futures, ReplProgress);

@@ -1,63 +1,9 @@
 //! Behavioural coverage for snapshot extension byte persistence.
 
-use monty::{MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress, SnapshotExtension};
+use monty::{MontyRun, NoLimitTracker, PrintWriter, ReplProgress, RunProgress};
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use snapshot_test_utils::create_repl;
-
-/// Test-focused API for attaching and reading optional snapshot-extension bytes
-/// on progress snapshots. `attach_snapshot_extension` returns `Self` for
-/// chaining, while `get_snapshot_extension` exposes the loaded bytes as an
-/// optional slice for assertions.
-trait ProgressSnapshotExt: Sized {
-    fn attach_snapshot_extension(self, ext: Vec<u8>) -> Self;
-    fn get_snapshot_extension(&self) -> Option<&[u8]>;
-}
-
-/// Generates `ProgressSnapshotExt` impls for `NoLimitTracker` progress types by
-/// forwarding snapshot-extension access through suspendable variants. The
-/// `$complete_pat` and `$complete_expr` parameters preserve whichever complete
-/// variant shape the enum uses so completed progress remains unchanged when
-/// `attach_snapshot_extension` is called, while `$complete_get_pat` makes the
-/// read path exhaustive when complete progress has no snapshot extension.
-macro_rules! impl_progress_snapshot_ext {
-    ($Progress:ident, $complete_pat:pat => $complete_expr:expr, $complete_get_pat:pat) => {
-        impl ProgressSnapshotExt for $Progress<NoLimitTracker> {
-            fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
-                match self {
-                    Self::FunctionCall(call) => Self::FunctionCall(call.with_snapshot_extension(snapshot_extension)),
-                    Self::OsCall(call) => Self::OsCall(call.with_snapshot_extension(snapshot_extension)),
-                    Self::ResolveFutures(state) => {
-                        Self::ResolveFutures(state.with_snapshot_extension(snapshot_extension))
-                    }
-                    Self::NameLookup(lookup) => Self::NameLookup(lookup.with_snapshot_extension(snapshot_extension)),
-                    $complete_pat => $complete_expr,
-                }
-            }
-
-            fn get_snapshot_extension(&self) -> Option<&[u8]> {
-                match self {
-                    Self::FunctionCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-                    Self::OsCall(call) => call.snapshot_extension().map(SnapshotExtension::as_slice),
-                    Self::ResolveFutures(state) => state.snapshot_extension().map(SnapshotExtension::as_slice),
-                    Self::NameLookup(lookup) => lookup.snapshot_extension().map(SnapshotExtension::as_slice),
-                    $complete_get_pat => None,
-                }
-            }
-        }
-    };
-}
-
-impl_progress_snapshot_ext!(
-    RunProgress,
-    Self::Complete(value) => Self::Complete(value),
-    Self::Complete(_)
-);
-impl_progress_snapshot_ext!(
-    ReplProgress,
-    Self::Complete { repl, value } => Self::Complete { repl, value },
-    Self::Complete { .. }
-);
+use snapshot_test_utils::{ProgressSnapshotExt, create_repl};
 
 #[expect(
     dead_code,

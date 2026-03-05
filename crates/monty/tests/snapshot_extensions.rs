@@ -101,20 +101,8 @@ fn snapshot_extension() -> Vec<u8> {
     vec![1, 2, 3, 4]
 }
 
-/// Maps a run progress variant to its expected snapshot-extension visibility.
-fn run_variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, SnapshotBehavior) {
-    (
-        variant,
-        if variant == SnapshotProgressVariant::Complete {
-            SnapshotBehavior::Absent
-        } else {
-            SnapshotBehavior::Preserved
-        },
-    )
-}
-
-/// Maps a REPL progress variant to its expected snapshot-extension visibility.
-fn repl_variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, SnapshotBehavior) {
+/// Maps a progress variant to its expected snapshot-extension visibility.
+fn variant_case(variant: SnapshotProgressVariant) -> (SnapshotProgressVariant, SnapshotBehavior) {
     (
         variant,
         if variant == SnapshotProgressVariant::Complete {
@@ -203,7 +191,7 @@ fn create_repl_progress_for_variant(variant: SnapshotProgressVariant) -> ReplPro
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
 fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
-    let (fixture_variant, expected_behavior) = run_variant_case(variant);
+    let (fixture_variant, expected_behavior) = variant_case(variant);
     assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
 
     let progress = create_run_progress_for_variant(variant);
@@ -273,7 +261,7 @@ fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotPro
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
 fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
-    let (fixture_variant, expected_behavior) = repl_variant_case(variant);
+    let (fixture_variant, expected_behavior) = variant_case(variant);
     assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
 
     let progress = create_repl_progress_for_variant(variant);

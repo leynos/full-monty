@@ -13,7 +13,7 @@ use ruff_python_parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErr
 use crate::{
     ExcType, MontyException,
     asyncio::CallId,
-    bytecode::{Code, Compiler, FrameExit, VM, VMSnapshot},
+    bytecode::{Code, Compiler, FrameExit, VM, VMSnapshot, VmComponents},
     exception_private::{RunError, RunResult},
     heap::{DropWithHeap, Heap},
     intern::{InternerBuilder, Interns},
@@ -369,10 +369,12 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         let (vm_result, vm_state) = {
             let mut vm = VM::new_with_observer(
-                &mut this.heap,
-                &mut this.namespaces,
-                &executor.interns,
-                print,
+                VmComponents {
+                    heap: &mut this.heap,
+                    namespaces: &mut this.namespaces,
+                    interns: &executor.interns,
+                    print_writer: print,
+                },
                 observer.clone(),
             );
             let vm_result = vm.run_module(&executor.module_code);
@@ -789,10 +791,12 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
         let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
-            &mut repl.heap,
-            &mut repl.namespaces,
-            &executor.interns,
-            print,
+            VmComponents {
+                heap: &mut repl.heap,
+                namespaces: &mut repl.namespaces,
+                interns: &executor.interns,
+                print_writer: print,
+            },
             observer.clone(),
         );
 
@@ -869,10 +873,12 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
         let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
-            &mut repl.heap,
-            &mut repl.namespaces,
-            &executor.interns,
-            print,
+            VmComponents {
+                heap: &mut repl.heap,
+                namespaces: &mut repl.namespaces,
+                interns: &executor.interns,
+                print_writer: print,
+            },
             observer.clone(),
         );
 
@@ -993,10 +999,12 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
         let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
-            &mut repl.heap,
-            &mut repl.namespaces,
-            &executor.interns,
-            print,
+            VmComponents {
+                heap: &mut repl.heap,
+                namespaces: &mut repl.namespaces,
+                interns: &executor.interns,
+                print_writer: print,
+            },
             observer.clone(),
         );
 

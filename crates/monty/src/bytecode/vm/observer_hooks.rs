@@ -19,15 +19,25 @@ use crate::{
     value::Value,
 };
 
+/// Bundles the borrowed execution-environment references required to
+/// construct or restore a [`VM`]. Keeping them together reduces argument
+/// lists and makes the relationship between the resources explicit.
+pub(crate) struct VmComponents<'a, 'p, T: ResourceTracker> {
+    pub heap: &'a mut Heap<T>,
+    pub namespaces: &'a mut Namespaces,
+    pub interns: &'a Interns,
+    pub print_writer: &'a mut PrintWriter<'p>,
+}
+
 impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Creates a new VM with an optional runtime observer.
-    pub fn new_with_observer(
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
-        observer: RuntimeObserverHandle,
-    ) -> Self {
+    pub fn new_with_observer(components: VmComponents<'a, 'p, T>, observer: RuntimeObserverHandle) -> Self {
+        let VmComponents {
+            heap,
+            namespaces,
+            interns,
+            print_writer,
+        } = components;
         Self::new_internal(heap, namespaces, interns, print_writer, observer)
     }
 
@@ -35,12 +45,15 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     pub fn restore_with_observer(
         snapshot: VMSnapshot,
         module_code: &'a Code,
-        heap: &'a mut Heap<T>,
-        namespaces: &'a mut Namespaces,
-        interns: &'a Interns,
-        print_writer: &'a mut PrintWriter<'p>,
+        components: VmComponents<'a, 'p, T>,
         observer: RuntimeObserverHandle,
     ) -> Self {
+        let VmComponents {
+            heap,
+            namespaces,
+            interns,
+            print_writer,
+        } = components;
         if observer.is_enabled() {
             Self::restore_internal(snapshot, module_code, heap, namespaces, interns, print_writer, observer)
         } else {

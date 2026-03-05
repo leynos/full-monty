@@ -11,7 +11,7 @@ mod collections;
 mod compare;
 mod exceptions;
 mod format;
-mod observer_hooks;
+pub mod observer_hooks;
 mod scheduler;
 
 use std::cmp::Ordering;

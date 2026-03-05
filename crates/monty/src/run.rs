@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     ExcType, MontyException,
-    bytecode::{Code, Compiler, FrameExit, VM},
+    bytecode::{Code, Compiler, FrameExit, VM, VmComponents},
     exception_private::RunResult,
     heap::{DropWithHeap, Heap},
     intern::Interns,
@@ -162,7 +162,15 @@ impl MontyRun {
         let mut namespaces = executor.prepare_namespaces(inputs, &mut heap)?;
 
         // Create and run VM
-        let mut vm = VM::new_with_observer(&mut heap, &mut namespaces, &executor.interns, print, observer.clone());
+        let mut vm = VM::new_with_observer(
+            VmComponents {
+                heap: &mut heap,
+                namespaces: &mut namespaces,
+                interns: &executor.interns,
+                print_writer: print,
+            },
+            observer.clone(),
+        );
 
         // Start execution
         let vm_result = vm.run_module(&executor.module_code);

@@ -11,7 +11,7 @@ use std::mem;
 use crate::{
     ExcType, MontyException,
     asyncio::CallId,
-    bytecode::{FrameExit, VM, VMSnapshot},
+    bytecode::{FrameExit, VM, VMSnapshot, VmComponents},
     exception_private::{RunError, RunResult},
     heap::Heap,
     io::PrintWriter,
@@ -353,10 +353,12 @@ impl<T: ResourceTracker> NameLookup<T> {
         let mut vm = VM::restore_with_observer(
             self.snapshot.vm_state,
             &self.snapshot.executor.module_code,
-            &mut self.snapshot.heap,
-            &mut self.snapshot.namespaces,
-            &self.snapshot.executor.interns,
-            print,
+            VmComponents {
+                heap: &mut self.snapshot.heap,
+                namespaces: &mut self.snapshot.namespaces,
+                interns: &self.snapshot.executor.interns,
+                print_writer: print,
+            },
             self.snapshot.observer.clone(),
         );
 
@@ -475,10 +477,12 @@ impl<T: ResourceTracker> ResolveFutures<T> {
         let mut vm = VM::restore_with_observer(
             vm_state,
             &executor.module_code,
-            &mut heap,
-            &mut namespaces,
-            &executor.interns,
-            print,
+            VmComponents {
+                heap: &mut heap,
+                namespaces: &mut namespaces,
+                interns: &executor.interns,
+                print_writer: print,
+            },
             observer.clone(),
         );
 
@@ -595,10 +599,12 @@ impl<T: ResourceTracker> Snapshot<T> {
         let mut vm = VM::restore_with_observer(
             self.vm_state,
             &self.executor.module_code,
-            &mut self.heap,
-            &mut self.namespaces,
-            &self.executor.interns,
-            print,
+            VmComponents {
+                heap: &mut self.heap,
+                namespaces: &mut self.namespaces,
+                interns: &self.executor.interns,
+                print_writer: print,
+            },
             self.observer.clone(),
         );
 

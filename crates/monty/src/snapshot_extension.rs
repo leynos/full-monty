@@ -45,3 +45,9 @@ impl From<Vec<u8>> for SnapshotExtension {
         Self::new(value)
     }
 }
+
+/// Clones an optional snapshot extension reference into owned storage.
+#[must_use]
+pub(crate) fn clone_snapshot_extension(extension: Option<&SnapshotExtension>) -> Option<SnapshotExtension> {
+    extension.cloned()
+}

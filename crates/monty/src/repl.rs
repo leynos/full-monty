@@ -29,7 +29,7 @@ use crate::{
     resource::ResourceTracker,
     run_progress::{ExtFunctionResult, NameLookupResult, emit_external_call_returned},
     runtime_id::RuntimeValueId,
-    snapshot_extension::SnapshotExtension,
+    snapshot_extension::{SnapshotExtension, clone_snapshot_extension},
     value::Value,
 };
 
@@ -907,6 +907,26 @@ pub struct ReplResolveFutures<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplResolveFutures<T> {
+    /// Creates a new `ReplResolveFutures` from resumed VM state while preserving
+    /// any embedder-owned snapshot extension bytes from the prior suspension.
+    fn from_vm_snapshot(
+        repl: MontyRepl<T>,
+        executor: ReplExecutor,
+        vm_state: VMSnapshot,
+        pending_call_ids: Vec<u32>,
+        observer: RuntimeObserverHandle,
+        extension_bytes: Option<&SnapshotExtension>,
+    ) -> Self {
+        Self {
+            repl,
+            executor,
+            vm_state,
+            pending_call_ids,
+            extension_bytes: clone_snapshot_extension(extension_bytes),
+            observer,
+        }
+    }
+
     /// Attaches embedder-owned snapshot extension bytes to this suspended state.
     #[must_use]
     pub fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
@@ -1060,6 +1080,27 @@ pub(crate) struct ReplSnapshot<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplSnapshot<T> {
+    /// Creates a resumable REPL snapshot from VM-owned execution state.
+    fn from_vm_snapshot(
+        repl: MontyRepl<T>,
+        executor: ReplExecutor,
+        vm_state: VMSnapshot,
+        observer: RuntimeObserverHandle,
+        pending_call_id: Option<u32>,
+        pending_call_kind: Option<ExternalCallKind>,
+        extension_bytes: Option<&SnapshotExtension>,
+    ) -> Self {
+        Self {
+            repl,
+            executor,
+            vm_state,
+            extension_bytes: clone_snapshot_extension(extension_bytes),
+            observer,
+            pending_call_id,
+            pending_call_kind,
+        }
+    }
+
     /// Attaches embedder-owned snapshot extension bytes to this suspended state.
     #[must_use]
     fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
@@ -1146,15 +1187,15 @@ fn handle_repl_vm_result<T: ResourceTracker>(
 ) -> Result<ReplProgress<T>, Box<ReplStartError<T>>> {
     macro_rules! new_repl_snapshot {
         ($pending_call_id:expr, $pending_call_kind:expr) => {
-            ReplSnapshot {
+            ReplSnapshot::from_vm_snapshot(
                 repl,
                 executor,
-                vm_state: vm_state.expect("snapshot should exist"),
-                extension_bytes: extension_bytes.cloned(),
-                observer: observer.clone(),
-                pending_call_id: $pending_call_id,
-                pending_call_kind: $pending_call_kind,
-            }
+                vm_state.expect("snapshot should exist"),
+                observer.clone(),
+                $pending_call_id,
+                $pending_call_kind,
+                extension_bytes,
+            )
         };
     }
 
@@ -1248,14 +1289,14 @@ fn handle_repl_vm_result<T: ResourceTracker>(
         }
         Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
             let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();
-            Ok(ReplProgress::ResolveFutures(ReplResolveFutures {
+            Ok(ReplProgress::ResolveFutures(ReplResolveFutures::from_vm_snapshot(
                 repl,
                 executor,
-                vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
+                vm_state.expect("snapshot should exist for ResolveFutures"),
                 pending_call_ids,
-                extension_bytes: extension_bytes.cloned(),
                 observer,
-            }))
+                extension_bytes,
+            )))
         }
         Ok(FrameExit::NameLookup {
             name_id,

@@ -24,8 +24,15 @@ pub fn as_os_call<T: ResourceTracker>(progress: RunProgress<T>, context: &str) -
     }
 }
 
-/// Asserts that two function-call snapshots are equivalent across all
-/// externally-visible fields used by observer integration tests.
+/// Test helper for runtime-observer integration tests that performs deep
+/// equality assertions across significant `monty::FunctionCall<T>` fields.
+///
+/// This compares `function_name`, `args`, `kwargs`, `call_id`, `method_call`,
+/// `arg_runtime_ids`, and `kwarg_runtime_ids` for two call snapshots.
+/// The generic `T: ResourceTracker` matches the tracker used by each call.
+///
+/// The helper panics on any mismatch via `assert_eq!` and intentionally does
+/// not return a `Result`.
 pub fn assert_function_calls_equal<T: ResourceTracker>(left: &monty::FunctionCall<T>, right: &monty::FunctionCall<T>) {
     assert_eq!(left.function_name, right.function_name);
     assert_eq!(left.args, right.args);

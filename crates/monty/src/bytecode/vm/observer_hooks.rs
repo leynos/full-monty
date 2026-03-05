@@ -54,11 +54,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             interns,
             print_writer,
         } = components;
-        if observer.is_enabled() {
-            Self::restore_internal(snapshot, module_code, heap, namespaces, interns, print_writer, observer)
-        } else {
-            Self::restore(snapshot, module_code, heap, namespaces, interns, print_writer)
-        }
+        Self::restore_internal(snapshot, module_code, heap, namespaces, interns, print_writer, observer)
     }
 
     /// Pushes a value while emitting a `ValueCreated` event when observation is enabled.

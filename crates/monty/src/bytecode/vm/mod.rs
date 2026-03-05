@@ -656,6 +656,10 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// * `namespaces` - The deserialized namespaces
     /// * `interns` - Interns for looking up function code
     /// * `print_writer` - Writer for print output
+    #[expect(
+        dead_code,
+        reason = "Observer-enabled restore paths use restore_internal directly, but this API is kept for parity."
+    )]
     pub fn restore(
         snapshot: VMSnapshot,
         module_code: &'a Code,

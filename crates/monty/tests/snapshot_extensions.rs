@@ -79,9 +79,13 @@ impl ProgressSnapshotExt for ReplProgress<NoLimitTracker> {
     }
 }
 
+/// Triggers an external function call suspension.
 const EXTERNAL_CALL_SCRIPT: &str = "ext_fn([])";
+/// Triggers an OS-level call suspension (pathlib.exists).
 const OS_CALL_SCRIPT: &str = "from pathlib import Path; Path('/tmp/test.txt').exists()";
+/// Simple complete script that finishes without suspension.
 const COMPLETE_SCRIPT: &str = "1 + 2";
+/// Script that resolves an awaited async future (resolves futures).
 const RESOLVE_FUTURES_SCRIPT: &str = r"
 import asyncio
 
@@ -316,11 +320,10 @@ fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgres
     }
 }
 
-#[rstest]
-#[case::function_call(SnapshotProgressVariant::FunctionCall)]
-fn corrupted_run_progress_payload_fails_to_load(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
-    let progress = create_run_progress_for_variant(variant);
-    let progress = progress.attach_snapshot_extension(snapshot_extension);
+#[test]
+fn corrupted_run_progress_payload_fails_to_load() {
+    let progress = create_run_progress_for_variant(SnapshotProgressVariant::FunctionCall);
+    let progress = progress.attach_snapshot_extension(vec![9, 8, 7]);
     let mut bytes = progress.dump().expect("run progress dump should succeed");
 
     bytes.pop();

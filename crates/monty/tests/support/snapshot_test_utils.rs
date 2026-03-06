@@ -52,7 +52,7 @@ macro_rules! impl_progress_ext {
                                 .resume_pending(&mut PrintWriter::Stdout)
                                 .expect("run_pending should succeed");
                         }
-                        Self::ResolveFutures(_) => return self,
+                        resolved @ Self::ResolveFutures(_) => return resolved,
                         Self::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
                         Self::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
                         $complete_panic_pat => panic!("unexpected Complete before ResolveFutures"),

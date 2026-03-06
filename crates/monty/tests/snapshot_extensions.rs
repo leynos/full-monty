@@ -108,6 +108,7 @@ fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgress
 #[case::complete(SnapshotProgressVariant::Complete)]
 fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotProgressVariant) {
     let progress = create_run_progress_for_variant(variant);
+    assert_snapshot_behavior(progress.get_snapshot_extension(), &[], SnapshotBehavior::Absent);
     let bytes = progress.dump().expect("run progress dump should succeed");
     let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
 
@@ -205,6 +206,7 @@ fn corrupted_repl_progress_payload_fails_to_load() {
 #[case::complete(SnapshotProgressVariant::Complete)]
 fn repl_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotProgressVariant) {
     let progress = create_repl_progress_for_variant(variant);
+    assert_snapshot_behavior(progress.get_snapshot_extension(), &[], SnapshotBehavior::Absent);
     let bytes = progress.dump().expect("repl progress dump should succeed");
     let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).expect("repl progress load should succeed");
 

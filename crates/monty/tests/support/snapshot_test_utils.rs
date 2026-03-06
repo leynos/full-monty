@@ -128,7 +128,28 @@ async def main():
 await main()
 ";
 
-/// Creates a suspendable `RunProgress` from Python source.
+/// Describes how a test variant should be driven from source text.
+enum ScriptAction {
+    /// Start the script and use the initial progress directly.
+    Plain(&'static str),
+    /// Start the script and drive the initial progress to `ResolveFutures`.
+    ResolveThen(&'static str),
+    /// Start the script and expect it to complete without suspension.
+    RunComplete(&'static str),
+}
+
+/// Maps a progress variant to the script and follow-up action needed to build it.
+fn script_for_variant(variant: SnapshotProgressVariant) -> ScriptAction {
+    match variant {
+        SnapshotProgressVariant::FunctionCall => ScriptAction::Plain(EXTERNAL_CALL_SCRIPT),
+        SnapshotProgressVariant::OsCall => ScriptAction::Plain(OS_CALL_SCRIPT),
+        SnapshotProgressVariant::ResolveFutures => ScriptAction::ResolveThen(RESOLVE_FUTURES_SCRIPT),
+        SnapshotProgressVariant::Complete => ScriptAction::RunComplete(COMPLETE_SCRIPT),
+    }
+}
+
+/// Creates a `RunProgress` from Python source, which may suspend or complete
+/// immediately for non-suspending scripts.
 pub fn create_run_progress(script: &str) -> RunProgress<NoLimitTracker> {
     let runner = MontyRun::new(script.to_owned(), "test.py", vec![]).expect("runner creation should succeed");
     runner
@@ -152,15 +173,11 @@ pub fn create_repl() -> MontyRepl<NoLimitTracker> {
 
 /// Creates a `RunProgress` for the requested variant.
 pub fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunProgress<NoLimitTracker> {
-    match variant {
-        SnapshotProgressVariant::FunctionCall => create_run_progress(EXTERNAL_CALL_SCRIPT),
-        SnapshotProgressVariant::OsCall => create_run_progress(OS_CALL_SCRIPT),
-        SnapshotProgressVariant::ResolveFutures => {
-            create_run_progress(RESOLVE_FUTURES_SCRIPT).drive_to_resolve_futures()
-        }
-        SnapshotProgressVariant::Complete => {
-            let runner =
-                MontyRun::new(COMPLETE_SCRIPT.to_owned(), "test.py", vec![]).expect("runner creation should succeed");
+    match script_for_variant(variant) {
+        ScriptAction::Plain(script) => create_run_progress(script),
+        ScriptAction::ResolveThen(script) => create_run_progress(script).drive_to_resolve_futures(),
+        ScriptAction::RunComplete(script) => {
+            let runner = MontyRun::new(script.to_owned(), "test.py", vec![]).expect("runner creation should succeed");
             runner
                 .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
                 .expect("run should complete")
@@ -171,18 +188,13 @@ pub fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunP
 /// Creates a `ReplProgress` for the requested variant.
 pub fn create_repl_progress_for_variant(variant: SnapshotProgressVariant) -> ReplProgress<NoLimitTracker> {
     let repl = create_repl();
-    let snippet = match variant {
-        SnapshotProgressVariant::FunctionCall => EXTERNAL_CALL_SCRIPT,
-        SnapshotProgressVariant::OsCall => OS_CALL_SCRIPT,
-        SnapshotProgressVariant::ResolveFutures => RESOLVE_FUTURES_SCRIPT,
-        SnapshotProgressVariant::Complete => COMPLETE_SCRIPT,
-    };
-    let progress = repl
-        .start(snippet, &mut PrintWriter::Stdout)
-        .expect("repl should produce progress");
-    if variant == SnapshotProgressVariant::ResolveFutures {
-        progress.drive_to_resolve_futures()
-    } else {
-        progress
+    match script_for_variant(variant) {
+        ScriptAction::Plain(script) | ScriptAction::RunComplete(script) => repl
+            .start(script, &mut PrintWriter::Stdout)
+            .expect("repl should produce progress"),
+        ScriptAction::ResolveThen(script) => repl
+            .start(script, &mut PrintWriter::Stdout)
+            .expect("repl should produce progress")
+            .drive_to_resolve_futures(),
     }
 }

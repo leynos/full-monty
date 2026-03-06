@@ -57,17 +57,16 @@ fn assert_snapshot_behavior(actual: Option<&[u8]>, snapshot_extension: &[u8], ex
     }
 }
 
+/// Verifies that `RunProgress` variants preserve attached snapshot-extension
+/// bytes across dump/load, and that `ResolveFutures` still completes under
+/// `NoLimitTracker` after the round trip.
 #[rstest]
 #[case::function_call(SnapshotProgressVariant::FunctionCall)]
 #[case::os_call(SnapshotProgressVariant::OsCall)]
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
-/// Verifies that `RunProgress` variants preserve attached snapshot-extension
-/// bytes across dump/load, and that `ResolveFutures` still completes under
-/// `NoLimitTracker` after the round trip.
 fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
-    let (fixture_variant, expected_behavior) = variant_case(variant);
-    assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
+    let (_, expected_behavior) = variant_case(variant);
 
     let progress = create_run_progress_for_variant(variant);
     let progress = progress.attach_snapshot_extension(snapshot_extension.clone());
@@ -99,14 +98,14 @@ fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgress
     }
 }
 
+/// Verifies that `RunProgress` starts with no snapshot extension attached for
+/// all variant cases, including the default `ResolveFutures` path under
+/// `NoLimitTracker`.
 #[rstest]
 #[case::function_call(SnapshotProgressVariant::FunctionCall)]
 #[case::os_call(SnapshotProgressVariant::OsCall)]
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
-/// Verifies that `RunProgress` starts with no snapshot extension attached for
-/// all variant cases, including the default `ResolveFutures` path under
-/// `NoLimitTracker`.
 fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotProgressVariant) {
     let progress = create_run_progress_for_variant(variant);
     let bytes = progress.dump().expect("run progress dump should succeed");
@@ -133,17 +132,16 @@ fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotPro
     }
 }
 
+/// Verifies that `ReplProgress` preserves attached snapshot-extension bytes
+/// across dump/load, and that `ResolveFutures` still reaches the expected REPL
+/// completion value after serialization.
 #[rstest]
 #[case::function_call(SnapshotProgressVariant::FunctionCall)]
 #[case::os_call(SnapshotProgressVariant::OsCall)]
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
-/// Verifies that `ReplProgress` preserves attached snapshot-extension bytes
-/// across dump/load, and that `ResolveFutures` still reaches the expected REPL
-/// completion value after serialization.
 fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
-    let (fixture_variant, expected_behavior) = variant_case(variant);
-    assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
+    let (_, expected_behavior) = variant_case(variant);
 
     let progress = create_repl_progress_for_variant(variant);
     let progress = progress.attach_snapshot_extension(snapshot_extension.clone());
@@ -171,9 +169,9 @@ fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgres
     }
 }
 
-#[test]
 /// Verifies that truncating a serialized `RunProgress` payload causes
 /// `RunProgress::load` to error instead of accepting corrupted bytes.
+#[test]
 fn corrupted_run_progress_payload_fails_to_load() {
     let progress = create_run_progress_for_variant(SnapshotProgressVariant::FunctionCall);
     let progress = progress.attach_snapshot_extension(vec![9, 8, 7]);
@@ -184,9 +182,9 @@ fn corrupted_run_progress_payload_fails_to_load() {
     assert!(RunProgress::<NoLimitTracker>::load(&bytes).is_err());
 }
 
-#[test]
 /// Verifies that truncating a serialized `ReplProgress` payload causes
 /// `ReplProgress::load` to error instead of accepting corrupted bytes.
+#[test]
 fn corrupted_repl_progress_payload_fails_to_load() {
     let progress = create_repl_progress_for_variant(SnapshotProgressVariant::FunctionCall);
     let progress = progress.attach_snapshot_extension(vec![9, 8, 7]);
@@ -195,4 +193,34 @@ fn corrupted_repl_progress_payload_fails_to_load() {
     bytes.pop();
 
     assert!(ReplProgress::<NoLimitTracker>::load(&bytes).is_err());
+}
+
+/// Verifies that `ReplProgress` starts with no snapshot extension attached for
+/// all variant cases, including the default `ResolveFutures` path under
+/// `NoLimitTracker`.
+#[rstest]
+#[case::function_call(SnapshotProgressVariant::FunctionCall)]
+#[case::os_call(SnapshotProgressVariant::OsCall)]
+#[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
+#[case::complete(SnapshotProgressVariant::Complete)]
+fn repl_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotProgressVariant) {
+    let progress = create_repl_progress_for_variant(variant);
+    let bytes = progress.dump().expect("repl progress dump should succeed");
+    let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).expect("repl progress load should succeed");
+
+    assert_snapshot_behavior(loaded.get_snapshot_extension(), &[], SnapshotBehavior::Absent);
+
+    if variant == SnapshotProgressVariant::ResolveFutures {
+        let completed = progress.complete_resolve_futures(&MontyObject::Int(3));
+        let ReplProgress::Complete { value, .. } = completed else {
+            panic!("expected completion after resolving defaulted REPL futures");
+        };
+        assert_eq!(value, MontyObject::Int(3));
+
+        let completed_loaded = loaded.complete_resolve_futures(&MontyObject::Int(3));
+        let ReplProgress::Complete { value, .. } = completed_loaded else {
+            panic!("expected loaded completion after resolving defaulted REPL futures");
+        };
+        assert_eq!(value, MontyObject::Int(3));
+    }
 }

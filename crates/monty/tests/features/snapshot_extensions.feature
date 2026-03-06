@@ -12,6 +12,12 @@ Feature: Snapshot extension bytes
     When run progress payload is corrupted
     Then loading the run progress fails
 
+  Scenario: Corrupted REPL progress payload fails to load
+    Given a REPL snippet with one external call
+    And snapshot extension bytes
+    When REPL progress payload is corrupted
+    Then loading the REPL progress fails
+
   Scenario: REPL progress preserves snapshot extension bytes across dump/load
     Given a REPL snippet with one external call
     And snapshot extension bytes

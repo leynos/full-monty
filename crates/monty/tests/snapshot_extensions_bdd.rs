@@ -28,6 +28,52 @@ struct SnapshotExtensionsWorld {
     load_failed: bool,
 }
 
+/// Round-trip operations shared by run and REPL progress values in BDD steps.
+trait BddRoundTripProgress: ProgressSnapshotExt + Sized {
+    /// Serializes the current progress value for round-trip checks.
+    fn dump_progress(&self) -> Vec<u8>;
+    /// Deserializes a progress value from serialized bytes.
+    fn load_progress(bytes: &[u8]) -> Self;
+    /// Reports whether loading the serialized bytes fails.
+    fn load_fails(bytes: &[u8]) -> bool;
+}
+
+/// Implements BDD round-trip helpers for a concrete progress type.
+macro_rules! impl_bdd_round_trip_progress {
+    ($Progress:ident) => {
+        impl BddRoundTripProgress for $Progress<NoLimitTracker> {
+            fn dump_progress(&self) -> Vec<u8> {
+                self.dump().expect("progress dump should succeed")
+            }
+
+            fn load_progress(bytes: &[u8]) -> Self {
+                Self::load(bytes).expect("progress load should succeed")
+            }
+
+            fn load_fails(bytes: &[u8]) -> bool {
+                Self::load(bytes).is_err()
+            }
+        }
+    };
+}
+
+impl_bdd_round_trip_progress!(RunProgress);
+impl_bdd_round_trip_progress!(ReplProgress);
+
+/// Dumps and reloads progress to recover any attached snapshot-extension bytes.
+fn round_trip_loaded_snapshot_extension<P: BddRoundTripProgress>(progress: &P) -> Option<Vec<u8>> {
+    let bytes = progress.dump_progress();
+    let loaded = P::load_progress(&bytes);
+    loaded.get_snapshot_extension().map(<[u8]>::to_vec)
+}
+
+/// Corrupts a serialized progress payload and reports whether reload fails.
+fn corrupted_progress_fails_to_load<P: BddRoundTripProgress>(progress: &P) -> bool {
+    let mut bytes = progress.dump_progress();
+    bytes.pop();
+    P::load_fails(&bytes)
+}
+
 /// Creates the per-scenario world that records script inputs and load results.
 #[fixture]
 fn world() -> SnapshotExtensionsWorld {
@@ -61,10 +107,7 @@ fn when_run_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
         .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
         .expect("run should suspend")
         .attach_snapshot_extension(world.snapshot_extension.clone());
-
-    let bytes = progress.dump().expect("run progress dump should succeed");
-    let loaded: RunProgress<NoLimitTracker> = RunProgress::load(&bytes).expect("run progress load should succeed");
-    world.loaded_snapshot_extension = loaded.get_snapshot_extension().map(<[u8]>::to_vec);
+    world.loaded_snapshot_extension = round_trip_loaded_snapshot_extension(&progress);
 }
 
 /// Dumps run progress with attached extension bytes, corrupts the payload, and
@@ -76,13 +119,7 @@ fn when_run_progress_payload_corrupted(world: &mut SnapshotExtensionsWorld) {
         .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
         .expect("run should suspend")
         .attach_snapshot_extension(world.snapshot_extension.clone());
-
-    let mut bytes = progress
-        .dump()
-        .expect("run progress dump with snapshot extension should succeed");
-    bytes.pop();
-
-    world.load_failed = RunProgress::<NoLimitTracker>::load(&bytes).is_err();
+    world.load_failed = corrupted_progress_fails_to_load(&progress);
 }
 
 /// Starts REPL progress, attaches the test extension bytes, and records the
@@ -94,11 +131,19 @@ fn when_repl_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
         .start(&world.repl_snippet, &mut PrintWriter::Stdout)
         .expect("repl should suspend")
         .attach_snapshot_extension(world.snapshot_extension.clone());
+    world.loaded_snapshot_extension = round_trip_loaded_snapshot_extension(&progress);
+}
 
-    let bytes = progress.dump().expect("repl progress dump should succeed");
-    let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).expect("repl progress load should succeed");
-
-    world.loaded_snapshot_extension = loaded.get_snapshot_extension().map(<[u8]>::to_vec);
+/// Dumps REPL progress with attached extension bytes, corrupts the payload, and
+/// records that deserialization fails.
+#[when("REPL progress payload is corrupted")]
+fn when_repl_progress_payload_corrupted(world: &mut SnapshotExtensionsWorld) {
+    let repl = create_repl();
+    let progress = repl
+        .start(&world.repl_snippet, &mut PrintWriter::Stdout)
+        .expect("repl should suspend")
+        .attach_snapshot_extension(world.snapshot_extension.clone());
+    world.load_failed = corrupted_progress_fails_to_load(&progress);
 }
 
 /// Verifies that the loaded snapshot-extension bytes match the original input.
@@ -114,6 +159,12 @@ fn then_loaded_snapshot_extension_matches(world: &SnapshotExtensionsWorld) {
 /// Verifies that loading the corrupted run-progress payload failed as expected.
 #[then("loading the run progress fails")]
 fn then_loading_run_progress_fails(world: &SnapshotExtensionsWorld) {
+    assert!(world.load_failed, "expected corrupted payload to fail load");
+}
+
+/// Verifies that loading the corrupted REPL-progress payload failed as expected.
+#[then("loading the REPL progress fails")]
+fn then_loading_repl_progress_fails(world: &SnapshotExtensionsWorld) {
     assert!(world.load_failed, "expected corrupted payload to fail load");
 }
 
@@ -134,6 +185,16 @@ fn run_snapshot_extension_round_trip(world: SnapshotExtensionsWorld) {
     name = "Corrupted run progress payload fails to load"
 )]
 fn corrupted_run_progress_payload(world: SnapshotExtensionsWorld) {
+    drop(world);
+}
+
+/// Runs the BDD scenario that expects corrupted REPL-progress payloads to fail
+/// deserialization.
+#[scenario(
+    path = "tests/features/snapshot_extensions.feature",
+    name = "Corrupted REPL progress payload fails to load"
+)]
+fn corrupted_repl_progress_payload(world: SnapshotExtensionsWorld) {
     drop(world);
 }
 

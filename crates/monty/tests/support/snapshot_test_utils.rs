@@ -20,7 +20,7 @@ pub trait ProgressSnapshotExt: Sized {
 /// Generates `ProgressSnapshotExt` impls for progress enums that differ only in
 /// the shape of their complete variant.
 macro_rules! impl_progress_ext {
-    ($Progress:ident, $complete_pat:pat => $complete_expr:expr, $complete_get_pat:pat) => {
+    ($Progress:ident, $complete_pat:pat => $complete_expr:expr, $complete_get_pat:pat, $complete_panic_pat:pat) => {
         impl ProgressSnapshotExt for $Progress<NoLimitTracker> {
             fn attach_snapshot_extension(self, snapshot_extension: Vec<u8>) -> Self {
                 match self {
@@ -55,7 +55,7 @@ macro_rules! impl_progress_ext {
                         Self::ResolveFutures(_) => return self,
                         Self::OsCall(call) => panic!("unexpected OsCall: {:?}", call.function),
                         Self::NameLookup(lookup) => panic!("unexpected NameLookup: {}", lookup.name),
-                        _ => panic!("unexpected Complete before ResolveFutures"),
+                        $complete_panic_pat => panic!("unexpected Complete before ResolveFutures"),
                     }
                 }
             }
@@ -80,11 +80,13 @@ macro_rules! impl_progress_ext {
 impl_progress_ext!(
     RunProgress,
     Self::Complete(value) => Self::Complete(value),
+    Self::Complete(_),
     Self::Complete(_)
 );
 impl_progress_ext!(
     ReplProgress,
     Self::Complete { repl, value } => Self::Complete { repl, value },
+    Self::Complete { .. },
     Self::Complete { .. }
 );
 
@@ -110,9 +112,13 @@ pub enum SnapshotBehavior {
     Absent,
 }
 
+/// Triggers an external function call suspension.
 const EXTERNAL_CALL_SCRIPT: &str = "ext_fn([])";
+/// Triggers an OS-level call suspension via filesystem access.
 const OS_CALL_SCRIPT: &str = "from pathlib import Path; Path('/tmp/test.txt').exists()";
+/// Completes synchronously without suspension.
 const COMPLETE_SCRIPT: &str = "1 + 2";
+/// Suspends on `ResolveFutures` after an initial function call.
 const RESOLVE_FUTURES_SCRIPT: &str = r"
 import asyncio
 

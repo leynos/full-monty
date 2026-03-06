@@ -178,9 +178,14 @@ pub fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunP
         ScriptAction::ResolveThen(script) => create_run_progress(script).drive_to_resolve_futures(),
         ScriptAction::RunComplete(script) => {
             let runner = MontyRun::new(script.to_owned(), "test.py", vec![]).expect("runner creation should succeed");
-            runner
+            let progress = runner
                 .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-                .expect("run should complete")
+                .expect("run should complete");
+            assert!(
+                matches!(&progress, RunProgress::Complete(_)),
+                "expected RunComplete script to produce RunProgress::Complete"
+            );
+            progress
         }
     }
 }
@@ -189,9 +194,19 @@ pub fn create_run_progress_for_variant(variant: SnapshotProgressVariant) -> RunP
 pub fn create_repl_progress_for_variant(variant: SnapshotProgressVariant) -> ReplProgress<NoLimitTracker> {
     let repl = create_repl();
     match script_for_variant(variant) {
-        ScriptAction::Plain(script) | ScriptAction::RunComplete(script) => repl
+        ScriptAction::Plain(script) => repl
             .start(script, &mut PrintWriter::Stdout)
             .expect("repl should produce progress"),
+        ScriptAction::RunComplete(script) => {
+            let progress = repl
+                .start(script, &mut PrintWriter::Stdout)
+                .expect("repl should produce progress");
+            assert!(
+                matches!(&progress, ReplProgress::Complete { .. }),
+                "expected RunComplete script to produce ReplProgress::Complete"
+            );
+            progress
+        }
         ScriptAction::ResolveThen(script) => repl
             .start(script, &mut PrintWriter::Stdout)
             .expect("repl should produce progress")

@@ -32,8 +32,6 @@ struct SnapshotExtensionsWorld {
 trait BddRoundTripProgress: ProgressSnapshotExt + Sized {
     /// Serializes the current progress value for round-trip checks.
     fn dump_progress(&self) -> Vec<u8>;
-    /// Deserializes a progress value from serialized bytes.
-    fn load_progress(bytes: &[u8]) -> Self;
     /// Reports whether loading the serialized bytes fails.
     fn load_fails(bytes: &[u8]) -> bool;
 }
@@ -46,10 +44,6 @@ macro_rules! impl_bdd_round_trip_progress {
                 self.dump().expect("progress dump should succeed")
             }
 
-            fn load_progress(bytes: &[u8]) -> Self {
-                Self::load(bytes).expect("progress load should succeed")
-            }
-
             fn load_fails(bytes: &[u8]) -> bool {
                 Self::load(bytes).is_err()
             }
@@ -59,13 +53,6 @@ macro_rules! impl_bdd_round_trip_progress {
 
 impl_bdd_round_trip_progress!(RunProgress);
 impl_bdd_round_trip_progress!(ReplProgress);
-
-/// Dumps and reloads progress to recover any attached snapshot-extension bytes.
-fn round_trip_loaded_snapshot_extension<P: BddRoundTripProgress>(progress: &P) -> Option<Vec<u8>> {
-    let bytes = progress.dump_progress();
-    let loaded = P::load_progress(&bytes);
-    loaded.get_snapshot_extension().map(<[u8]>::to_vec)
-}
 
 /// Corrupts a serialized progress payload and reports whether reload fails.
 fn corrupted_progress_fails_to_load<P: BddRoundTripProgress>(progress: &P) -> bool {
@@ -98,6 +85,20 @@ fn given_snapshot_extension_bytes(world: &mut SnapshotExtensionsWorld) {
     world.snapshot_extension = vec![1, 3, 5, 7];
 }
 
+/// Attaches extension bytes, performs a dump/load round-trip, and returns
+/// the recovered extension bytes.
+macro_rules! dump_load_round_trip {
+    ($progress:expr, $ext:expr, $ProgressType:ident) => {{
+        let progress = $progress.attach_snapshot_extension($ext);
+        let bytes = progress
+            .dump()
+            .expect(concat!(stringify!($ProgressType), " dump should succeed"));
+        let loaded: $ProgressType<NoLimitTracker> =
+            $ProgressType::load(&bytes).expect(concat!(stringify!($ProgressType), " load should succeed"));
+        loaded.get_snapshot_extension().map(<[u8]>::to_vec)
+    }};
+}
+
 /// Starts run progress, attaches the test extension bytes, and records the
 /// bytes recovered after a dump/load round trip.
 #[when("run progress is dumped and loaded with snapshot extension bytes")]
@@ -105,9 +106,8 @@ fn when_run_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
     let runner = MontyRun::new(world.script.clone(), "test.py", vec![]).expect("runner creation should succeed");
     let progress = runner
         .start(vec![], NoLimitTracker, &mut PrintWriter::Stdout)
-        .expect("run should suspend")
-        .attach_snapshot_extension(world.snapshot_extension.clone());
-    world.loaded_snapshot_extension = round_trip_loaded_snapshot_extension(&progress);
+        .expect("run should suspend");
+    world.loaded_snapshot_extension = dump_load_round_trip!(progress, world.snapshot_extension.clone(), RunProgress);
 }
 
 /// Dumps run progress with attached extension bytes, corrupts the payload, and
@@ -129,9 +129,8 @@ fn when_repl_progress_dumped_and_loaded(world: &mut SnapshotExtensionsWorld) {
     let repl = create_repl();
     let progress = repl
         .start(&world.repl_snippet, &mut PrintWriter::Stdout)
-        .expect("repl should suspend")
-        .attach_snapshot_extension(world.snapshot_extension.clone());
-    world.loaded_snapshot_extension = round_trip_loaded_snapshot_extension(&progress);
+        .expect("repl should suspend");
+    world.loaded_snapshot_extension = dump_load_round_trip!(progress, world.snapshot_extension.clone(), ReplProgress);
 }
 
 /// Dumps REPL progress with attached extension bytes, corrupts the payload, and

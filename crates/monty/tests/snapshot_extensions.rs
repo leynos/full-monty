@@ -62,6 +62,9 @@ fn assert_snapshot_behavior(actual: Option<&[u8]>, snapshot_extension: &[u8], ex
 #[case::os_call(SnapshotProgressVariant::OsCall)]
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
+/// Verifies that `RunProgress` variants preserve attached snapshot-extension
+/// bytes across dump/load, and that `ResolveFutures` still completes under
+/// `NoLimitTracker` after the round trip.
 fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
     let (fixture_variant, expected_behavior) = variant_case(variant);
     assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
@@ -101,6 +104,9 @@ fn run_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgress
 #[case::os_call(SnapshotProgressVariant::OsCall)]
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
+/// Verifies that `RunProgress` starts with no snapshot extension attached for
+/// all variant cases, including the default `ResolveFutures` path under
+/// `NoLimitTracker`.
 fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotProgressVariant) {
     let progress = create_run_progress_for_variant(variant);
     let bytes = progress.dump().expect("run progress dump should succeed");
@@ -132,6 +138,9 @@ fn run_progress_snapshot_extension_defaults_to_none(#[case] variant: SnapshotPro
 #[case::os_call(SnapshotProgressVariant::OsCall)]
 #[case::resolve_futures(SnapshotProgressVariant::ResolveFutures)]
 #[case::complete(SnapshotProgressVariant::Complete)]
+/// Verifies that `ReplProgress` preserves attached snapshot-extension bytes
+/// across dump/load, and that `ResolveFutures` still reaches the expected REPL
+/// completion value after serialization.
 fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgressVariant, snapshot_extension: Vec<u8>) {
     let (fixture_variant, expected_behavior) = variant_case(variant);
     assert_eq!(fixture_variant, variant, "fixture should describe the active variant");
@@ -163,6 +172,8 @@ fn repl_progress_snapshot_extension_round_trips(#[case] variant: SnapshotProgres
 }
 
 #[test]
+/// Verifies that truncating a serialized `RunProgress` payload causes
+/// `RunProgress::load` to error instead of accepting corrupted bytes.
 fn corrupted_run_progress_payload_fails_to_load() {
     let progress = create_run_progress_for_variant(SnapshotProgressVariant::FunctionCall);
     let progress = progress.attach_snapshot_extension(vec![9, 8, 7]);
@@ -174,6 +185,8 @@ fn corrupted_run_progress_payload_fails_to_load() {
 }
 
 #[test]
+/// Verifies that truncating a serialized `ReplProgress` payload causes
+/// `ReplProgress::load` to error instead of accepting corrupted bytes.
 fn corrupted_repl_progress_payload_fails_to_load() {
     let progress = create_repl_progress_for_variant(SnapshotProgressVariant::FunctionCall);
     let progress = progress.attach_snapshot_extension(vec![9, 8, 7]);

@@ -168,7 +168,7 @@ impl MontyRun {
         // Three-phase conversion: convert while VM alive, then snapshot, then build progress
         let converted = convert_frame_exit(vm_result, &mut vm);
         let vm_state = check_snapshot_from_converted(&converted, vm);
-        build_run_progress(converted, vm_state, executor, heap, observer)
+        build_run_progress(converted, vm_state, executor, heap, observer, None)
     }
 }
 

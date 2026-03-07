@@ -24,6 +24,7 @@ use crate::{
     resource::ResourceTracker,
     run::Executor,
     runtime_id::RuntimeValueId,
+    snapshot_extension::{SnapshotExtension, clone_snapshot_extension},
     value::Value,
 };
 
@@ -179,6 +180,23 @@ impl<T: ResourceTracker> FunctionCall<T> {
         self.snapshot.heap.tracker_mut()
     }
 
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    ///
+    /// Monty persists these bytes alongside the snapshot but never interprets
+    /// them. Hosts can use them to carry opaque state across serialization and
+    /// resume boundaries.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
+        self.snapshot = self.snapshot.with_snapshot_extension(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&SnapshotExtension> {
+        self.snapshot.snapshot_extension()
+    }
+
     /// Resumes execution with the return value or exception from the external function.
     ///
     /// Consumes self and returns the next execution progress.
@@ -240,6 +258,19 @@ pub struct OsCall<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> OsCall<T> {
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
+        self.snapshot = self.snapshot.with_snapshot_extension(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&SnapshotExtension> {
+        self.snapshot.snapshot_extension()
+    }
+
     /// Resumes execution with the OS call result.
     ///
     /// # Arguments
@@ -291,6 +322,19 @@ impl<T: ResourceTracker> NameLookup<T> {
         }
     }
 
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
+        self.snapshot = self.snapshot.with_snapshot_extension(snapshot_extension);
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&SnapshotExtension> {
+        self.snapshot.snapshot_extension()
+    }
+
     /// Resumes execution after name resolution.
     ///
     /// Caches the resolved value in the appropriate slot (globals or stack)
@@ -304,6 +348,7 @@ impl<T: ResourceTracker> NameLookup<T> {
         result: impl Into<NameLookupResult>,
         print: PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
+        let extension_bytes = self.snapshot.extension_bytes.clone();
         let observer = self.snapshot.observer.clone();
         // Restore the VM first, then convert inside its lifetime
         let mut vm = VM::restore_with_observer(
@@ -354,6 +399,7 @@ impl<T: ResourceTracker> NameLookup<T> {
             self.snapshot.executor,
             self.snapshot.heap,
             observer,
+            extension_bytes.as_ref(),
         )
     }
 }
@@ -383,6 +429,9 @@ pub struct ResolveFutures<T: ResourceTracker> {
     observer: RuntimeObserverHandle,
     /// The pending call_ids that this snapshot is waiting on.
     pending_call_ids: Vec<u32>,
+    /// Optional embedder-owned bytes persisted with this snapshot.
+    #[serde(default, rename = "snapshot_extension")]
+    extension_bytes: Option<SnapshotExtension>,
 }
 
 impl<T: ResourceTracker> ResolveFutures<T> {
@@ -393,6 +442,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
         heap: Heap<T>,
         observer: RuntimeObserverHandle,
         pending_call_ids: Vec<u32>,
+        extension_bytes: Option<&SnapshotExtension>,
     ) -> Self {
         Self {
             executor,
@@ -400,7 +450,21 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             heap,
             observer,
             pending_call_ids,
+            extension_bytes: clone_snapshot_extension(extension_bytes),
         }
+    }
+
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
+        self.extension_bytes = Some(snapshot_extension.into());
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> Option<&SnapshotExtension> {
+        self.extension_bytes.as_ref()
     }
 
     /// Returns unresolved call IDs for this suspended state.
@@ -435,6 +499,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             mut heap,
             observer,
             pending_call_ids,
+            extension_bytes,
         } = self;
 
         // Validate that all provided call_ids are in the pending set before restoring VM.
@@ -503,6 +568,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
                     heap,
                     observer,
                     pending_call_ids,
+                    extension_bytes,
                 }));
             }
         }
@@ -512,7 +578,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
         // Three-phase: convert while VM alive, snapshot, build progress
         let converted = convert_frame_exit(result, &mut vm);
         let vm_state = check_snapshot_from_converted(&converted, vm);
-        build_run_progress(converted, vm_state, executor, heap, observer)
+        build_run_progress(converted, vm_state, executor, heap, observer, extension_bytes.as_ref())
     }
 }
 
@@ -534,6 +600,9 @@ pub(crate) struct Snapshot<T: ResourceTracker> {
     pub(crate) vm_state: VMSnapshot,
     /// The heap containing all allocated objects.
     pub(crate) heap: Heap<T>,
+    /// Optional embedder-owned bytes persisted with this snapshot.
+    #[serde(default, rename = "snapshot_extension")]
+    extension_bytes: Option<SnapshotExtension>,
     /// Runtime observer to reattach across restore/resume boundaries.
     #[serde(skip, default = "RuntimeObserverHandle::disabled")]
     pub(crate) observer: RuntimeObserverHandle,
@@ -542,6 +611,38 @@ pub(crate) struct Snapshot<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> Snapshot<T> {
+    /// Creates a resumable snapshot from VM-owned execution state.
+    fn from_vm_snapshot(
+        executor: Executor,
+        vm_state: VMSnapshot,
+        heap: Heap<T>,
+        observer: RuntimeObserverHandle,
+        pending_call_id: u32,
+        extension_bytes: Option<&SnapshotExtension>,
+    ) -> Self {
+        Self {
+            executor,
+            vm_state,
+            heap,
+            extension_bytes: clone_snapshot_extension(extension_bytes),
+            observer,
+            pending_call_id,
+        }
+    }
+
+    /// Attaches embedder-owned snapshot extension bytes to this suspended state.
+    #[must_use]
+    pub(crate) fn with_snapshot_extension(mut self, snapshot_extension: impl Into<SnapshotExtension>) -> Self {
+        self.extension_bytes = Some(snapshot_extension.into());
+        self
+    }
+
+    /// Returns the embedder-owned snapshot extension bytes, if present.
+    #[must_use]
+    pub(crate) fn snapshot_extension(&self) -> Option<&SnapshotExtension> {
+        self.extension_bytes.as_ref()
+    }
+
     /// Continues execution with the return value or exception from the external call.
     pub(crate) fn run(
         mut self,
@@ -549,6 +650,7 @@ impl<T: ResourceTracker> Snapshot<T> {
         print: PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
         let ext_result = result.into();
+        let extension_bytes = self.extension_bytes.clone();
 
         emit_external_call_returned(self.pending_call_id, &ext_result, &self.observer);
 
@@ -579,7 +681,14 @@ impl<T: ResourceTracker> Snapshot<T> {
         // Three-phase: convert while VM alive, snapshot, build progress
         let converted = convert_frame_exit(vm_result, &mut vm);
         let vm_state = check_snapshot_from_converted(&converted, vm);
-        build_run_progress(converted, vm_state, self.executor, self.heap, observer)
+        build_run_progress(
+            converted,
+            vm_state,
+            self.executor,
+            self.heap,
+            observer,
+            extension_bytes.as_ref(),
+        )
     }
 }
 
@@ -834,16 +943,18 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
     executor: Executor,
     heap: Heap<T>,
     observer: RuntimeObserverHandle,
+    extension_bytes: Option<&SnapshotExtension>,
 ) -> Result<RunProgress<T>, MontyException> {
     macro_rules! new_snapshot {
         ($call_id:expr) => {
-            Snapshot {
+            Snapshot::from_vm_snapshot(
                 executor,
-                vm_state: vm_state.expect("snapshot should exist"),
+                vm_state.expect("snapshot should exist"),
                 heap,
-                observer: observer.clone(),
-                pending_call_id: $call_id,
-            }
+                observer.clone(),
+                $call_id,
+                extension_bytes,
+            )
         };
     }
 
@@ -906,6 +1017,7 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             heap,
             observer,
             pending_call_ids,
+            extension_bytes,
         ))),
         ConvertedExit::NameLookup {
             name,

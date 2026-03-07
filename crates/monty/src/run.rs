@@ -193,7 +193,7 @@ impl MontyRun {
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 Ok((converted, vm_state))
             })?;
-        build_run_progress(converted, vm_state, executor, heap, observer)
+        build_run_progress(converted, vm_state, executor, heap, observer, None)
     }
 }
 

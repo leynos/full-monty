@@ -1,6 +1,10 @@
 //! Compatibility and overhead checks for Track A observer modes.
 
-use std::{hint::black_box, time::Instant};
+use std::{
+    hint::black_box,
+    sync::{Mutex, MutexGuard, OnceLock},
+    time::Instant,
+};
 
 #[path = "support/track_a_test_utils.rs"]
 mod track_a_test_utils;
@@ -117,6 +121,14 @@ fn take_output(output: &str) -> String {
     output.to_owned()
 }
 
+fn track_a_test_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn median_ns(mode: BenchmarkMode) -> u128 {
     let run = build_run(BENCHMARK_SCRIPT);
     let mut durations = Vec::with_capacity(BENCHMARK_SAMPLES);
@@ -165,6 +177,7 @@ fn run_benchmark_iteration(run: &MontyRun, mode: BenchmarkMode) -> MontyObject {
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_function_call_and_completion(#[case] mode: ObserverMode) {
+    let _guard = track_a_test_guard();
     let run = build_run(FUNCTION_CALL_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
@@ -198,6 +211,7 @@ fn run_observer_modes_match_baseline_function_call_and_completion(#[case] mode: 
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode) {
+    let _guard = track_a_test_guard();
     let run = build_run(ERROR_SCRIPT);
     let baseline_progress = start_run_with_mode(&run, BenchmarkMode::Baseline, PrintWriter::Disabled);
     let baseline_call = baseline_progress
@@ -226,6 +240,7 @@ fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode) {
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
+    let _guard = track_a_test_guard();
     let run = build_run(OS_CALL_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
@@ -259,6 +274,7 @@ fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
 fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
+    let _guard = track_a_test_guard();
     let baseline_repl = init_repl(REPL_INIT_SCRIPT);
     let baseline_progress = baseline_repl
         .feed_start(REPL_COMPLETE_SNIPPET, Vec::new(), PrintWriter::Disabled)
@@ -286,6 +302,7 @@ fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
 fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
+    let _guard = track_a_test_guard();
     let baseline_repl = init_repl(REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
@@ -362,6 +379,7 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
 
 #[test]
 fn track_a_overhead_disabled_within_budget() {
+    let _guard = track_a_test_guard();
     let baseline = stable_median_ns(BenchmarkMode::Baseline);
     let disabled = stable_median_ns(BenchmarkMode::Observer(ObserverMode::DisabledHandle));
     println!("track_a_overhead disabled baseline_ns={baseline} observed_ns={disabled}");
@@ -370,6 +388,7 @@ fn track_a_overhead_disabled_within_budget() {
 
 #[test]
 fn track_a_overhead_noop_within_budget() {
+    let _guard = track_a_test_guard();
     let baseline = stable_median_ns(BenchmarkMode::Baseline);
     let noop = stable_median_ns(BenchmarkMode::Observer(ObserverMode::NoopObserver));
     println!("track_a_overhead noop baseline_ns={baseline} observed_ns={noop}");

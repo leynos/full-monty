@@ -1,11 +1,19 @@
 //! Behavioural coverage for Track A compatibility invariants.
 
+#[expect(
+    dead_code,
+    reason = "shared helper module defines utilities consumed by sibling integration tests"
+)]
+#[path = "support/track_a_test_utils.rs"]
+mod track_a_test_utils;
+
 use monty::{
     MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver, PrintWriter, ReplProgress, RunProgress,
     RuntimeObserverHandle,
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
+use track_a_test_utils::{assert_function_calls_equal, assert_repl_function_calls_equal};
 
 #[derive(Debug, Clone, Copy)]
 enum ObserverMode {
@@ -140,10 +148,7 @@ fn then_run_suspensions_match(world: &TrackAInvariantsWorld) {
         panic!("expected observer function-call progress");
     };
 
-    assert_eq!(baseline_call.function_name, observer_call.function_name);
-    assert_eq!(baseline_call.args, observer_call.args);
-    assert_eq!(baseline_call.kwargs, observer_call.kwargs);
-    assert_eq!(baseline_call.call_id, observer_call.call_id);
+    assert_function_calls_equal(baseline_call, observer_call);
 }
 
 #[then("both REPL modes complete with the same observable result")]
@@ -181,9 +186,7 @@ fn then_repl_suspensions_match(world: &TrackAInvariantsWorld) {
         panic!("expected observer function-call progress");
     };
 
-    assert_eq!(baseline_call.function_name, observer_call.function_name);
-    assert_eq!(baseline_call.args, observer_call.args);
-    assert_eq!(baseline_call.call_id, observer_call.call_id);
+    assert_repl_function_calls_equal(baseline_call, observer_call);
 }
 
 #[scenario(

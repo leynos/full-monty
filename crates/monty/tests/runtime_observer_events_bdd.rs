@@ -8,7 +8,6 @@ use monty::{
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-
 /// Test-friendly observer event projection used by BDD steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedEvent {

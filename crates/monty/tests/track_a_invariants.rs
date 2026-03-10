@@ -6,17 +6,15 @@ use std::{
     time::Instant,
 };
 
-#[path = "support/track_a_test_utils.rs"]
-mod track_a_test_utils;
+#[path = "support/test_utils.rs"]
+mod test_utils;
 
 use monty::{
     ExtFunctionResult, MontyException, MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver,
     PrintWriter, ReplProgress, ReplStartError, RunProgress, RuntimeObserverHandle,
 };
 use rstest::rstest;
-use track_a_test_utils::{
-    assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal, assert_repl_function_calls_equal,
-};
+use test_utils::{assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal};
 
 const FUNCTION_CALL_SCRIPT: &str = "print(ext_fn(1))";
 const ERROR_SCRIPT: &str = "ext_fn(1)";
@@ -333,7 +331,7 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
         .into_function_call()
         .expect("observer-aware REPL should suspend at function call");
 
-    assert_repl_function_calls_equal(&baseline_call, &observer_call);
+    assert_function_calls_equal(&baseline_call, &observer_call);
 
     let baseline_bytes =
         ReplProgress::FunctionCall(baseline_call.with_snapshot_extension(SNAPSHOT_EXTENSION_BYTES.to_vec()))

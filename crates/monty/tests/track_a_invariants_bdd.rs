@@ -4,8 +4,8 @@
     dead_code,
     reason = "shared helper module defines utilities consumed by sibling integration tests"
 )]
-#[path = "support/track_a_test_utils.rs"]
-mod track_a_test_utils;
+#[path = "support/test_utils.rs"]
+mod test_utils;
 
 use monty::{
     MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver, PrintWriter, ReplProgress, RunProgress,
@@ -13,7 +13,7 @@ use monty::{
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use track_a_test_utils::{assert_function_calls_equal, assert_repl_function_calls_equal};
+use test_utils::assert_function_calls_equal;
 
 #[derive(Debug, Clone, Copy)]
 enum ObserverMode {
@@ -186,7 +186,7 @@ fn then_repl_suspensions_match(world: &TrackAInvariantsWorld) {
         panic!("expected observer function-call progress");
     };
 
-    assert_repl_function_calls_equal(baseline_call, observer_call);
+    assert_function_calls_equal(baseline_call, observer_call);
 }
 
 #[scenario(

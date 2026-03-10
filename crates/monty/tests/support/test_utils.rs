@@ -2,215 +2,130 @@
 //!
 //! Each integration test crate compiles this shared helper module independently,
 //! so some helpers are intentionally unused in a given crate.
-use std::fmt::Debug;
 
 use monty::{
-    FunctionCall, MontyException, OsCall, ReplFunctionCall, ReplOsCall, ResourceTracker, RuntimeValueId,
+    FunctionCall, MontyException, MontyObject, OsCall, OsFunction, ReplFunctionCall, ReplOsCall, ResourceTracker,
+    RuntimeValueId,
 };
 
-macro_rules! assert_fields_equal {
-    ($left:expr, $right:expr; $($field:ident),+ $(,)?) => {
-        $(
-            assert_eq!(
-                $left.$field(),
-                $right.$field(),
-                "field `{}` did not match",
-                stringify!($field)
-            );
-        )+
-    };
+#[derive(Debug, PartialEq)]
+struct FunctionCallKey<'a> {
+    function_name: &'a String,
+    args: &'a Vec<MontyObject>,
+    kwargs: &'a Vec<(MontyObject, MontyObject)>,
+    call_id: &'a u32,
+    method_call: &'a bool,
+    arg_runtime_ids: &'a Vec<RuntimeValueId>,
+    kwarg_runtime_ids: &'a Vec<(RuntimeValueId, RuntimeValueId)>,
 }
 
-/// Shared view over suspendable function-call payloads used by test assertions.
-pub(crate) trait FunctionCallLike {
-    type Args: PartialEq + Debug;
-    type Kwargs: PartialEq + Debug;
-    type CallId: PartialEq + Debug;
-    type MethodCall: PartialEq + Debug;
-    type ArgRuntimeIds: PartialEq + Debug;
-    type KwargRuntimeIds: PartialEq + Debug;
-
-    fn function_name(&self) -> &str;
-    fn args(&self) -> &Self::Args;
-    fn kwargs(&self) -> &Self::Kwargs;
-    fn call_id(&self) -> &Self::CallId;
-    fn method_call(&self) -> &Self::MethodCall;
-    fn arg_runtime_ids(&self) -> &Self::ArgRuntimeIds;
-    fn kwarg_runtime_ids(&self) -> &Self::KwargRuntimeIds;
-}
-
-/// Shared view over suspendable OS-call payloads used by test assertions.
-pub(crate) trait OsCallLike {
-    type Args: PartialEq + Debug;
-    type Kwargs: PartialEq + Debug;
-    type CallId: PartialEq + Debug;
-    type ArgRuntimeIds: PartialEq + Debug;
-    type KwargRuntimeIds: PartialEq + Debug;
-
-    fn function(&self) -> &str;
-    fn args(&self) -> &Self::Args;
-    fn kwargs(&self) -> &Self::Kwargs;
-    fn call_id(&self) -> &Self::CallId;
-    fn arg_runtime_ids(&self) -> &Self::ArgRuntimeIds;
-    fn kwarg_runtime_ids(&self) -> &Self::KwargRuntimeIds;
-}
-
-impl<T: ResourceTracker> FunctionCallLike for FunctionCall<T> {
-    type Args = Vec<monty::MontyObject>;
-    type Kwargs = Vec<(monty::MontyObject, monty::MontyObject)>;
-    type CallId = u32;
-    type MethodCall = bool;
-    type ArgRuntimeIds = Vec<RuntimeValueId>;
-    type KwargRuntimeIds = Vec<(RuntimeValueId, RuntimeValueId)>;
-
-    fn function_name(&self) -> &str {
-        &self.function_name
-    }
-
-    fn args(&self) -> &Self::Args {
-        &self.args
-    }
-
-    fn kwargs(&self) -> &Self::Kwargs {
-        &self.kwargs
-    }
-
-    fn call_id(&self) -> &Self::CallId {
-        &self.call_id
-    }
-
-    fn method_call(&self) -> &Self::MethodCall {
-        &self.method_call
-    }
-
-    fn arg_runtime_ids(&self) -> &Self::ArgRuntimeIds {
-        &self.arg_runtime_ids
-    }
-
-    fn kwarg_runtime_ids(&self) -> &Self::KwargRuntimeIds {
-        &self.kwarg_runtime_ids
+impl<'a> FunctionCallKey<'a> {
+    fn from_call<T: ResourceTracker>(call: &'a FunctionCall<T>) -> Self {
+        Self {
+            function_name: &call.function_name,
+            args: &call.args,
+            kwargs: &call.kwargs,
+            call_id: &call.call_id,
+            method_call: &call.method_call,
+            arg_runtime_ids: &call.arg_runtime_ids,
+            kwarg_runtime_ids: &call.kwarg_runtime_ids,
+        }
     }
 }
 
-impl<T: ResourceTracker> FunctionCallLike for ReplFunctionCall<T> {
-    type Args = Vec<monty::MontyObject>;
-    type Kwargs = Vec<(monty::MontyObject, monty::MontyObject)>;
-    type CallId = u32;
-    type MethodCall = bool;
-    type ArgRuntimeIds = Vec<RuntimeValueId>;
-    type KwargRuntimeIds = Vec<(RuntimeValueId, RuntimeValueId)>;
-
-    fn function_name(&self) -> &str {
-        &self.function_name
-    }
-
-    fn args(&self) -> &Self::Args {
-        &self.args
-    }
-
-    fn kwargs(&self) -> &Self::Kwargs {
-        &self.kwargs
-    }
-
-    fn call_id(&self) -> &Self::CallId {
-        &self.call_id
-    }
-
-    fn method_call(&self) -> &Self::MethodCall {
-        &self.method_call
-    }
-
-    fn arg_runtime_ids(&self) -> &Self::ArgRuntimeIds {
-        &self.arg_runtime_ids
-    }
-
-    fn kwarg_runtime_ids(&self) -> &Self::KwargRuntimeIds {
-        &self.kwarg_runtime_ids
-    }
+/// Asserts that two external function-call suspensions expose the same public fields.
+pub fn assert_function_calls_equal<T: ResourceTracker>(left: &FunctionCall<T>, right: &FunctionCall<T>) {
+    assert_eq!(FunctionCallKey::from_call(left), FunctionCallKey::from_call(right));
 }
 
-impl<T: ResourceTracker> OsCallLike for OsCall<T> {
-    type Args = Vec<monty::MontyObject>;
-    type Kwargs = Vec<(monty::MontyObject, monty::MontyObject)>;
-    type CallId = u32;
-    type ArgRuntimeIds = Vec<RuntimeValueId>;
-    type KwargRuntimeIds = Vec<(RuntimeValueId, RuntimeValueId)>;
-
-    fn function(&self) -> &str {
-        os_function_name(self.function)
-    }
-
-    fn args(&self) -> &Self::Args {
-        &self.args
-    }
-
-    fn kwargs(&self) -> &Self::Kwargs {
-        &self.kwargs
-    }
-
-    fn call_id(&self) -> &Self::CallId {
-        &self.call_id
-    }
-
-    fn arg_runtime_ids(&self) -> &Self::ArgRuntimeIds {
-        &self.arg_runtime_ids
-    }
-
-    fn kwarg_runtime_ids(&self) -> &Self::KwargRuntimeIds {
-        &self.kwarg_runtime_ids
-    }
+#[derive(Debug, PartialEq)]
+struct OsCallKey<'a> {
+    function: &'a OsFunction,
+    args: &'a Vec<MontyObject>,
+    kwargs: &'a Vec<(MontyObject, MontyObject)>,
+    call_id: &'a u32,
+    arg_runtime_ids: &'a Vec<RuntimeValueId>,
+    kwarg_runtime_ids: &'a Vec<(RuntimeValueId, RuntimeValueId)>,
 }
 
-impl<T: ResourceTracker> OsCallLike for ReplOsCall<T> {
-    type Args = Vec<monty::MontyObject>;
-    type Kwargs = Vec<(monty::MontyObject, monty::MontyObject)>;
-    type CallId = u32;
-    type ArgRuntimeIds = Vec<RuntimeValueId>;
-    type KwargRuntimeIds = Vec<(RuntimeValueId, RuntimeValueId)>;
-
-    fn function(&self) -> &str {
-        os_function_name(self.function)
+impl<'a> OsCallKey<'a> {
+    fn from_call<T: ResourceTracker>(call: &'a OsCall<T>) -> Self {
+        Self {
+            function: &call.function,
+            args: &call.args,
+            kwargs: &call.kwargs,
+            call_id: &call.call_id,
+            arg_runtime_ids: &call.arg_runtime_ids,
+            kwarg_runtime_ids: &call.kwarg_runtime_ids,
+        }
     }
-
-    fn args(&self) -> &Self::Args {
-        &self.args
-    }
-
-    fn kwargs(&self) -> &Self::Kwargs {
-        &self.kwargs
-    }
-
-    fn call_id(&self) -> &Self::CallId {
-        &self.call_id
-    }
-
-    fn arg_runtime_ids(&self) -> &Self::ArgRuntimeIds {
-        &self.arg_runtime_ids
-    }
-
-    fn kwarg_runtime_ids(&self) -> &Self::KwargRuntimeIds {
-        &self.kwarg_runtime_ids
-    }
-}
-
-/// Asserts that two function-call suspensions expose the same public fields.
-pub fn assert_function_calls_equal<C: FunctionCallLike>(left: &C, right: &C) {
-    assert_fields_equal!(
-        left,
-        right;
-        function_name,
-        args,
-        kwargs,
-        call_id,
-        method_call,
-        arg_runtime_ids,
-        kwarg_runtime_ids
-    );
 }
 
 /// Asserts that two OS-call suspensions expose the same public fields.
-pub fn assert_os_calls_equal<C: OsCallLike>(left: &C, right: &C) {
-    assert_fields_equal!(left, right; function, args, kwargs, call_id, arg_runtime_ids, kwarg_runtime_ids);
+pub fn assert_os_calls_equal<T: ResourceTracker>(left: &OsCall<T>, right: &OsCall<T>) {
+    assert_eq!(OsCallKey::from_call(left), OsCallKey::from_call(right));
+}
+
+#[derive(Debug, PartialEq)]
+struct ReplFunctionCallKey<'a> {
+    function_name: &'a String,
+    args: &'a Vec<MontyObject>,
+    kwargs: &'a Vec<(MontyObject, MontyObject)>,
+    call_id: &'a u32,
+    method_call: &'a bool,
+    arg_runtime_ids: &'a Vec<RuntimeValueId>,
+    kwarg_runtime_ids: &'a Vec<(RuntimeValueId, RuntimeValueId)>,
+}
+
+impl<'a> ReplFunctionCallKey<'a> {
+    fn from_call<T: ResourceTracker>(call: &'a ReplFunctionCall<T>) -> Self {
+        Self {
+            function_name: &call.function_name,
+            args: &call.args,
+            kwargs: &call.kwargs,
+            call_id: &call.call_id,
+            method_call: &call.method_call,
+            arg_runtime_ids: &call.arg_runtime_ids,
+            kwarg_runtime_ids: &call.kwarg_runtime_ids,
+        }
+    }
+}
+
+/// Asserts that two REPL function-call suspensions expose the same public fields.
+pub fn assert_repl_function_calls_equal<T: ResourceTracker>(left: &ReplFunctionCall<T>, right: &ReplFunctionCall<T>) {
+    assert_eq!(ReplFunctionCallKey::from_call(left), ReplFunctionCallKey::from_call(right));
+}
+
+#[derive(Debug, PartialEq)]
+struct ReplOsCallKey<'a> {
+    function: &'a OsFunction,
+    args: &'a Vec<MontyObject>,
+    kwargs: &'a Vec<(MontyObject, MontyObject)>,
+    call_id: &'a u32,
+    arg_runtime_ids: &'a Vec<RuntimeValueId>,
+    kwarg_runtime_ids: &'a Vec<(RuntimeValueId, RuntimeValueId)>,
+}
+
+impl<'a> ReplOsCallKey<'a> {
+    fn from_call<T: ResourceTracker>(call: &'a ReplOsCall<T>) -> Self {
+        Self {
+            function: &call.function,
+            args: &call.args,
+            kwargs: &call.kwargs,
+            call_id: &call.call_id,
+            arg_runtime_ids: &call.arg_runtime_ids,
+            kwarg_runtime_ids: &call.kwarg_runtime_ids,
+        }
+    }
+}
+
+/// Asserts that two REPL OS-call suspensions expose the same public fields.
+#[expect(
+    dead_code,
+    reason = "repl OS-call equality helper remains available for future test coverage"
+)]
+pub fn assert_repl_os_calls_equal<T: ResourceTracker>(left: &ReplOsCall<T>, right: &ReplOsCall<T>) {
+    assert_eq!(ReplOsCallKey::from_call(left), ReplOsCallKey::from_call(right));
 }
 
 /// Asserts that two exceptions expose the same observable type and message.
@@ -218,27 +133,4 @@ pub fn assert_exceptions_equal(left: &MontyException, right: &MontyException) {
     assert_eq!(left.exc_type(), right.exc_type());
     assert_eq!(left.message(), right.message());
     assert_eq!(left.to_string(), right.to_string());
-}
-
-fn os_function_name(function: monty::OsFunction) -> &'static str {
-    match function {
-        monty::OsFunction::Exists => "Path.exists",
-        monty::OsFunction::IsFile => "Path.is_file",
-        monty::OsFunction::IsDir => "Path.is_dir",
-        monty::OsFunction::IsSymlink => "Path.is_symlink",
-        monty::OsFunction::ReadText => "Path.read_text",
-        monty::OsFunction::ReadBytes => "Path.read_bytes",
-        monty::OsFunction::WriteText => "Path.write_text",
-        monty::OsFunction::WriteBytes => "Path.write_bytes",
-        monty::OsFunction::Mkdir => "Path.mkdir",
-        monty::OsFunction::Unlink => "Path.unlink",
-        monty::OsFunction::Rmdir => "Path.rmdir",
-        monty::OsFunction::Iterdir => "Path.iterdir",
-        monty::OsFunction::Stat => "Path.stat",
-        monty::OsFunction::Rename => "Path.rename",
-        monty::OsFunction::Resolve => "Path.resolve",
-        monty::OsFunction::Absolute => "Path.absolute",
-        monty::OsFunction::Getenv => "os.getenv",
-        monty::OsFunction::GetEnviron => "os.environ",
-    }
 }

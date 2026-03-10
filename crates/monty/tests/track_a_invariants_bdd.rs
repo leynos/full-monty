@@ -13,7 +13,7 @@ use monty::{
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use test_utils::assert_function_calls_equal;
+use test_utils::{assert_function_calls_equal, assert_repl_function_calls_equal};
 
 #[derive(Debug, Clone, Copy)]
 enum ObserverMode {
@@ -186,7 +186,7 @@ fn then_repl_suspensions_match(world: &TrackAInvariantsWorld) {
         panic!("expected observer function-call progress");
     };
 
-    assert_function_calls_equal(baseline_call, observer_call);
+    assert_repl_function_calls_equal(baseline_call, observer_call);
 }
 
 #[scenario(

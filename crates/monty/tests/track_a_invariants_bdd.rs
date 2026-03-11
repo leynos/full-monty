@@ -1,19 +1,19 @@
 //! Behavioural coverage for Track A compatibility invariants.
 
-#[expect(
-    dead_code,
-    reason = "shared helper module defines utilities consumed by sibling integration tests"
-)]
-#[path = "support/test_utils.rs"]
-mod test_utils;
-
 use monty::{
     MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver, PrintWriter, ReplProgress, RunProgress,
     RuntimeObserverHandle,
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use test_utils::{assert_function_calls_equal, assert_repl_function_calls_equal};
+use test_utils::assert_function_calls_equal;
+
+#[expect(
+    dead_code,
+    reason = "shared helper module defines utilities consumed by sibling integration tests"
+)]
+#[path = "support/test_utils.rs"]
+mod test_utils;
 
 #[derive(Debug, Clone, Copy)]
 enum ObserverMode {
@@ -186,7 +186,7 @@ fn then_repl_suspensions_match(world: &TrackAInvariantsWorld) {
         panic!("expected observer function-call progress");
     };
 
-    assert_repl_function_calls_equal(baseline_call, observer_call);
+    assert_function_calls_equal(baseline_call, observer_call);
 }
 
 #[scenario(

@@ -1,8 +1,8 @@
 //! Behavioural coverage for Track A compatibility invariants.
 
 use monty::{
-    MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver, PrintWriter, ReplProgress, RunProgress,
-    RuntimeObserverHandle,
+    FunctionCall, MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver, PrintWriter, ReplFunctionCall,
+    ReplProgress, RunProgress, RuntimeObserverHandle,
 };
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
@@ -136,19 +136,25 @@ fn when_observer_repl_is_dumped_and_loaded(world: &mut TrackAInvariantsWorld) {
     world.observer_repl = Some(ReplProgress::load(&observer_bytes).expect("observer load should succeed"));
 }
 
+fn extract_run_function_call(progress: &RunProgress<NoLimitTracker>) -> &FunctionCall<NoLimitTracker> {
+    let RunProgress::FunctionCall(call) = progress else {
+        panic!("expected function-call run progress");
+    };
+    call
+}
+
+fn extract_repl_function_call(progress: &ReplProgress<NoLimitTracker>) -> &ReplFunctionCall<NoLimitTracker> {
+    let ReplProgress::FunctionCall(call) = progress else {
+        panic!("expected function-call repl progress");
+    };
+    call
+}
+
 #[then("both run modes suspend with matching external call payloads")]
 fn then_run_suspensions_match(world: &TrackAInvariantsWorld) {
     let baseline = world.baseline_run.as_ref().expect("baseline run should exist");
     let observer = world.observer_run.as_ref().expect("observer run should exist");
-
-    let RunProgress::FunctionCall(baseline_call) = baseline else {
-        panic!("expected baseline function-call progress");
-    };
-    let RunProgress::FunctionCall(observer_call) = observer else {
-        panic!("expected observer function-call progress");
-    };
-
-    assert_function_calls_equal(baseline_call, observer_call);
+    assert_function_calls_equal(extract_run_function_call(baseline), extract_run_function_call(observer));
 }
 
 #[then("both REPL modes complete with the same observable result")]
@@ -178,15 +184,10 @@ fn then_repl_completions_match(world: &TrackAInvariantsWorld) {
 fn then_repl_suspensions_match(world: &TrackAInvariantsWorld) {
     let baseline = world.baseline_repl.as_ref().expect("baseline repl should exist");
     let observer = world.observer_repl.as_ref().expect("observer repl should exist");
-
-    let ReplProgress::FunctionCall(baseline_call) = baseline else {
-        panic!("expected baseline function-call progress");
-    };
-    let ReplProgress::FunctionCall(observer_call) = observer else {
-        panic!("expected observer function-call progress");
-    };
-
-    assert_function_calls_equal(baseline_call, observer_call);
+    assert_function_calls_equal(
+        extract_repl_function_call(baseline),
+        extract_repl_function_call(observer),
+    );
 }
 
 #[scenario(

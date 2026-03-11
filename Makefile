@@ -81,6 +81,13 @@ format-rs:  ## Format Rust code with fmt
 	@cargo +nightly fmt --version
 	cargo +nightly fmt --all
 
+.PHONY: check-fmt
+check-fmt: .uv install-js ## Check Rust, Python, and JS formatting without modifying files
+	@cargo +nightly fmt --version
+	cargo +nightly fmt --all --check
+	uv run ruff format --check
+	cd crates/monty-js && npm run format:prettier -- --check
+
 .PHONY: format-py
 format-py: ## Format Python code - WARNING be careful about this command as it may modify code and break tests silently!
 	uv run ruff format

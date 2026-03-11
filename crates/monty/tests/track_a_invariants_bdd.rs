@@ -1,6 +1,8 @@
 //! Behavioural coverage for Track A compatibility invariants.
 
-use monty::{FunctionCall, MontyRun, NoLimitTracker, PrintWriter, ReplFunctionCall, ReplProgress, RunProgress};
+use monty::{
+    FunctionCall, MontyObject, MontyRun, NoLimitTracker, PrintWriter, ReplFunctionCall, ReplProgress, RunProgress,
+};
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
 use test_utils::{ObserverMode, assert_function_calls_equal, init_repl};
@@ -12,18 +14,31 @@ use test_utils::{ObserverMode, assert_function_calls_equal, init_repl};
 #[path = "support/test_utils.rs"]
 mod test_utils;
 
+const REPL_FOLLOW_UP_SNIPPET: &str = "seed + 1";
+
+/// Shared BDD world that accumulates the scripts, mode selection, and progress values needed to
+/// compare baseline execution with observer-aware execution across multiple scenarios.
 #[derive(Default)]
 struct TrackAInvariantsWorld {
+    /// Run script configured by the `Given` steps.
     run_script: String,
+    /// REPL setup snippet executed before scenario-specific snippets.
     repl_init_script: String,
+    /// Scenario-specific REPL snippet under test.
     repl_snippet: String,
+    /// Observer mode selected by the scenario.
     observer_mode: Option<ObserverMode>,
+    /// Baseline run progress captured by the `When` steps.
     baseline_run: Option<RunProgress<NoLimitTracker>>,
+    /// Observer-aware run progress captured by the `When` steps.
     observer_run: Option<RunProgress<NoLimitTracker>>,
+    /// Baseline REPL progress captured by the `When` steps.
     baseline_repl: Option<ReplProgress<NoLimitTracker>>,
+    /// Observer-aware REPL progress captured by the `When` steps.
     observer_repl: Option<ReplProgress<NoLimitTracker>>,
 }
 
+/// Returns a fresh BDD world so each scenario builds state independently.
 #[fixture]
 fn world() -> TrackAInvariantsWorld {
     TrackAInvariantsWorld::default()
@@ -105,6 +120,7 @@ fn when_observer_repl_is_dumped_and_loaded(world: &mut TrackAInvariantsWorld) {
     world.observer_repl = Some(ReplProgress::load(&observer_bytes).expect("observer load should succeed"));
 }
 
+/// Extracts the function-call payload from run progress for Track A payload comparisons.
 fn extract_run_function_call(progress: &RunProgress<NoLimitTracker>) -> &FunctionCall<NoLimitTracker> {
     let RunProgress::FunctionCall(call) = progress else {
         panic!("expected function-call run progress");
@@ -112,6 +128,7 @@ fn extract_run_function_call(progress: &RunProgress<NoLimitTracker>) -> &Functio
     call
 }
 
+/// Extracts the function-call payload from REPL progress for Track A payload comparisons.
 fn extract_repl_function_call(progress: &ReplProgress<NoLimitTracker>) -> &ReplFunctionCall<NoLimitTracker> {
     let ReplProgress::FunctionCall(call) = progress else {
         panic!("expected function-call repl progress");
@@ -127,19 +144,19 @@ fn then_run_suspensions_match(world: &TrackAInvariantsWorld) {
 }
 
 #[then("both REPL modes complete with the same observable result")]
-fn then_repl_completions_match(world: &TrackAInvariantsWorld) {
-    let baseline = world.baseline_repl.as_ref().expect("baseline repl should exist");
-    let observer = world.observer_repl.as_ref().expect("observer repl should exist");
+fn then_repl_completions_match(world: &mut TrackAInvariantsWorld) {
+    let baseline = world.baseline_repl.take().expect("baseline repl should exist");
+    let observer = world.observer_repl.take().expect("observer repl should exist");
 
     let ReplProgress::Complete {
-        repl: _baseline_repl,
+        repl: mut baseline_repl,
         value: baseline_value,
     } = baseline
     else {
         panic!("expected baseline completion");
     };
     let ReplProgress::Complete {
-        repl: _observer_repl,
+        repl: mut observer_repl,
         value: observer_value,
     } = observer
     else {
@@ -147,6 +164,14 @@ fn then_repl_completions_match(world: &TrackAInvariantsWorld) {
     };
 
     assert_eq!(baseline_value, observer_value);
+    let baseline_follow_up = baseline_repl
+        .feed_run(REPL_FOLLOW_UP_SNIPPET, Vec::new(), PrintWriter::Disabled)
+        .expect("baseline follow-up snippet should succeed");
+    let observer_follow_up = observer_repl
+        .feed_run(REPL_FOLLOW_UP_SNIPPET, Vec::new(), PrintWriter::Disabled)
+        .expect("observer follow-up snippet should succeed");
+    assert_eq!(baseline_follow_up, observer_follow_up);
+    assert_eq!(baseline_follow_up, MontyObject::Int(12));
 }
 
 #[then("both REPL modes still suspend with matching external call payloads")]

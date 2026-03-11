@@ -35,6 +35,11 @@ pub fn init_repl(filename: &str, code: &str) -> MontyRepl<NoLimitTracker> {
     repl
 }
 
+/// Exposes the exact run/REPL function-call fields Track A treats as observable equality.
+///
+/// The comparison surface intentionally includes argument ordering, `call_id`, and runtime IDs
+/// because hosts can observe all of them when correlating resumptions or inspecting suspension
+/// payloads. Changing this set would weaken the invariant these tests are checking.
 trait FunctionCallFields {
     fn function_name(&self) -> &String;
     fn args(&self) -> &Vec<MontyObject>;
@@ -105,6 +110,7 @@ impl<T: ResourceTracker> FunctionCallFields for ReplFunctionCall<T> {
     }
 }
 
+/// Borrowed key for comparing the full observable surface of a function-call suspension.
 #[derive(Debug, PartialEq)]
 struct FunctionCallKey<'a> {
     function_name: &'a String,
@@ -117,6 +123,7 @@ struct FunctionCallKey<'a> {
 }
 
 impl<'a> FunctionCallKey<'a> {
+    /// Captures the observable equality fields from either a run or REPL function-call payload.
     fn from_call(call: &'a impl FunctionCallFields) -> Self {
         Self {
             function_name: call.function_name(),
@@ -139,6 +146,10 @@ pub fn assert_function_calls_equal(left: &impl FunctionCallFields, right: &impl 
     assert_eq!(FunctionCallKey::from_call(left), FunctionCallKey::from_call(right));
 }
 
+/// Exposes the exact OS-call fields Track A treats as observable equality.
+///
+/// The comparison includes keyword ordering, `call_id`, and runtime IDs because embedders can
+/// observe and correlate those values while servicing sandboxed OS requests.
 trait OsCallFields {
     fn function(&self) -> &OsFunction;
     fn args(&self) -> &Vec<MontyObject>;
@@ -200,6 +211,7 @@ impl<T: ResourceTracker> OsCallFields for ReplOsCall<T> {
     }
 }
 
+/// Borrowed key for comparing the full observable surface of an OS-call suspension.
 #[derive(Debug, PartialEq)]
 struct OsCallKey<'a> {
     function: &'a OsFunction,
@@ -211,6 +223,7 @@ struct OsCallKey<'a> {
 }
 
 impl<'a> OsCallKey<'a> {
+    /// Captures the observable equality fields from either a run or REPL OS-call payload.
     fn from_call(call: &'a impl OsCallFields) -> Self {
         Self {
             function: call.function(),

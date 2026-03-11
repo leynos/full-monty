@@ -1,12 +1,9 @@
 //! Behavioural coverage for Track A compatibility invariants.
 
-use monty::{
-    FunctionCall, MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver, PrintWriter, ReplFunctionCall,
-    ReplProgress, RunProgress, RuntimeObserverHandle,
-};
+use monty::{FunctionCall, MontyRun, NoLimitTracker, PrintWriter, ReplFunctionCall, ReplProgress, RunProgress};
 use rstest::fixture;
 use rstest_bdd_macros::{given, scenario, then, when};
-use test_utils::assert_function_calls_equal;
+use test_utils::{ObserverMode, assert_function_calls_equal, init_repl};
 
 #[expect(
     dead_code,
@@ -14,21 +11,6 @@ use test_utils::assert_function_calls_equal;
 )]
 #[path = "support/test_utils.rs"]
 mod test_utils;
-
-#[derive(Debug, Clone, Copy)]
-enum ObserverMode {
-    DisabledHandle,
-    NoopObserver,
-}
-
-impl ObserverMode {
-    fn handle(self) -> RuntimeObserverHandle {
-        match self {
-            Self::DisabledHandle => RuntimeObserverHandle::disabled(),
-            Self::NoopObserver => RuntimeObserverHandle::new(NoopRuntimeObserver),
-        }
-    }
-}
 
 #[derive(Default)]
 struct TrackAInvariantsWorld {
@@ -45,15 +27,6 @@ struct TrackAInvariantsWorld {
 #[fixture]
 fn world() -> TrackAInvariantsWorld {
     TrackAInvariantsWorld::default()
-}
-
-fn init_repl(code: &str) -> MontyRepl<NoLimitTracker> {
-    let mut repl = MontyRepl::new("track_a_bdd_repl.py", NoLimitTracker);
-    let value = repl
-        .feed_run(code, Vec::new(), PrintWriter::Disabled)
-        .expect("repl init script should succeed");
-    assert_eq!(value, MontyObject::None);
-    repl
 }
 
 #[given("a run script that suspends at one external call")]
@@ -105,14 +78,14 @@ fn when_run_execution_starts(world: &mut TrackAInvariantsWorld) {
 
 #[when("baseline and observer-aware REPL execution both start")]
 fn when_repl_execution_starts(world: &mut TrackAInvariantsWorld) {
-    let baseline_repl = init_repl(&world.repl_init_script);
+    let baseline_repl = init_repl("track_a_bdd_repl.py", &world.repl_init_script);
     world.baseline_repl = Some(
         baseline_repl
             .feed_start(&world.repl_snippet, Vec::new(), PrintWriter::Disabled)
             .expect("baseline repl start should succeed"),
     );
 
-    let observer_repl = init_repl(&world.repl_init_script);
+    let observer_repl = init_repl("track_a_bdd_repl.py", &world.repl_init_script);
     world.observer_repl = Some(
         observer_repl
             .feed_start_with_observer(
@@ -127,10 +100,6 @@ fn when_repl_execution_starts(world: &mut TrackAInvariantsWorld) {
 
 #[when("the observer-aware REPL progress is dumped and loaded")]
 fn when_observer_repl_is_dumped_and_loaded(world: &mut TrackAInvariantsWorld) {
-    let baseline_progress = world.baseline_repl.take().expect("baseline repl progress should exist");
-    let baseline_bytes = baseline_progress.dump().expect("baseline dump should succeed");
-    world.baseline_repl = Some(ReplProgress::load(&baseline_bytes).expect("baseline load should succeed"));
-
     let observer_progress = world.observer_repl.take().expect("observer repl progress should exist");
     let observer_bytes = observer_progress.dump().expect("observer dump should succeed");
     world.observer_repl = Some(ReplProgress::load(&observer_bytes).expect("observer load should succeed"));

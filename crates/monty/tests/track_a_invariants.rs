@@ -7,11 +7,13 @@ use std::{
 };
 
 use monty::{
-    ExtFunctionResult, MontyException, MontyObject, MontyRepl, MontyRun, NoLimitTracker, NoopRuntimeObserver,
-    PrintWriter, ReplProgress, ReplStartError, RunProgress, RuntimeObserverHandle,
+    ExtFunctionResult, MontyException, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress,
+    ReplStartError, RunProgress,
 };
 use rstest::rstest;
-use test_utils::{assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal};
+use test_utils::{
+    ObserverMode, assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal, init_repl,
+};
 
 #[path = "support/test_utils.rs"]
 mod test_utils;
@@ -37,21 +39,6 @@ const BENCHMARK_SAMPLES: usize = 11;
 const BENCHMARK_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
-enum ObserverMode {
-    DisabledHandle,
-    NoopObserver,
-}
-
-impl ObserverMode {
-    fn handle(self) -> RuntimeObserverHandle {
-        match self {
-            Self::DisabledHandle => RuntimeObserverHandle::disabled(),
-            Self::NoopObserver => RuntimeObserverHandle::new(NoopRuntimeObserver),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 enum BenchmarkMode {
     Baseline,
     Observer(ObserverMode),
@@ -59,15 +46,6 @@ enum BenchmarkMode {
 
 fn build_run(script: &str) -> MontyRun {
     MontyRun::new(script.to_owned(), "track_a.py", vec![]).expect("runner creation should succeed")
-}
-
-fn init_repl(code: &str) -> MontyRepl<NoLimitTracker> {
-    let mut repl = MontyRepl::new("track_a_repl.py", NoLimitTracker);
-    let value = repl
-        .feed_run(code, Vec::new(), PrintWriter::Disabled)
-        .expect("repl init script should succeed");
-    assert_eq!(value, MontyObject::None, "init script should not produce a value");
-    repl
 }
 
 fn start_run_with_mode(run: &MontyRun, mode: BenchmarkMode, print: PrintWriter<'_>) -> RunProgress<NoLimitTracker> {
@@ -157,18 +135,11 @@ fn stable_median_ns(mode: BenchmarkMode) -> u128 {
 }
 
 fn run_benchmark_iteration(run: &MontyRun, mode: BenchmarkMode) -> MontyObject {
-    match mode {
-        BenchmarkMode::Baseline => run
-            .run(vec![], NoLimitTracker, PrintWriter::Disabled)
-            .expect("baseline benchmark run should succeed"),
-        BenchmarkMode::Observer(observer_mode) => {
-            let progress = start_run_with_mode(run, BenchmarkMode::Observer(observer_mode), PrintWriter::Disabled);
-            let Some(value) = progress.into_complete() else {
-                panic!("benchmark script should complete without suspension");
-            };
-            value
-        }
-    }
+    let progress = start_run_with_mode(run, mode, PrintWriter::Disabled);
+    let Some(value) = progress.into_complete() else {
+        panic!("benchmark script should complete without suspension");
+    };
+    value
 }
 
 #[rstest]
@@ -273,12 +244,12 @@ fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
 #[case(ObserverMode::NoopObserver)]
 fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
     let _guard = track_a_test_guard();
-    let baseline_repl = init_repl(REPL_INIT_SCRIPT);
+    let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let baseline_progress = baseline_repl
         .feed_start(REPL_COMPLETE_SNIPPET, Vec::new(), PrintWriter::Disabled)
         .expect("baseline REPL start should succeed");
 
-    let observer_repl = init_repl(REPL_INIT_SCRIPT);
+    let observer_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let observer_progress = start_repl_with_mode(observer_repl, REPL_COMPLETE_SNIPPET, mode)
         .expect("observer-aware REPL start should succeed");
 
@@ -301,7 +272,7 @@ fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
 #[case(ObserverMode::NoopObserver)]
 fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
     let _guard = track_a_test_guard();
-    let baseline_repl = init_repl(REPL_INIT_SCRIPT);
+    let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
     let baseline_progress = baseline_repl
@@ -311,22 +282,12 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
         .into_function_call()
         .expect("baseline should suspend at function call");
 
-    let observer_repl = init_repl(REPL_INIT_SCRIPT);
+    let observer_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut observer_output = String::new();
     let mut observer_print = PrintWriter::Collect(&mut observer_output);
-    let observer_progress = match mode {
-        ObserverMode::DisabledHandle => observer_repl.start_with_observer(
-            REPL_SNAPSHOT_SNIPPET,
-            observer_print.reborrow(),
-            RuntimeObserverHandle::disabled(),
-        ),
-        ObserverMode::NoopObserver => observer_repl.start_with_observer(
-            REPL_SNAPSHOT_SNIPPET,
-            observer_print.reborrow(),
-            RuntimeObserverHandle::new(NoopRuntimeObserver),
-        ),
-    }
-    .expect("observer-aware REPL should suspend at function call");
+    let observer_progress = observer_repl
+        .start_with_observer(REPL_SNAPSHOT_SNIPPET, observer_print.reborrow(), mode.handle())
+        .expect("observer-aware REPL should suspend at function call");
     let observer_call = observer_progress
         .into_function_call()
         .expect("observer-aware REPL should suspend at function call");

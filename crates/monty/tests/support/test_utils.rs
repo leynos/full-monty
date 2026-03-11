@@ -4,9 +4,36 @@
 //! so some helpers are intentionally unused in a given crate.
 
 use monty::{
-    FunctionCall, MontyException, MontyObject, OsCall, OsFunction, ReplFunctionCall, ReplOsCall, ResourceTracker,
-    RuntimeValueId,
+    FunctionCall, MontyException, MontyObject, MontyRepl, NoLimitTracker, NoopRuntimeObserver, OsCall, OsFunction,
+    PrintWriter, ReplFunctionCall, ReplOsCall, ResourceTracker, RuntimeObserverHandle, RuntimeValueId,
 };
+
+/// Observer configuration shared by Track A tests so both suites exercise the same modes.
+#[derive(Debug, Clone, Copy)]
+pub enum ObserverMode {
+    DisabledHandle,
+    NoopObserver,
+}
+
+impl ObserverMode {
+    /// Returns the runtime observer handle associated with the selected mode.
+    pub fn handle(self) -> RuntimeObserverHandle {
+        match self {
+            Self::DisabledHandle => RuntimeObserverHandle::disabled(),
+            Self::NoopObserver => RuntimeObserverHandle::new(NoopRuntimeObserver),
+        }
+    }
+}
+
+/// Creates a REPL, runs the initialization snippet, and asserts the setup is side-effect only.
+pub fn init_repl(filename: &str, code: &str) -> MontyRepl<NoLimitTracker> {
+    let mut repl = MontyRepl::new(filename, NoLimitTracker);
+    let value = repl
+        .feed_run(code, Vec::new(), PrintWriter::Disabled)
+        .expect("repl init script should succeed");
+    assert_eq!(value, MontyObject::None, "init script should not produce a value");
+    repl
+}
 
 trait FunctionCallFields {
     fn function_name(&self) -> &String;

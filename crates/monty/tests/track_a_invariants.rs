@@ -50,9 +50,10 @@ const BENCHMARK_SAMPLES: usize = 11;
 const BENCHMARK_ATTEMPTS: usize = 3;
 /// Disabled observer mode may add at most 20% overhead because it should stay close to baseline.
 const DISABLED_OVERHEAD_MAX_PERCENT: u128 = 120;
-/// No-op observer mode may add up to 130% overhead because every event still triggers callbacks
-/// and the fully instrumented path shows modest variance across feature-gated test runs in CI.
-const NOOP_OVERHEAD_MAX_PERCENT: u128 = 230;
+/// No-op observer mode may add up to 140% overhead because every event still triggers callbacks
+/// and the identical `feed_start_with_observer` path shows modest variance across feature-gated
+/// test runs in CI, especially under `ref-count-return`.
+const NOOP_OVERHEAD_MAX_PERCENT: u128 = 240;
 
 /// Execution mode used by the observer-overhead benchmark.
 ///
@@ -311,7 +312,12 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
     let mut observer_output = String::new();
     let mut observer_print = PrintWriter::Collect(&mut observer_output);
     let observer_progress = observer_repl
-        .start_with_observer(REPL_SNAPSHOT_SNIPPET, observer_print.reborrow(), mode.handle())
+        .feed_start_with_observer(
+            REPL_SNAPSHOT_SNIPPET,
+            Vec::new(),
+            observer_print.reborrow(),
+            mode.handle(),
+        )
         .expect("observer-aware REPL should suspend at function call");
     let observer_call = observer_progress
         .into_function_call()

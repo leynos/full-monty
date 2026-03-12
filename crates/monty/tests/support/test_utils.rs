@@ -40,7 +40,7 @@ pub fn init_repl(filename: &str, code: &str) -> MontyRepl<NoLimitTracker> {
 /// The comparison surface intentionally includes argument ordering, `call_id`, and runtime IDs
 /// because hosts can observe all of them when correlating resumptions or inspecting suspension
 /// payloads. Changing this set would weaken the invariant these tests are checking.
-trait FunctionCallFields {
+pub(crate) trait FunctionCallFields {
     fn function_name(&self) -> &String;
     fn args(&self) -> &Vec<MontyObject>;
     fn kwargs(&self) -> &Vec<(MontyObject, MontyObject)>;
@@ -138,11 +138,7 @@ impl<'a> FunctionCallKey<'a> {
 }
 
 /// Asserts that two external function-call suspensions expose the same public fields.
-#[expect(
-    private_bounds,
-    reason = "shared helpers stay module-exported for sibling integration tests while the field access traits remain private"
-)]
-pub fn assert_function_calls_equal(left: &impl FunctionCallFields, right: &impl FunctionCallFields) {
+pub(crate) fn assert_function_calls_equal(left: &impl FunctionCallFields, right: &impl FunctionCallFields) {
     assert_eq!(FunctionCallKey::from_call(left), FunctionCallKey::from_call(right));
 }
 
@@ -150,7 +146,7 @@ pub fn assert_function_calls_equal(left: &impl FunctionCallFields, right: &impl 
 ///
 /// The comparison includes keyword ordering, `call_id`, and runtime IDs because embedders can
 /// observe and correlate those values while servicing sandboxed OS requests.
-trait OsCallFields {
+pub(crate) trait OsCallFields {
     fn function(&self) -> &OsFunction;
     fn args(&self) -> &Vec<MontyObject>;
     fn kwargs(&self) -> &Vec<(MontyObject, MontyObject)>;
@@ -237,11 +233,7 @@ impl<'a> OsCallKey<'a> {
 }
 
 /// Asserts that two OS-call suspensions expose the same public fields.
-#[expect(
-    private_bounds,
-    reason = "shared helpers stay module-exported for sibling integration tests while the field access traits remain private"
-)]
-pub fn assert_os_calls_equal(left: &impl OsCallFields, right: &impl OsCallFields) {
+pub(crate) fn assert_os_calls_equal(left: &impl OsCallFields, right: &impl OsCallFields) {
     assert_eq!(OsCallKey::from_call(left), OsCallKey::from_call(right));
 }
 

@@ -1,8 +1,10 @@
 //! Compatibility and overhead checks for Track A observer modes.
 
 use std::{
+    fs::{File, OpenOptions},
     hint::black_box,
-    sync::{Mutex, MutexGuard, OnceLock},
+    path::PathBuf,
+    sync::OnceLock,
     time::Instant,
 };
 
@@ -10,6 +12,7 @@ use monty::{
     ExtFunctionResult, MontyException, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress,
     ReplStartError, RunProgress,
 };
+use nix::fcntl::{Flock, FlockArg};
 use rstest::rstest;
 use test_utils::{
     ObserverMode, assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal, init_repl,
@@ -57,8 +60,10 @@ const NOOP_OVERHEAD_MAX_PERCENT: u128 = 240;
 
 /// Execution mode used by the observer-overhead benchmark.
 ///
-/// `Baseline` and `Observer` both go through `start(...).into_complete()` so the measurement
-/// isolates observer cost rather than comparing two different execution APIs.
+/// `Baseline` starts runs with `MontyRun::start`, while `Observer` uses
+/// `MontyRun::start_with_observer`. The benchmark then evaluates both variants through the same
+/// `RunProgress` completion/assertion shape so the comparison isolates observer cost rather than
+/// diverging test logic.
 #[derive(Debug, Clone, Copy)]
 enum BenchmarkMode {
     Baseline,
@@ -119,13 +124,30 @@ fn assert_repl_complete_progress(
     );
 }
 
-/// Serializes access to Track A tests that would otherwise contend on shared runtime state.
-fn track_a_test_guard() -> MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Cross-process guard that holds the Track A benchmark lock file for the current test scope.
+struct TrackATestGuard {
+    _file: Flock<File>,
+}
+
+/// Returns the stable lock-file path used to serialize Track A tests across processes.
+fn track_a_lock_path() -> &'static PathBuf {
+    static LOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
+    LOCK_PATH.get_or_init(|| std::env::temp_dir().join("full-monty-track-a.lock"))
+}
+
+/// Serializes Track A tests across threads and test binaries to keep benchmark runs isolated.
+fn track_a_test_guard() -> TrackATestGuard {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(track_a_lock_path())
+        .expect("track-a lock file should open");
+    let file = Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .expect("track-a lock file should lock exclusively");
+    TrackATestGuard { _file: file }
 }
 
 /// Measures the median nanoseconds for one benchmark attempt in the requested execution mode.
@@ -168,6 +190,7 @@ fn run_benchmark_iteration(run: &MontyRun, mode: BenchmarkMode) -> MontyObject {
     value
 }
 
+/// Verifies observer run modes suspend on the same function call and resume to the same output.
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
@@ -202,6 +225,7 @@ fn run_observer_modes_match_baseline_function_call_and_completion(#[case] mode: 
     assert_eq!(baseline_output, observer_output);
 }
 
+/// Verifies observer run modes propagate resumed external-call errors exactly like baseline runs.
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
@@ -231,6 +255,7 @@ fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode) {
     assert_exceptions_equal(&baseline_error, &observer_error);
 }
 
+/// Verifies observer run modes expose identical OS-call suspensions and resumed output.
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
@@ -265,6 +290,7 @@ fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
     assert_eq!(baseline_output, observer_output);
 }
 
+/// Verifies observer-aware REPL completion preserves the same state transitions as baseline REPLs.
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
@@ -293,6 +319,7 @@ fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
     );
 }
 
+/// Verifies REPL snapshot dump/load preserves observer-visible function-call state and output.
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
@@ -367,6 +394,7 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
     assert_eq!(baseline_output, observer_output);
 }
 
+/// Verifies the disabled observer handle stays within the Track A overhead budget.
 #[test]
 fn track_a_overhead_disabled_within_budget() {
     let _guard = track_a_test_guard();
@@ -376,6 +404,7 @@ fn track_a_overhead_disabled_within_budget() {
     assert!(disabled * 100 <= baseline * DISABLED_OVERHEAD_MAX_PERCENT);
 }
 
+/// Verifies the no-op observer stays within the looser Track A overhead budget under full events.
 #[test]
 fn track_a_overhead_noop_within_budget() {
     let _guard = track_a_test_guard();

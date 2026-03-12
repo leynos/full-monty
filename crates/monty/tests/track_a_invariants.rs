@@ -1,25 +1,21 @@
+#![cfg(unix)]
+
 //! Compatibility and overhead checks for Track A observer modes.
 
-use std::{
-    fs::{File, OpenOptions},
-    hint::black_box,
-    path::PathBuf,
-    sync::OnceLock,
-    time::Instant,
-};
-
 use monty::{
-    ExtFunctionResult, MontyException, MontyObject, MontyRepl, MontyRun, NoLimitTracker, PrintWriter, ReplProgress,
+    ExtFunctionResult, MontyException, MontyObject, MontyRepl, NoLimitTracker, PrintWriter, ReplProgress,
     ReplStartError, RunProgress,
 };
-use nix::fcntl::{Flock, FlockArg};
 use rstest::rstest;
 use test_utils::{
     ObserverMode, assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal, init_repl,
 };
+use track_a_test_utils::{BenchmarkMode, build_run, start_run_with_mode, track_a_test_guard};
 
 #[path = "support/test_utils.rs"]
 mod test_utils;
+#[path = "support/track_a_test_utils.rs"]
+mod track_a_test_utils;
 
 /// Script that suspends at a single external function call before printing the result.
 const FUNCTION_CALL_SCRIPT: &str = "print(ext_fn(1))";
@@ -33,61 +29,8 @@ const REPL_INIT_SCRIPT: &str = "seed = 10";
 const REPL_COMPLETE_SNIPPET: &str = "seed = seed + 1\nseed";
 /// REPL snippet that suspends at an external function call after reading session state.
 const REPL_SNAPSHOT_SNIPPET: &str = "print(ext_fn(seed + 1))";
-/// Benchmark script used to estimate observer overhead on a deterministic CPU-bound workload.
-const BENCHMARK_SCRIPT: &str = r"
-total = 0
-for i in range(2_000):
-    if i % 3 == 0:
-        total = total + i
-    else:
-        total = total - 1
-total
-";
 /// Snapshot extension bytes used to verify round-trip preservation through REPL dump/load.
 const SNAPSHOT_EXTENSION_BYTES: &[u8] = &[1, 3, 5, 7];
-/// Warmup iterations discarded before measuring benchmark medians.
-const BENCHMARK_WARMUP_RUNS: usize = 5;
-/// Samples collected for each median benchmark estimate.
-const BENCHMARK_SAMPLES: usize = 11;
-/// Repeated median estimates used to stabilize benchmark noise.
-const BENCHMARK_ATTEMPTS: usize = 3;
-/// Disabled observer mode may add at most 20% overhead because it should stay close to baseline.
-const DISABLED_OVERHEAD_MAX_PERCENT: u128 = 120;
-/// No-op observer mode may add up to 140% overhead because every event still triggers callbacks
-/// and the identical `feed_start_with_observer` path shows modest variance across feature-gated
-/// test runs in CI, especially under `ref-count-return`.
-const NOOP_OVERHEAD_MAX_PERCENT: u128 = 240;
-
-/// Execution mode used by the observer-overhead benchmark.
-///
-/// `Baseline` starts runs with `MontyRun::start`, while `Observer` uses
-/// `MontyRun::start_with_observer`. The benchmark then evaluates both variants through the same
-/// `RunProgress` completion/assertion shape so the comparison isolates observer cost rather than
-/// diverging test logic.
-#[derive(Debug, Clone, Copy)]
-enum BenchmarkMode {
-    Baseline,
-    Observer(ObserverMode),
-}
-
-/// Builds a fresh runner for the given Track A script using a stable test filename.
-fn build_run(script: &str) -> MontyRun {
-    MontyRun::new(script.to_owned(), "track_a.py", vec![]).expect("runner creation should succeed")
-}
-
-/// Starts a run in either baseline or observer-aware mode and returns its first progress value.
-fn start_run_with_mode(run: &MontyRun, mode: BenchmarkMode, print: PrintWriter<'_>) -> RunProgress<NoLimitTracker> {
-    match mode {
-        BenchmarkMode::Baseline => run
-            .clone()
-            .start(vec![], NoLimitTracker, print)
-            .expect("baseline start should succeed"),
-        BenchmarkMode::Observer(observer_mode) => run
-            .clone()
-            .start_with_observer(vec![], NoLimitTracker, print, observer_mode.handle())
-            .expect("observer-aware start should succeed"),
-    }
-}
 
 /// Starts a REPL snippet with the requested observer mode and returns the first progress value.
 fn start_repl_with_mode(
@@ -122,72 +65,6 @@ fn assert_repl_complete_progress(
             .expect("follow-up snippet should succeed"),
         *expected_follow_up
     );
-}
-
-/// Cross-process guard that holds the Track A benchmark lock file for the current test scope.
-struct TrackATestGuard {
-    _file: Flock<File>,
-}
-
-/// Returns the stable lock-file path used to serialize Track A tests across processes.
-fn track_a_lock_path() -> &'static PathBuf {
-    static LOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
-    LOCK_PATH.get_or_init(|| std::env::temp_dir().join("full-monty-track-a.lock"))
-}
-
-/// Serializes Track A tests across threads and test binaries to keep benchmark runs isolated.
-fn track_a_test_guard() -> TrackATestGuard {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(track_a_lock_path())
-        .expect("track-a lock file should open");
-    let file = Flock::lock(file, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .expect("track-a lock file should lock exclusively");
-    TrackATestGuard { _file: file }
-}
-
-/// Measures the median nanoseconds for one benchmark attempt in the requested execution mode.
-fn median_ns(mode: BenchmarkMode) -> u128 {
-    let run = build_run(BENCHMARK_SCRIPT);
-    let mut durations = Vec::with_capacity(BENCHMARK_SAMPLES);
-
-    for _ in 0..BENCHMARK_WARMUP_RUNS {
-        let _ = black_box(run_benchmark_iteration(&run, mode));
-    }
-
-    for _ in 0..BENCHMARK_SAMPLES {
-        let start = Instant::now();
-        let result = run_benchmark_iteration(&run, mode);
-        let elapsed = start.elapsed().as_nanos();
-        assert_eq!(result, MontyObject::Int(665_000));
-        durations.push(elapsed);
-    }
-
-    durations.sort_unstable();
-    durations[durations.len() / 2]
-}
-
-/// Repeats `median_ns` and returns the median of medians to reduce noise in CI environments.
-fn stable_median_ns(mode: BenchmarkMode) -> u128 {
-    let mut medians = Vec::with_capacity(BENCHMARK_ATTEMPTS);
-    for _ in 0..BENCHMARK_ATTEMPTS {
-        medians.push(median_ns(mode));
-    }
-    medians.sort_unstable();
-    medians[medians.len() / 2]
-}
-
-/// Executes one benchmark iteration through the start/resume path used by Track A comparisons.
-fn run_benchmark_iteration(run: &MontyRun, mode: BenchmarkMode) -> MontyObject {
-    let progress = start_run_with_mode(run, mode, PrintWriter::Disabled);
-    let Some(value) = progress.into_complete() else {
-        panic!("benchmark script should complete without suspension");
-    };
-    value
 }
 
 /// Verifies observer run modes suspend on the same function call and resume to the same output.
@@ -392,24 +269,4 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
     assert_repl_complete_progress(baseline_resume, &MontyObject::None, "seed", &MontyObject::Int(10));
     assert_repl_complete_progress(observer_resume, &MontyObject::None, "seed", &MontyObject::Int(10));
     assert_eq!(baseline_output, observer_output);
-}
-
-/// Verifies the disabled observer handle stays within the Track A overhead budget.
-#[test]
-fn track_a_overhead_disabled_within_budget() {
-    let _guard = track_a_test_guard();
-    let baseline = stable_median_ns(BenchmarkMode::Baseline);
-    let disabled = stable_median_ns(BenchmarkMode::Observer(ObserverMode::DisabledHandle));
-    println!("track_a_overhead disabled baseline_ns={baseline} observed_ns={disabled}");
-    assert!(disabled * 100 <= baseline * DISABLED_OVERHEAD_MAX_PERCENT);
-}
-
-/// Verifies the no-op observer stays within the looser Track A overhead budget under full events.
-#[test]
-fn track_a_overhead_noop_within_budget() {
-    let _guard = track_a_test_guard();
-    let baseline = stable_median_ns(BenchmarkMode::Baseline);
-    let noop = stable_median_ns(BenchmarkMode::Observer(ObserverMode::NoopObserver));
-    println!("track_a_overhead noop baseline_ns={baseline} observed_ns={noop}");
-    assert!(noop * 100 <= baseline * NOOP_OVERHEAD_MAX_PERCENT);
 }

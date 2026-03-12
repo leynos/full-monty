@@ -55,6 +55,8 @@ rstest-bdd-macros = { version = "0.5.0", features = ["compile-time-validation"] 
 serde_json = "1.0"
 pprof = { version = "0.15", features = ["flamegraph", "criterion"] }
 similar = "2.7.0"
+
+[target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.30.1", features = ["fs"] }
 
 [build-dependencies]

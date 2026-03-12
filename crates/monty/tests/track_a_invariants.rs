@@ -199,7 +199,7 @@ fn run_observer_modes_match_baseline_function_call_and_completion(#[case] mode: 
 
     assert_complete_progress(baseline_resume, &MontyObject::None);
     assert_complete_progress(observer_resume, &MontyObject::None);
-    assert_eq!(baseline_output.clone(), observer_output.clone());
+    assert_eq!(baseline_output, observer_output);
 }
 
 #[rstest]
@@ -262,7 +262,7 @@ fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
 
     assert_complete_progress(baseline_resume, &MontyObject::None);
     assert_complete_progress(observer_resume, &MontyObject::None);
-    assert_eq!(baseline_output.clone(), observer_output.clone());
+    assert_eq!(baseline_output, observer_output);
 }
 
 #[rstest]
@@ -364,7 +364,7 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
 
     assert_repl_complete_progress(baseline_resume, &MontyObject::None, "seed", &MontyObject::Int(10));
     assert_repl_complete_progress(observer_resume, &MontyObject::None, "seed", &MontyObject::Int(10));
-    assert_eq!(baseline_output.clone(), observer_output.clone());
+    assert_eq!(baseline_output, observer_output);
 }
 
 #[test]

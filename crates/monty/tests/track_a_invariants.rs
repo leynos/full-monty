@@ -34,13 +34,19 @@ const REPL_SNAPSHOT_SNIPPET: &str = "print(ext_fn(seed + 1))";
 /// Snapshot extension bytes used to verify round-trip preservation through REPL dump/load.
 const SNAPSHOT_EXTENSION_BYTES: &[u8] = &[1, 3, 5, 7];
 
-/// Starts a REPL snippet with the requested observer mode and returns the first progress value.
+/// Starts a REPL snippet in baseline or observer-aware mode and returns the first progress value.
 fn start_repl_with_mode(
     repl: MontyRepl<NoLimitTracker>,
     snippet: &str,
-    mode: ObserverMode,
+    mode: BenchmarkMode,
+    writer: PrintWriter<'_>,
 ) -> Result<ReplProgress<NoLimitTracker>, Box<ReplStartError<NoLimitTracker>>> {
-    repl.feed_start_with_observer(snippet, Vec::new(), PrintWriter::Disabled, mode.handle())
+    match mode {
+        BenchmarkMode::Baseline => repl.feed_start(snippet, Vec::new(), writer),
+        BenchmarkMode::Observer(observer_mode) => {
+            repl.feed_start_with_observer(snippet, Vec::new(), writer, observer_mode.handle())
+        }
+    }
 }
 
 /// Asserts that a run completed successfully with the expected final value.
@@ -213,13 +219,22 @@ fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode, tr
 #[case(ObserverMode::NoopObserver)]
 fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
-    let baseline_progress = baseline_repl
-        .feed_start(REPL_COMPLETE_SNIPPET, Vec::new(), PrintWriter::Disabled)
-        .expect("baseline REPL start should succeed");
+    let baseline_progress = start_repl_with_mode(
+        baseline_repl,
+        REPL_COMPLETE_SNIPPET,
+        BenchmarkMode::Baseline,
+        PrintWriter::Disabled,
+    )
+    .expect("baseline REPL start should succeed");
 
     let observer_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
-    let observer_progress = start_repl_with_mode(observer_repl, REPL_COMPLETE_SNIPPET, mode)
-        .expect("observer-aware REPL start should succeed");
+    let observer_progress = start_repl_with_mode(
+        observer_repl,
+        REPL_COMPLETE_SNIPPET,
+        BenchmarkMode::Observer(mode),
+        PrintWriter::Disabled,
+    )
+    .expect("observer-aware REPL start should succeed");
 
     assert_repl_complete_progress(
         baseline_progress,
@@ -244,9 +259,13 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode, track_a
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
-    let baseline_progress = baseline_repl
-        .feed_start(REPL_SNAPSHOT_SNIPPET, Vec::new(), baseline_print.reborrow())
-        .expect("baseline REPL should suspend at function call");
+    let baseline_progress = start_repl_with_mode(
+        baseline_repl,
+        REPL_SNAPSHOT_SNIPPET,
+        BenchmarkMode::Baseline,
+        baseline_print.reborrow(),
+    )
+    .expect("baseline REPL should suspend at function call");
     let baseline_call = baseline_progress
         .into_function_call()
         .expect("baseline should suspend at function call");
@@ -254,14 +273,13 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode, track_a
     let observer_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut observer_output = String::new();
     let mut observer_print = PrintWriter::Collect(&mut observer_output);
-    let observer_progress = observer_repl
-        .feed_start_with_observer(
-            REPL_SNAPSHOT_SNIPPET,
-            Vec::new(),
-            observer_print.reborrow(),
-            mode.handle(),
-        )
-        .expect("observer-aware REPL should suspend at function call");
+    let observer_progress = start_repl_with_mode(
+        observer_repl,
+        REPL_SNAPSHOT_SNIPPET,
+        BenchmarkMode::Observer(mode),
+        observer_print.reborrow(),
+    )
+    .expect("observer-aware REPL should suspend at function call");
     let observer_call = observer_progress
         .into_function_call()
         .expect("observer-aware REPL should suspend at function call");

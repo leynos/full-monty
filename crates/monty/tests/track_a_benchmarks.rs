@@ -76,10 +76,9 @@ fn stable_median_ns(mode: BenchmarkMode) -> u128 {
 /// Executes one benchmark iteration through the start/resume path used by Track A comparisons.
 fn run_benchmark_iteration(run: &MontyRun, mode: BenchmarkMode) -> MontyObject {
     let progress = start_run_with_mode(run, mode, PrintWriter::Disabled);
-    let Some(value) = progress.into_complete() else {
-        panic!("benchmark script should complete without suspension");
-    };
-    value
+    progress
+        .into_complete()
+        .expect("benchmark script should complete without suspension")
 }
 
 /// Verifies each observer mode stays within its configured Track A overhead budget.

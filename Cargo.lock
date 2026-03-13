@@ -2043,6 +2043,7 @@ dependencies = [
  "itertools 0.14.0",
  "jiter",
  "libm",
+ "nix 0.30.1",
  "num-bigint",
  "num-integer",
  "num-traits",

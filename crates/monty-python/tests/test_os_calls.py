@@ -33,6 +33,7 @@ def test_path_exists_yields_oscall():
     assert len(result.arg_runtime_ids) == len(result.args)
     assert result.kwarg_runtime_ids == snapshot([])
 
+
 def test_os_call_runtime_ids_survive_snapshot_dump_load():
     """OS-call runtime IDs are preserved when dumping/loading FunctionSnapshot."""
     m = pydantic_monty.Monty('from pathlib import Path; Path("/tmp/test.txt").exists()')

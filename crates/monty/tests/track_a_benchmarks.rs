@@ -4,7 +4,7 @@
 
 use std::{hint::black_box, time::Instant};
 
-use monty::{MontyObject, PrintWriter};
+use monty::{MontyObject, MontyRun, PrintWriter};
 use rstest::rstest;
 use test_utils::ObserverMode;
 use track_a_test_utils::{BenchmarkMode, build_run, start_run_with_mode, track_a_test_guard};
@@ -74,7 +74,7 @@ fn stable_median_ns(mode: BenchmarkMode) -> u128 {
 }
 
 /// Executes one benchmark iteration through the start/resume path used by Track A comparisons.
-fn run_benchmark_iteration(run: &monty::MontyRun, mode: BenchmarkMode) -> MontyObject {
+fn run_benchmark_iteration(run: &MontyRun, mode: BenchmarkMode) -> MontyObject {
     let progress = start_run_with_mode(run, mode, PrintWriter::Disabled);
     let Some(value) = progress.into_complete() else {
         panic!("benchmark script should complete without suspension");

@@ -110,7 +110,7 @@ fn track_a_guard() -> TrackATestGuard {
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_function_call_and_completion(
     #[case] mode: ObserverMode,
-    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
+    track_a_guard: TrackATestGuard,
 ) {
     let run = build_run(FUNCTION_CALL_SCRIPT);
     let mut baseline_output = String::new();
@@ -146,10 +146,7 @@ fn run_observer_modes_match_baseline_function_call_and_completion(
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn run_observer_modes_match_baseline_error_path(
-    #[case] mode: ObserverMode,
-    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
-) {
+fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let run = build_run(ERROR_SCRIPT);
     let baseline_progress = start_run_with_mode(&run, BenchmarkMode::Baseline, PrintWriter::Disabled);
     let baseline_call = baseline_progress
@@ -179,10 +176,7 @@ fn run_observer_modes_match_baseline_error_path(
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn run_observer_modes_match_baseline_os_call_path(
-    #[case] mode: ObserverMode,
-    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
-) {
+fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let run = build_run(OS_CALL_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
@@ -217,10 +211,7 @@ fn run_observer_modes_match_baseline_os_call_path(
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn repl_observer_modes_match_baseline_completion(
-    #[case] mode: ObserverMode,
-    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
-) {
+fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let baseline_progress = baseline_repl
         .feed_start(REPL_COMPLETE_SNIPPET, Vec::new(), PrintWriter::Disabled)
@@ -249,10 +240,7 @@ fn repl_observer_modes_match_baseline_completion(
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn repl_snapshot_round_trip_matches_baseline(
-    #[case] mode: ObserverMode,
-    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
-) {
+fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);

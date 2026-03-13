@@ -6,11 +6,11 @@ use monty::{
     ExtFunctionResult, MontyException, MontyObject, MontyRepl, NoLimitTracker, PrintWriter, ReplProgress,
     ReplStartError, RunProgress,
 };
-use rstest::rstest;
+use rstest::{fixture, rstest};
 use test_utils::{
     ObserverMode, assert_exceptions_equal, assert_function_calls_equal, assert_os_calls_equal, init_repl,
 };
-use track_a_test_utils::{BenchmarkMode, build_run, start_run_with_mode, track_a_test_guard};
+use track_a_test_utils::{BenchmarkMode, TrackATestGuard, build_run, start_run_with_mode, track_a_test_guard};
 
 #[path = "support/test_utils.rs"]
 mod test_utils;
@@ -67,12 +67,20 @@ fn assert_repl_complete_progress(
     );
 }
 
+/// Creates the cross-process Track A test guard so each rstest case holds the lock for its body.
+#[fixture]
+fn track_a_guard() -> TrackATestGuard {
+    track_a_test_guard()
+}
+
 /// Verifies observer run modes suspend on the same function call and resume to the same output.
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn run_observer_modes_match_baseline_function_call_and_completion(#[case] mode: ObserverMode) {
-    let _guard = track_a_test_guard();
+fn run_observer_modes_match_baseline_function_call_and_completion(
+    #[case] mode: ObserverMode,
+    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+) {
     let run = build_run(FUNCTION_CALL_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
@@ -106,8 +114,10 @@ fn run_observer_modes_match_baseline_function_call_and_completion(#[case] mode: 
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode) {
-    let _guard = track_a_test_guard();
+fn run_observer_modes_match_baseline_error_path(
+    #[case] mode: ObserverMode,
+    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+) {
     let run = build_run(ERROR_SCRIPT);
     let baseline_progress = start_run_with_mode(&run, BenchmarkMode::Baseline, PrintWriter::Disabled);
     let baseline_call = baseline_progress
@@ -136,8 +146,10 @@ fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode) {
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
-    let _guard = track_a_test_guard();
+fn run_observer_modes_match_baseline_os_call_path(
+    #[case] mode: ObserverMode,
+    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+) {
     let run = build_run(OS_CALL_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
@@ -171,8 +183,10 @@ fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode) {
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
-    let _guard = track_a_test_guard();
+fn repl_observer_modes_match_baseline_completion(
+    #[case] mode: ObserverMode,
+    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let baseline_progress = baseline_repl
         .feed_start(REPL_COMPLETE_SNIPPET, Vec::new(), PrintWriter::Disabled)
@@ -200,8 +214,10 @@ fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode) {
 #[rstest]
 #[case(ObserverMode::DisabledHandle)]
 #[case(ObserverMode::NoopObserver)]
-fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode) {
-    let _guard = track_a_test_guard();
+fn repl_snapshot_round_trip_matches_baseline(
+    #[case] mode: ObserverMode,
+    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
     let mut baseline_print = PrintWriter::Collect(&mut baseline_output);

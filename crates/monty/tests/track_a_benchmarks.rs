@@ -5,6 +5,7 @@
 use std::{hint::black_box, time::Instant};
 
 use monty::{MontyObject, PrintWriter};
+use rstest::rstest;
 use test_utils::ObserverMode;
 use track_a_test_utils::{BenchmarkMode, build_run, start_run_with_mode, track_a_test_guard};
 
@@ -80,22 +81,14 @@ fn run_benchmark_iteration(run: &monty::MontyRun, mode: BenchmarkMode) -> MontyO
     value
 }
 
-/// Verifies the disabled observer handle stays within the Track A overhead budget.
-#[test]
-fn track_a_overhead_disabled_within_budget() {
+/// Verifies each observer mode stays within its configured Track A overhead budget.
+#[rstest]
+#[case(ObserverMode::DisabledHandle, DISABLED_OVERHEAD_MAX_PERCENT)]
+#[case(ObserverMode::NoopObserver, NOOP_OVERHEAD_MAX_PERCENT)]
+fn track_a_overhead_within_budget(#[case] mode: ObserverMode, #[case] max_percent: u128) {
     let _guard = track_a_test_guard();
     let baseline = stable_median_ns(BenchmarkMode::Baseline);
-    let disabled = stable_median_ns(BenchmarkMode::Observer(ObserverMode::DisabledHandle));
-    println!("track_a_overhead disabled baseline_ns={baseline} observed_ns={disabled}");
-    assert!(disabled * 100 <= baseline * DISABLED_OVERHEAD_MAX_PERCENT);
-}
-
-/// Verifies the no-op observer stays within the looser Track A overhead budget under full events.
-#[test]
-fn track_a_overhead_noop_within_budget() {
-    let _guard = track_a_test_guard();
-    let baseline = stable_median_ns(BenchmarkMode::Baseline);
-    let noop = stable_median_ns(BenchmarkMode::Observer(ObserverMode::NoopObserver));
-    println!("track_a_overhead noop baseline_ns={baseline} observed_ns={noop}");
-    assert!(noop * 100 <= baseline * NOOP_OVERHEAD_MAX_PERCENT);
+    let observed = stable_median_ns(BenchmarkMode::Observer(mode));
+    println!("track_a_overhead {mode:?} baseline_ns={baseline} observed_ns={observed}");
+    assert!(observed * 100 <= baseline * max_percent);
 }

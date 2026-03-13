@@ -1,10 +1,12 @@
 #![cfg(unix)]
 
-//! Compatibility and overhead checks for Track A observer modes.
+//! Compatibility invariants for Track A observer modes.
+//!
+//! Overhead and benchmark coverage lives in `crates/monty/tests/track_a_benchmarks.rs`.
 
 use monty::{
     ExtFunctionResult, MontyException, MontyObject, MontyRepl, NoLimitTracker, PrintWriter, ReplProgress,
-    ReplStartError, RunProgress,
+    ReplStartError, RunProgress, RuntimeValueId,
 };
 use rstest::{fixture, rstest};
 use test_utils::{
@@ -67,6 +69,35 @@ fn assert_repl_complete_progress(
     );
 }
 
+/// Owned comparison key for verifying REPL function-call payloads survive dump/load unchanged.
+#[derive(Debug, PartialEq)]
+struct ReplFunctionCallKey {
+    function_name: String,
+    args: Vec<MontyObject>,
+    kwargs: Vec<(MontyObject, MontyObject)>,
+    call_id: u32,
+    method_call: bool,
+    arg_runtime_ids: Vec<RuntimeValueId>,
+    kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+    snapshot_extension: Option<Vec<u8>>,
+}
+
+impl ReplFunctionCallKey {
+    /// Captures the observable REPL function-call payload and snapshot metadata for round-trip checks.
+    fn from_call(call: &monty::ReplFunctionCall<NoLimitTracker>) -> Self {
+        Self {
+            function_name: call.function_name.clone(),
+            args: call.args.clone(),
+            kwargs: call.kwargs.clone(),
+            call_id: call.call_id,
+            method_call: call.method_call,
+            arg_runtime_ids: call.arg_runtime_ids.clone(),
+            kwarg_runtime_ids: call.kwarg_runtime_ids.clone(),
+            snapshot_extension: call.snapshot_extension().map(|ext| ext.as_slice().to_vec()),
+        }
+    }
+}
+
 /// Creates the cross-process Track A test guard so each rstest case holds the lock for its body.
 #[fixture]
 fn track_a_guard() -> TrackATestGuard {
@@ -79,7 +110,7 @@ fn track_a_guard() -> TrackATestGuard {
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_function_call_and_completion(
     #[case] mode: ObserverMode,
-    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
 ) {
     let run = build_run(FUNCTION_CALL_SCRIPT);
     let mut baseline_output = String::new();
@@ -108,6 +139,7 @@ fn run_observer_modes_match_baseline_function_call_and_completion(
     assert_complete_progress(baseline_resume, &MontyObject::None);
     assert_complete_progress(observer_resume, &MontyObject::None);
     assert_eq!(baseline_output, observer_output);
+    drop(track_a_guard);
 }
 
 /// Verifies observer run modes propagate resumed external-call errors exactly like baseline runs.
@@ -116,7 +148,7 @@ fn run_observer_modes_match_baseline_function_call_and_completion(
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_error_path(
     #[case] mode: ObserverMode,
-    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
 ) {
     let run = build_run(ERROR_SCRIPT);
     let baseline_progress = start_run_with_mode(&run, BenchmarkMode::Baseline, PrintWriter::Disabled);
@@ -140,6 +172,7 @@ fn run_observer_modes_match_baseline_error_path(
         .expect_err("observer-aware resume should error");
 
     assert_exceptions_equal(&baseline_error, &observer_error);
+    drop(track_a_guard);
 }
 
 /// Verifies observer run modes expose identical OS-call suspensions and resumed output.
@@ -148,7 +181,7 @@ fn run_observer_modes_match_baseline_error_path(
 #[case(ObserverMode::NoopObserver)]
 fn run_observer_modes_match_baseline_os_call_path(
     #[case] mode: ObserverMode,
-    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
 ) {
     let run = build_run(OS_CALL_SCRIPT);
     let mut baseline_output = String::new();
@@ -177,6 +210,7 @@ fn run_observer_modes_match_baseline_os_call_path(
     assert_complete_progress(baseline_resume, &MontyObject::None);
     assert_complete_progress(observer_resume, &MontyObject::None);
     assert_eq!(baseline_output, observer_output);
+    drop(track_a_guard);
 }
 
 /// Verifies observer-aware REPL completion preserves the same state transitions as baseline REPLs.
@@ -185,7 +219,7 @@ fn run_observer_modes_match_baseline_os_call_path(
 #[case(ObserverMode::NoopObserver)]
 fn repl_observer_modes_match_baseline_completion(
     #[case] mode: ObserverMode,
-    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
 ) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let baseline_progress = baseline_repl
@@ -208,6 +242,7 @@ fn repl_observer_modes_match_baseline_completion(
         "seed + 1",
         &MontyObject::Int(12),
     );
+    drop(track_a_guard);
 }
 
 /// Verifies REPL snapshot dump/load preserves observer-visible function-call state and output.
@@ -216,7 +251,7 @@ fn repl_observer_modes_match_baseline_completion(
 #[case(ObserverMode::NoopObserver)]
 fn repl_snapshot_round_trip_matches_baseline(
     #[case] mode: ObserverMode,
-    #[expect(unused_variables, reason = "fixture guard is held for the full test body")] track_a_guard: TrackATestGuard,
+    #[from(track_a_guard)] track_a_guard: TrackATestGuard,
 ) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
@@ -245,14 +280,16 @@ fn repl_snapshot_round_trip_matches_baseline(
 
     assert_function_calls_equal(&baseline_call, &observer_call);
 
-    let baseline_bytes =
-        ReplProgress::FunctionCall(baseline_call.with_snapshot_extension(SNAPSHOT_EXTENSION_BYTES.to_vec()))
-            .dump()
-            .expect("baseline progress should dump");
+    let baseline_dump_call = baseline_call.with_snapshot_extension(SNAPSHOT_EXTENSION_BYTES.to_vec());
+    let baseline_dump_key = ReplFunctionCallKey::from_call(&baseline_dump_call);
+    let baseline_bytes = ReplProgress::FunctionCall(baseline_dump_call)
+        .dump()
+        .expect("baseline progress should dump");
     let baseline_loaded = ReplProgress::<NoLimitTracker>::load(&baseline_bytes).expect("baseline load should succeed");
     let baseline_loaded_call = baseline_loaded
         .into_function_call()
         .expect("loaded baseline should stay suspended");
+    assert_eq!(ReplFunctionCallKey::from_call(&baseline_loaded_call), baseline_dump_key);
     assert_eq!(
         baseline_loaded_call
             .snapshot_extension()
@@ -260,14 +297,16 @@ fn repl_snapshot_round_trip_matches_baseline(
         Some(SNAPSHOT_EXTENSION_BYTES)
     );
 
-    let observer_bytes =
-        ReplProgress::FunctionCall(observer_call.with_snapshot_extension(SNAPSHOT_EXTENSION_BYTES.to_vec()))
-            .dump()
-            .expect("observer-aware progress should dump");
+    let observer_dump_call = observer_call.with_snapshot_extension(SNAPSHOT_EXTENSION_BYTES.to_vec());
+    let observer_dump_key = ReplFunctionCallKey::from_call(&observer_dump_call);
+    let observer_bytes = ReplProgress::FunctionCall(observer_dump_call)
+        .dump()
+        .expect("observer-aware progress should dump");
     let observer_loaded = ReplProgress::<NoLimitTracker>::load(&observer_bytes).expect("observer load should succeed");
     let observer_loaded_call = observer_loaded
         .into_function_call()
         .expect("loaded observer-aware progress should stay suspended");
+    assert_eq!(ReplFunctionCallKey::from_call(&observer_loaded_call), observer_dump_key);
     assert_eq!(
         observer_loaded_call
             .snapshot_extension()
@@ -285,4 +324,5 @@ fn repl_snapshot_round_trip_matches_baseline(
     assert_repl_complete_progress(baseline_resume, &MontyObject::None, "seed", &MontyObject::Int(10));
     assert_repl_complete_progress(observer_resume, &MontyObject::None, "seed", &MontyObject::Int(10));
     assert_eq!(baseline_output, observer_output);
+    drop(track_a_guard);
 }

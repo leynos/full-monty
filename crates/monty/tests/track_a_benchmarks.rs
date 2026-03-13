@@ -37,8 +37,9 @@ const BENCHMARK_ATTEMPTS: usize = 3;
 /// Disabled observer mode may add at most 20% overhead because it should stay close to baseline.
 const DISABLED_OVERHEAD_MAX_PERCENT: u128 = 120;
 /// No-op observer mode may add up to 140% overhead because every event still triggers callbacks
-/// and the identical `feed_start_with_observer` path shows modest variance across feature-gated
-/// test runs in CI, especially under `ref-count-return`.
+/// and `start_run_with_mode(...)` exercises the real `MontyRun::start_with_observer(...)` path,
+/// which shows modest variance across feature-gated test runs in CI, especially under
+/// `ref-count-return`.
 const NOOP_OVERHEAD_MAX_PERCENT: u128 = 240;
 
 /// Measures the median nanoseconds for one benchmark attempt in the requested execution mode.

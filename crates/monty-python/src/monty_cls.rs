@@ -1344,7 +1344,7 @@ impl PyFunctionSnapshot {
 
     /// Serializes the FunctionSnapshot instance to a binary format.
     ///
-    /// The serialized data can be stored and later restored with `load_snapshot()`
+    /// The serialized data can be stored and later restored with `FunctionSnapshot.load()`
     /// or `load_repl_snapshot()`. REPL snapshots automatically include the REPL state.
     ///
     /// Note: The `print_callback` is not serialized and must be re-provided when loading.
@@ -1368,6 +1368,28 @@ impl PyFunctionSnapshot {
             self.call_id,
         )?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Deserializes a `FunctionSnapshot` instance from binary format.
+    ///
+    /// Note: The `print_callback` is not preserved during serialization and
+    /// must be re-provided as a keyword argument if print output is needed.
+    ///
+    /// # Raises
+    /// `ValueError` if deserialization fails or the payload contains another snapshot type.
+    #[staticmethod]
+    #[pyo3(signature = (data, *, print_callback=None, dataclass_registry=None))]
+    fn load<'py>(
+        py: Python<'py>,
+        data: &Bound<'_, PyBytes>,
+        print_callback: Option<&Bound<'_, PyAny>>,
+        dataclass_registry: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let snapshot = serialization::load_snapshot(py, data, print_callback, dataclass_registry)?;
+        snapshot
+            .extract::<PyRef<'_, Self>>()
+            .map_err(|_| PyValueError::new_err("Serialized data does not contain a FunctionSnapshot"))?;
+        Ok(snapshot)
     }
 
     /// Converts the stored Monty args into a Python `tuple` on each access.

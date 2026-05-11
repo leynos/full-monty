@@ -1239,11 +1239,11 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                     let value = self.pop();
                     let branch_taken = !value.py_bool(self);
                     self.emit_control_condition(&value, branch_taken);
-                    if !branch_taken {
-                        value.drop_with_heap(self);
-                    } else {
+                    if branch_taken {
                         self.push(value);
                         jump_relative!(cached_frame.ip, offset);
+                    } else {
+                        value.drop_with_heap(self);
                     }
                 }
                 // Iteration - route through exception handling

@@ -1,6 +1,6 @@
 //! Integration tests for generic runtime observer events.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRepl, MontyRun,
@@ -91,7 +91,7 @@ impl RecordingObserver {
 
 impl RuntimeObserver for RecordingObserver {
     fn on_event(&mut self, event: RuntimeObserverEvent<'_>) {
-        let mut events = self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
         events.push(RecordedEvent::from_runtime_event(event));
     }
 }
@@ -110,7 +110,7 @@ fn build_recording_observer() -> (RuntimeObserverHandle, Arc<Mutex<Vec<RecordedE
 /// Poisoned mutexes are recovered by taking the inner value so assertions can still inspect
 /// partially recorded state from failing execution paths.
 fn read_events(events: &Arc<Mutex<Vec<RecordedEvent>>>) -> Vec<RecordedEvent> {
-    events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    events.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 #[fixture]

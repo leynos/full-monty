@@ -31,10 +31,16 @@ pub(crate) enum ArgValues {
 /// Host-facing external call arguments plus stable runtime IDs.
 pub(crate) struct HostCallArgs {
     pub args: Vec<MontyObject>,
-    pub kwargs: Vec<(MontyObject, MontyObject)>,
+    pub kwargs: HostKwargs,
     pub arg_runtime_ids: Vec<RuntimeValueId>,
-    pub kwarg_runtime_ids: Vec<(RuntimeValueId, RuntimeValueId)>,
+    pub kwarg_runtime_ids: KwargRuntimeIds,
 }
+
+/// Host-facing keyword argument pairs in Monty's object representation.
+type HostKwargs = Vec<(MontyObject, MontyObject)>;
+
+/// Stable runtime IDs for host-facing keyword argument key/value pairs.
+type KwargRuntimeIds = Vec<(RuntimeValueId, RuntimeValueId)>;
 
 impl ArgValues {
     /// Checks that zero arguments were passed.
@@ -549,10 +555,7 @@ impl KwargsValues {
     }
 
     /// Converts keyword arguments into host values and their runtime IDs.
-    fn into_py_objects_with_runtime_ids(
-        self,
-        vm: &mut VM<'_, impl ResourceTracker>,
-    ) -> (Vec<(MontyObject, MontyObject)>, Vec<(RuntimeValueId, RuntimeValueId)>) {
+    fn into_py_objects_with_runtime_ids(self, vm: &mut VM<'_, impl ResourceTracker>) -> (HostKwargs, KwargRuntimeIds) {
         match self {
             Self::Empty => (vec![], vec![]),
             Self::Inline(kvs) => kvs

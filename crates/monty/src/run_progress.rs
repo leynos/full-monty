@@ -486,18 +486,22 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             pending_call_ids,
         } = self;
 
-        let vm_state = HeapReader::with(&mut heap, &mut (&executor, &observer), |reader, (executor, observer)| {
-            let mut vm = VM::restore_with_observer(
-                vm_state,
-                &executor.module_code,
-                reader,
-                &executor.interns,
-                PrintWriter::Stdout,
-                (*observer).clone(),
-            );
-            vm.__force_gc_for_tests();
-            vm.snapshot()
-        });
+        let vm_state = HeapReader::with(
+            &mut heap,
+            &mut (&executor, &observer),
+            |reader, (executor, observer)| {
+                let mut vm = VM::restore_with_observer(
+                    vm_state,
+                    &executor.module_code,
+                    reader,
+                    &executor.interns,
+                    PrintWriter::Stdout,
+                    (*observer).clone(),
+                );
+                vm.__force_gc_for_tests();
+                vm.snapshot()
+            },
+        );
 
         Self::new(executor, vm_state, heap, observer, pending_call_ids)
     }
@@ -632,8 +636,10 @@ impl<T: ResourceTracker> Snapshot<T> {
 
         emit_external_call_returned(pending_call_id, &ext_result, &observer);
 
-        let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
+        let (converted, vm_state) = HeapReader::with(
+            &mut heap,
+            &mut (&executor, print, &observer),
+            |reader, (executor, print, observer)| {
                 let mut vm = VM::restore_with_observer(
                     vm_state,
                     &executor.module_code,
@@ -661,7 +667,8 @@ impl<T: ResourceTracker> Snapshot<T> {
                 let converted = convert_frame_exit(vm_result, &mut vm);
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 (converted, vm_state)
-            });
+            },
+        );
         build_run_progress(converted, vm_state, executor, heap, observer, extension_bytes.as_ref())
     }
 

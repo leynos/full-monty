@@ -174,33 +174,37 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         this.ensure_globals_size(executor.namespace_size);
 
-        match HeapReader::with(&mut this.heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
-            let mut vm = VM::new_with_observer(
-                mem::take(&mut this.globals),
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                (*observer).clone(),
-            );
+        match HeapReader::with(
+            &mut this.heap,
+            &mut (&executor, print, &observer),
+            |reader, (executor, print, observer)| {
+                let mut vm = VM::new_with_observer(
+                    mem::take(&mut this.globals),
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    (*observer).clone(),
+                );
 
-            // Inject inputs with VM alive
-            if let Err(error) = inject_inputs_into_vm(executor, input_values, &mut vm) {
-                this.globals = vm.take_globals();
-                return Err(error);
-            }
+                // Inject inputs with VM alive
+                if let Err(error) = inject_inputs_into_vm(executor, input_values, &mut vm) {
+                    this.globals = vm.take_globals();
+                    return Err(error);
+                }
 
-            let vm_result = vm.run_module(&executor.module_code);
+                let vm_result = vm.run_module(&executor.module_code);
 
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                this.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    this.globals = vm.take_globals();
+                    None
+                };
+                Ok((converted, vm_state))
+            },
+        ) {
             Ok((converted, vm_state)) => build_repl_progress(converted, vm_state, executor, this, observer, None),
             Err(error) => Err(Box::new(ReplStartError { repl: this, error })),
         }
@@ -727,62 +731,66 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
             ..
         } = snapshot;
 
-        match HeapReader::with(&mut repl.heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
-            // Restore the VM first, then convert inside its lifetime
-            let mut vm = VM::restore_with_observer(
-                vm_state,
-                &executor.module_code,
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                (*observer).clone(),
-            );
+        match HeapReader::with(
+            &mut repl.heap,
+            &mut (&executor, print, &observer),
+            |reader, (executor, print, observer)| {
+                // Restore the VM first, then convert inside its lifetime
+                let mut vm = VM::restore_with_observer(
+                    vm_state,
+                    &executor.module_code,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    (*observer).clone(),
+                );
 
-            // Resolve the name lookup result with the VM alive
-            let vm_result = match result {
-                NameLookupResult::Value(obj) => {
-                    let value = match obj.to_value(&mut vm) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            repl.globals = vm.take_globals();
-                            return Err(MontyException::runtime_error(format!(
-                                "invalid name lookup result: {e}"
-                            )));
+                // Resolve the name lookup result with the VM alive
+                let vm_result = match result {
+                    NameLookupResult::Value(obj) => {
+                        let value = match obj.to_value(&mut vm) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                repl.globals = vm.take_globals();
+                                return Err(MontyException::runtime_error(format!(
+                                    "invalid name lookup result: {e}"
+                                )));
+                            }
+                        };
+
+                        // Cache the resolved value in the appropriate slot
+                        let slot = namespace_slot as usize;
+                        if is_global {
+                            let cloned = value.clone_with_heap(&vm);
+                            let old = mem::replace(&mut vm.globals[slot], cloned);
+                            old.drop_with_heap(&mut vm);
+                        } else {
+                            let stack_base = vm.current_stack_base();
+                            let cloned = value.clone_with_heap(&vm);
+                            let old = mem::replace(&mut vm.stack[stack_base + slot], cloned);
+                            old.drop_with_heap(&mut vm);
                         }
-                    };
 
-                    // Cache the resolved value in the appropriate slot
-                    let slot = namespace_slot as usize;
-                    if is_global {
-                        let cloned = value.clone_with_heap(&vm);
-                        let old = mem::replace(&mut vm.globals[slot], cloned);
-                        old.drop_with_heap(&mut vm);
-                    } else {
-                        let stack_base = vm.current_stack_base();
-                        let cloned = value.clone_with_heap(&vm);
-                        let old = mem::replace(&mut vm.stack[stack_base + slot], cloned);
-                        old.drop_with_heap(&mut vm);
+                        vm.push_created(value);
+                        vm.run()
                     }
+                    NameLookupResult::Undefined => {
+                        let err: RunError = ExcType::name_error(&name).into();
+                        vm.resume_with_exception(err)
+                    }
+                };
 
-                    vm.push_created(value);
-                    vm.run()
-                }
-                NameLookupResult::Undefined => {
-                    let err: RunError = ExcType::name_error(&name).into();
-                    vm.resume_with_exception(err)
-                }
-            };
-
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                repl.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    repl.globals = vm.take_globals();
+                    None
+                };
+                Ok((converted, vm_state))
+            },
+        ) {
             Ok((converted, vm_state)) => {
                 build_repl_progress(converted, vm_state, executor, repl, observer, extension_bytes.as_ref())
             }
@@ -881,35 +889,39 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
             .find(|(call_id, _)| !pending_call_ids.contains(call_id))
             .map(|(call_id, _)| *call_id);
 
-        match HeapReader::with(&mut repl.heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
-            let mut vm = VM::restore_with_observer(
-                vm_state,
-                &executor.module_code,
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                (*observer).clone(),
-            );
+        match HeapReader::with(
+            &mut repl.heap,
+            &mut (&executor, print, &observer),
+            |reader, (executor, print, observer)| {
+                let mut vm = VM::restore_with_observer(
+                    vm_state,
+                    &executor.module_code,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    (*observer).clone(),
+                );
 
-            if let Some(call_id) = invalid_call_id {
-                repl.globals = vm.take_globals();
-                return Err(MontyException::runtime_error(format!(
-                    "unknown call_id {call_id}, expected one of: {pending_call_ids:?}"
-                )));
-            }
+                if let Some(call_id) = invalid_call_id {
+                    repl.globals = vm.take_globals();
+                    return Err(MontyException::runtime_error(format!(
+                        "unknown call_id {call_id}, expected one of: {pending_call_ids:?}"
+                    )));
+                }
 
-            let vm_result = vm.resume_with_resolved_futures(results);
+                let vm_result = vm.resume_with_resolved_futures(results);
 
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                repl.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    repl.globals = vm.take_globals();
+                    None
+                };
+                Ok((converted, vm_state))
+            },
+        ) {
             Ok((converted, vm_state)) => {
                 build_repl_progress(converted, vm_state, executor, repl, observer, extension_bytes.as_ref())
             }
@@ -1063,8 +1075,10 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
         let ext_result = result.into();
         emit_external_call_returned(pending_call_id, &ext_result, &observer);
 
-        let (converted, vm_state) =
-            HeapReader::with(&mut repl.heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
+        let (converted, vm_state) = HeapReader::with(
+            &mut repl.heap,
+            &mut (&executor, print, &observer),
+            |reader, (executor, print, observer)| {
                 let mut vm = VM::restore_with_observer(
                     vm_state,
                     &executor.module_code,
@@ -1097,7 +1111,8 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
                     None
                 };
                 (converted, vm_state)
-            });
+            },
+        );
         build_repl_progress(converted, vm_state, executor, repl, observer, extension_bytes.as_ref())
     }
 

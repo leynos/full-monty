@@ -601,13 +601,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         interns: &'h Interns,
         print_writer: PrintWriter<'h>,
     ) -> Self {
-        Self::new_with_observer(
-            globals,
-            heap,
-            interns,
-            print_writer,
-            RuntimeObserverHandle::disabled(),
-        )
+        Self::new_with_observer(globals, heap, interns, print_writer, RuntimeObserverHandle::disabled())
     }
 
     /// Creates a new VM with an explicit runtime observer.
@@ -647,6 +641,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
     /// * `heap` - The deserialized heap
     /// * `interns` - Interns for looking up function code
     /// * `print_writer` - Writer for print output
+    #[expect(dead_code, reason = "kept as the observer-free restore convenience API")]
     pub fn restore(
         snapshot: VMSnapshot,
         module_code: &'h Code,

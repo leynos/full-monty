@@ -174,8 +174,10 @@ impl MontyRun {
         // Create heap and VM with empty globals, then populate inputs with VM alive
         let mut heap = Heap::new(executor.namespace_size, resource_tracker);
         let globals = executor.empty_globals();
-        let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print, &observer), |reader, (executor, print, observer)| {
+        let (converted, vm_state) = HeapReader::with(
+            &mut heap,
+            &mut (&executor, print, &observer),
+            |reader, (executor, print, observer)| {
                 let mut vm = VM::new_with_observer(
                     globals,
                     reader,
@@ -192,7 +194,8 @@ impl MontyRun {
                 let converted = convert_frame_exit(vm_result, &mut vm);
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 Ok((converted, vm_state))
-            })?;
+            },
+        )?;
         build_run_progress(converted, vm_state, executor, heap, observer, None)
     }
 }

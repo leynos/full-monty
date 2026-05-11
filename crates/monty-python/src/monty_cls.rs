@@ -1046,26 +1046,21 @@ pub struct PyFunctionSnapshot {
 
     /// Name of the script being executed
     #[pyo3(get)]
-
     pub script_name: String,
 
     /// Whether this call refers to an OS function
     #[pyo3(get)]
-
     pub is_os_function: bool,
 
     /// Whether this call is a dataclass method call (first arg is `self`)
     #[pyo3(get)]
-
     pub is_method_call: bool,
 
     /// The name of the function being called.
     #[pyo3(get)]
-
     pub function_name: String,
     /// The unique identifier for this call
     #[pyo3(get)]
-
     pub call_id: u32,
 
     /// Stable runtime IDs for positional args in `args` order.

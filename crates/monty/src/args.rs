@@ -316,25 +316,6 @@ impl ArgValues {
         ExcType::type_error_no_kwargs(method_name)
     }
 
-    /// Converts the arguments into a Vec of MontyObjects.
-    ///
-    /// This is used when passing arguments to external functions.
-    pub fn into_py_objects(
-        self,
-        vm: &mut VM<'_, impl ResourceTracker>,
-    ) -> (Vec<MontyObject>, Vec<(MontyObject, MontyObject)>) {
-        match self {
-            Self::Empty => (vec![], vec![]),
-            Self::One(a) => (vec![MontyObject::new(a, vm)], vec![]),
-            Self::Two(a1, a2) => (vec![MontyObject::new(a1, vm), MontyObject::new(a2, vm)], vec![]),
-            Self::Kwargs(kwargs) => (vec![], kwargs.into_py_objects(vm)),
-            Self::ArgsKargs { args, kwargs } => (
-                args.into_iter().map(|v| MontyObject::new(v, vm)).collect(),
-                kwargs.into_py_objects(vm),
-            ),
-        }
-    }
-
     /// Converts arguments into host values and their runtime IDs.
     ///
     /// The runtime IDs are host-facing instrumentation metadata used to track
@@ -565,27 +546,6 @@ impl KwargsValues {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Converts the arguments into a Vec of MontyObjects.
-    ///
-    /// This is used when passing arguments to external functions.
-    fn into_py_objects(self, vm: &mut VM<'_, impl ResourceTracker>) -> Vec<(MontyObject, MontyObject)> {
-        match self {
-            Self::Empty => vec![],
-            Self::Inline(kvs) => kvs
-                .into_iter()
-                .map(|(k, v)| {
-                    let key = MontyObject::String(vm.interns.get_str(k).to_owned());
-                    let value = MontyObject::new(v, vm);
-                    (key, value)
-                })
-                .collect(),
-            Self::Dict(dict) => dict
-                .into_iter()
-                .map(|(k, v)| (MontyObject::new(k, vm), MontyObject::new(v, vm)))
-                .collect(),
-        }
     }
 
     /// Converts keyword arguments into host values and their runtime IDs.

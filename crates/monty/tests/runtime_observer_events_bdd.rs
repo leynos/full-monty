@@ -1,6 +1,6 @@
 //! Behavioural coverage for generic runtime observer events.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use monty::{
     ExcType, ExternalCallKind, ExternalCallReturnKind, MontyException, MontyObject, MontyRun, NoLimitTracker,
@@ -64,10 +64,7 @@ impl RecordingObserver {
 impl RuntimeObserver for RecordingObserver {
     fn on_event(&mut self, event: RuntimeObserverEvent<'_>) {
         if let Some(record) = RecordedEvent::from_runtime_event(event) {
-            self.events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(record);
+            self.events.lock().unwrap_or_else(PoisonError::into_inner).push(record);
         }
     }
 }
@@ -200,7 +197,7 @@ fn start_and_resume_generic<R, A>(
     drop(fixture.observer);
     world
         .events
-        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        .clone_from(&fixture.events.lock().unwrap_or_else(PoisonError::into_inner));
 }
 
 /// Provides a script that pauses at one external call.
@@ -239,7 +236,7 @@ fn when_start_and_complete(world: &mut RuntimeObserverWorld) {
     drop(fixture.observer);
     world
         .events
-        .clone_from(&fixture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        .clone_from(&fixture.events.lock().unwrap_or_else(PoisonError::into_inner));
 }
 
 /// Starts execution with an observer and resumes with an external exception.

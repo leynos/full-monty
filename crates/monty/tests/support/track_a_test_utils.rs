@@ -1,6 +1,7 @@
 //! Shared helpers for Track A observer integration tests and benchmarks.
 
 use std::{
+    env::temp_dir,
     fs::{File, OpenOptions},
     path::PathBuf,
     sync::OnceLock,
@@ -59,7 +60,7 @@ pub(crate) fn start_run_with_mode(
 /// Returns the stable lock-file path used to serialize Track A tests across processes.
 fn track_a_lock_path() -> &'static PathBuf {
     static LOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
-    LOCK_PATH.get_or_init(|| std::env::temp_dir().join("full-monty-track-a.lock"))
+    LOCK_PATH.get_or_init(|| temp_dir().join("full-monty-track-a.lock"))
 }
 
 /// Serializes Track A tests across threads and test binaries to keep benchmark runs isolated.

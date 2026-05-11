@@ -1,17 +1,5 @@
 .DEFAULT_GOAL := main
 
-# Prefer the project-local interpreter (3.14) for CPython parity tests, while
-# remaining portable by falling back to whatever `python3` is on PATH.
-ifeq ($(wildcard $(CURDIR)/.venv/bin/python3),)
-PYO3_PYTHON_DEFAULT := $(shell command -v python3)
-else
-PYO3_PYTHON_DEFAULT := $(CURDIR)/.venv/bin/python3
-endif
-
-ifeq ($(strip $(PYO3_PYTHON_DEFAULT)),)
-$(error python3 not found on PATH and $(CURDIR)/.venv/bin/python3 is missing)
-endif
-
 .PHONY: .cargo
 .cargo: ## Check that cargo is installed
 	@cargo --version || echo 'Please install cargo: https://github.com/rust-lang/cargo'
@@ -19,10 +7,6 @@ endif
 .PHONY: .uv
 .uv: ## Check that uv is installed
 	@uv --version || echo 'Please install uv: https://docs.astral.sh/uv/getting-started/installation/'
-
-.PHONY: .pre-commit
-.pre-commit: ## Check that pre-commit is installed
-	@pre-commit -V || echo 'Please install pre-commit: https://pre-commit.com/'
 
 .PHONY: install-py
 install-py: .uv ## Install python dependencies
@@ -34,9 +18,9 @@ install-js: ## Install JS package dependencies
 	cd crates/monty-js && npm install
 
 .PHONY: install
-install: .cargo .pre-commit install-py install-js ## Install the package, dependencies, and pre-commit for local development
+install: .cargo install-py install-js ## Install the package, dependencies, and prek for local development
 	cargo check --workspace
-	pre-commit install --install-hooks
+	uvx prek install --install-hooks
 
 .PHONY: dev-py
 dev-py: ## Install the python package for development
@@ -103,9 +87,9 @@ format: format-rs format-py format-js ## Format Rust code, this does not format 
 .PHONY: lint-rs
 lint-rs:  ## Lint Rust code with clippy and import checks
 	@cargo clippy --version
-	cargo clippy --workspace --tests --bench main -- -D warnings
+	cargo clippy --workspace --tests -p monty-bench --bench main -- -D warnings
 	cargo clippy --workspace --tests --all-features -- -D warnings
-	uv run scripts/check_imports.py
+	./scripts/check_imports.py
 
 .PHONY: lint-rs-local
 lint-rs-local:  ## Lint Rust code in nested checkouts with local clippy config and system Python
@@ -116,7 +100,7 @@ lint-rs-local:  ## Lint Rust code in nested checkouts with local clippy config a
 
 .PHONY: clippy-fix
 clippy-fix: ## Fix Rust code with clippy
-	cargo clippy --workspace --tests --bench main --all-features --fix --allow-dirty
+	cargo clippy --workspace --tests -p monty-bench --bench main --all-features --fix --allow-dirty
 
 .PHONY: lint-py
 lint-py: dev-py ## Lint Python code with ruff
@@ -137,23 +121,34 @@ format-lint-py: format-py lint-py ## Format and lint Python code with ruff
 
 .PHONY: test-no-features
 test-no-features: ## Run rust tests without any features enabled
-	PYO3_PYTHON="$${PYO3_PYTHON:-$(PYO3_PYTHON_DEFAULT)}" cargo test -p monty
+	cargo test -p monty
+	cargo run -p monty-datatest
 
-.PHONY: test-ref-count-panic
-test-ref-count-panic: ## Run rust tests with ref-count-panic enabled
-	PYO3_PYTHON="$${PYO3_PYTHON:-$(PYO3_PYTHON_DEFAULT)}" cargo test -p monty --features ref-count-panic
+.PHONY: test-memory-model-checks
+test-memory-model-checks: ## Run rust tests with memory-model-checks enabled
+	cargo test -p monty --features "memory-model-checks test-hooks"
+	cargo run -p monty-datatest --features memory-model-checks
 
 .PHONY: test-ref-count-return
 test-ref-count-return: ## Run rust tests with ref-count-return enabled
-	PYO3_PYTHON="$${PYO3_PYTHON:-$(PYO3_PYTHON_DEFAULT)}" cargo test -p monty --features ref-count-return
+	cargo test -p monty --features ref-count-return
+	cargo run -p monty-datatest --features ref-count-return
 
 .PHONY: test-cases
 test-cases: ## Run tests cases only
-	PYO3_PYTHON="$${PYO3_PYTHON:-$(PYO3_PYTHON_DEFAULT)}" cargo test -p monty --test datatest_runner
+	cargo run -p monty-datatest
+
+.PHONY: miri
+miri: ## Run library inline tests under miri (particularly relevant for heap.rs)
+	cargo +nightly miri test -p monty --lib
+
+.PHONY: miri-test-cases
+miri-test-cases: ## Run library inline tests under miri (particularly relevant for heap.rs)
+	MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri run -p monty-datatest -- run_test_cases_monty
 
 .PHONY: test-type-checking
 test-type-checking: ## Run rust tests on monty_type_checking
-	PYO3_PYTHON="$${PYO3_PYTHON:-$(PYO3_PYTHON_DEFAULT)}" cargo test -p monty_type_checking -p monty_typeshed
+	cargo test -p monty_type_checking -p monty_typeshed
 
 .PHONY: pytest
 pytest: ## Run Python tests with pytest
@@ -168,7 +163,7 @@ test-docs: dev-py ## Test docs examples only
 	cargo test --doc -p monty
 
 .PHONY: test
-test: test-ref-count-panic test-ref-count-return test-no-features test-type-checking test-py ## Run rust tests
+test: test-memory-model-checks test-ref-count-return test-no-features test-type-checking test-py miri ## Run rust tests
 
 .PHONY: testcov
 testcov: ## Run Rust tests with coverage, print table, and generate HTML report
@@ -176,10 +171,13 @@ testcov: ## Run Rust tests with coverage, print table, and generate HTML report
 	cargo llvm-cov clean --workspace
 	echo "coverage for `make test-no-features`"
 	cargo llvm-cov --no-report -p monty
-	echo "coverage for `make test-ref-count-panic`"
-	cargo llvm-cov --no-report -p monty --features ref-count-panic
+	cargo llvm-cov run --no-report -p monty-datatest
+	echo "coverage for `make test-memory-model-checks`"
+	cargo llvm-cov --no-report -p monty --features memory-model-checks
+	cargo llvm-cov run --no-report -p monty-datatest --features memory-model-checks
 	echo "coverage for `make test-ref-count-return`"
 	cargo llvm-cov --no-report -p monty --features ref-count-return
+	cargo llvm-cov run --no-report -p monty-datatest --features ref-count-return
 	echo "coverage for `make test-type-checking`"
 	cargo llvm-cov --no-report -p monty_type_checking -p monty_typeshed
 	echo "Generating reports:"
@@ -200,15 +198,15 @@ update-typeshed: ## Update vendored typeshed from upstream
 
 .PHONY: bench
 bench: ## Run benchmarks
-	cargo bench -p monty --bench main
+	cargo bench -p monty-bench --bench main
 
 .PHONY: dev-bench
 dev-bench: ## Run benchmarks to test with dev profile
-	cargo bench --profile dev -p monty --bench main -- --test
+	cargo bench --profile dev -p monty-bench --bench main -- --test
 
 .PHONY: profile
 profile: ## Profile the code with pprof and generate flamegraphs
-	cargo bench -p monty --bench main --profile profiling -- --profile-time=10
+	cargo bench -p monty-bench --bench main --profile profiling -- --profile-time=10
 	uv run scripts/flamegraph_to_text.py
 
 .PHONY: type-sizes
@@ -225,7 +223,7 @@ fuzz-tokens_input_panic: ## Run the `tokens_input_panic` fuzz target (structured
 	cargo +nightly fuzz run --fuzz-dir crates/fuzz tokens_input_panic
 
 .PHONY: main
-main: lint test-ref-count-panic test-py ## run linting and the most important tests
+main: lint test-memory-model-checks test-py ## run linting and the most important tests
 
 # (must stay last!)
 .PHONY: help

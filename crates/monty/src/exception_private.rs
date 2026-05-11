@@ -11,14 +11,15 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_public::{MontyException, StackFrame},
+    exception_public::{MontyException, SourceMap, StackFrame},
     fstring::FormatError,
-    heap::{Heap, HeapData},
+    heap::{HeapData, HeapRead},
     intern::{Interns, StaticStrings, StringId},
     parse::CodeRange,
     resource::ResourceTracker,
     types::{
         PyTrait, Str, Type, allocate_tuple,
+        long_int::INT_MAX_STR_DIGITS,
         str::{StringRepr, string_repr_fmt},
     },
     value::{EitherStr, Value},
@@ -79,6 +80,9 @@ pub enum ExcType {
     ValueError,
     /// Subclass of ValueError - for encoding/decoding errors.
     UnicodeDecodeError,
+    /// Subclass of ValueError for invalid JSON syntax in `json.loads()`.
+    #[strum(serialize = "json.JSONDecodeError")]
+    JsonDecodeError,
 
     // --- ImportError hierarchy ---
     /// Import-related errors (module not found, name not in module).
@@ -97,6 +101,9 @@ pub enum ExcType {
     IsADirectoryError,
     /// Subclass of OSError - for when a path is not a directory but one was expected.
     NotADirectoryError,
+    /// Subclass of OSError - for when an operation is not permitted (e.g., writing
+    /// to a read-only mount, or attempting to access a path outside a mounted directory).
+    PermissionError,
 
     // --- Standalone exception types ---
     AssertionError,
@@ -152,14 +159,18 @@ impl ExcType {
             Self::AttributeError => matches!(self, Self::FrozenInstanceError),
             // NameError catches UnboundLocalError
             Self::NameError => matches!(self, Self::UnboundLocalError),
-            // ValueError catches UnicodeDecodeError
-            Self::ValueError => matches!(self, Self::UnicodeDecodeError),
+            // ValueError catches UnicodeDecodeError and json.JSONDecodeError
+            Self::ValueError => matches!(self, Self::UnicodeDecodeError | Self::JsonDecodeError),
             // ImportError catches ModuleNotFoundError
             Self::ImportError => matches!(self, Self::ModuleNotFoundError),
-            // OSError catches FileNotFoundError, FileExistsError, IsADirectoryError, NotADirectoryError
+            // OSError catches FileNotFoundError, FileExistsError, IsADirectoryError, NotADirectoryError, PermissionError
             Self::OSError => matches!(
                 self,
-                Self::FileNotFoundError | Self::FileExistsError | Self::IsADirectoryError | Self::NotADirectoryError
+                Self::FileNotFoundError
+                    | Self::FileExistsError
+                    | Self::IsADirectoryError
+                    | Self::NotADirectoryError
+                    | Self::PermissionError
             ),
             // All other types only match exactly (handled by self == handler_type above)
             _ => false,
@@ -173,7 +184,7 @@ impl ExcType {
     ///
     /// The `interns` parameter provides access to interned string content.
     /// Returns a heap-allocated exception value.
-    pub(crate) fn call(self, vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub(crate) fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         defer_drop!(args, vm);
         let exc = match args {
             ArgValues::Empty => Ok(SimpleException::new_none(self)),
@@ -248,19 +259,6 @@ impl ExcType {
         })
     }
 
-    /// Creates a FrozenInstanceError for assigning to a frozen dataclass.
-    ///
-    /// Matches CPython's `dataclasses.FrozenInstanceError` which is a subclass of `AttributeError`.
-    /// Message format: "cannot assign to field 'attr_name'"
-    #[must_use]
-    pub(crate) fn frozen_instance_error(attr_name: &str) -> RunError {
-        SimpleException::new_msg(
-            Self::FrozenInstanceError,
-            format!("cannot assign to field '{attr_name}'"),
-        )
-        .into()
-    }
-
     #[must_use]
     pub(crate) fn type_error_not_sub(type_: Type) -> RunError {
         SimpleException::new_msg(Self::TypeError, format!("'{type_}' object is not subscriptable")).into()
@@ -323,9 +321,14 @@ impl ExcType {
     /// Creates a KeyError for a missing dict key.
     ///
     /// For string keys, uses the raw string value without extra quoting.
-    #[must_use]
-    pub(crate) fn key_error(key: &Value, vm: &VM<'_, '_, impl ResourceTracker>) -> RunError {
-        let key_str = key.py_str(vm).into_owned();
+    /// If the key's string conversion fails (e.g. huge LongInt exceeding
+    /// `INT_MAX_STR_DIGITS`), falls back to the type name so that a
+    /// `KeyError` is always raised rather than a spurious `ValueError`.
+    pub(crate) fn key_error(key: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunError {
+        let key_str = match key.py_str(vm) {
+            Ok(s) => s.into_owned(),
+            Err(_) => format!("<{}>", key.py_type(vm)),
+        };
         SimpleException::new_msg(Self::KeyError, key_str).into()
     }
 
@@ -412,6 +415,24 @@ impl ExcType {
         SimpleException::new_msg(
             Self::TypeError,
             format!("{name} expected at most {max} arguments, got {actual}"),
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for too many arguments to a method or named function.
+    ///
+    /// Matches CPython's format for method-style calls:
+    /// `{name}() takes at most {max} argument ({actual} given)` (singular when max=1)
+    /// `{name}() takes at most {max} arguments ({actual} given)` (plural otherwise)
+    ///
+    /// Use this instead of `type_error_at_most` for methods and type constructors that
+    /// CPython formats with parentheses, e.g. `now()`, `timezone()`, `expandtabs()`.
+    #[must_use]
+    pub(crate) fn type_error_method_at_most(name: &str, max: usize, actual: usize) -> RunError {
+        let plural = if max == 1 { "" } else { "s" };
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("{name}() takes at most {max} argument{plural} ({actual} given)"),
         )
         .into()
     }
@@ -536,6 +557,24 @@ impl ExcType {
         .into()
     }
 
+    /// Creates a TypeError for when a positional argument conflicts with a keyword argument
+    /// of the same name in a C-implemented type constructor.
+    ///
+    /// Matches CPython's `PyArg_ParseTupleAndKeywords` format:
+    /// `argument for function given by name ('{key}') and position ({pos})`
+    ///
+    /// The position is 1-indexed, matching CPython's convention. The `func_descriptor` is
+    /// typically `"function"` for most C types (like `datetime`), matching CPython's generic
+    /// wording for `PyArg_ParseTupleAndKeywords`.
+    #[must_use]
+    pub(crate) fn type_error_positional_keyword_conflict(func_descriptor: &str, key: &str, pos: usize) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("argument for {func_descriptor} given by name ('{key}') and position ({pos})"),
+        )
+        .into()
+    }
+
     /// Creates a TypeError for unexpected keyword argument.
     ///
     /// Matches CPython's format: `{name}() got an unexpected keyword argument '{key}'`
@@ -544,6 +583,59 @@ impl ExcType {
         SimpleException::new_msg(
             Self::TypeError,
             format!("{name}() got an unexpected keyword argument '{key}'"),
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for unexpected keyword argument in C-implemented types.
+    ///
+    /// Matches CPython's `PyArg_ParseTupleAndKeywords` format:
+    /// `this function got an unexpected keyword argument '{key}'`
+    #[must_use]
+    pub(crate) fn type_error_c_unexpected_keyword(key: &str) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("this function got an unexpected keyword argument '{key}'"),
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for too many arguments to a C-implemented type.
+    ///
+    /// Matches CPython's `PyArg_ParseTupleAndKeywords` format:
+    /// `function takes at most {max} arguments ({actual} given)`
+    #[must_use]
+    pub(crate) fn type_error_c_at_most(max: usize, actual: usize) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("function takes at most {max} arguments ({actual} given)"),
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for a missing required argument in a C-implemented type.
+    ///
+    /// Matches CPython's `PyArg_ParseTupleAndKeywords` format:
+    /// `function missing required argument '{arg_name}' (pos {pos})`
+    #[must_use]
+    pub(crate) fn type_error_c_missing_required(arg_name: &str, pos: usize) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("function missing required argument '{arg_name}' (pos {pos})"),
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for a missing required argument in a C-implemented type,
+    /// with a function name prefix.
+    ///
+    /// Matches CPython's format for types like `timezone`:
+    /// `{name}() missing required argument '{arg_name}' (pos {pos})`
+    #[must_use]
+    pub(crate) fn type_error_c_missing_required_named(name: &str, arg_name: &str, pos: usize) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("{name}() missing required argument '{arg_name}' (pos {pos})"),
         )
         .into()
     }
@@ -579,10 +671,27 @@ impl ExcType {
         SimpleException::new_msg(Self::TypeError, "keywords must be strings").into()
     }
 
+    /// Creates a TypeError for an invalid `tzinfo` argument.
+    ///
+    /// Matches CPython: `tzinfo argument must be None or of a tzinfo subclass, not type 'int'`
+    #[must_use]
+    pub(crate) fn type_error_tzinfo(ty: Type) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("tzinfo argument must be None or of a tzinfo subclass, not type '{ty}'"),
+        )
+        .into()
+    }
+
     /// Creates a simple TypeError with a custom message.
     #[must_use]
     pub(crate) fn type_error(msg: impl fmt::Display) -> RunError {
         SimpleException::new_msg(Self::TypeError, msg).into()
+    }
+
+    /// Creates a generic `ValueError` with a custom message.
+    pub(crate) fn value_error(msg: impl fmt::Display) -> RunError {
+        SimpleException::new_msg(Self::ValueError, msg).into()
     }
 
     /// Creates a TypeError for bytes() constructor with invalid type.
@@ -839,7 +948,7 @@ impl ExcType {
     pub(crate) fn name_error(name: &str) -> SimpleException {
         let mut msg = format!("name '{name}' is not defined");
         // add the same suffix as cpython, but only for the modules supported by Monty
-        if matches!(name, "asyncio" | "sys" | "typing" | "types" | "re") {
+        if matches!(name, "asyncio" | "sys" | "typing" | "types" | "re" | "json") {
             write!(&mut msg, ". Did you forget to import '{name}'?").unwrap();
         }
         SimpleException::new_msg(Self::NameError, msg)
@@ -922,6 +1031,45 @@ impl ExcType {
         })
     }
 
+    /// Creates a ValueError when an integer is too large to convert to a decimal string.
+    ///
+    /// Matches CPython 3.11+'s `sys.int_max_str_digits` error message.
+    #[must_use]
+    pub(crate) fn value_error_int_too_large_for_str() -> RunError {
+        SimpleException::new_msg(
+            Self::ValueError,
+            format!("Exceeds the limit ({INT_MAX_STR_DIGITS} digits) for integer string conversion"),
+        )
+        .into()
+    }
+
+    /// Creates a ValueError when a decimal string has too many digits for `int()` conversion.
+    ///
+    /// Includes the actual digit count to help users diagnose the issue.
+    #[must_use]
+    pub(crate) fn value_error_int_str_too_large(digit_count: usize) -> RunError {
+        SimpleException::new_msg(
+            Self::ValueError,
+            format!(
+                "Exceeds the limit ({INT_MAX_STR_DIGITS} digits) for integer string conversion: value has {digit_count} digits"
+            ),
+        )
+        .into()
+    }
+
+    /// Creates a ValueError for `int()` when a string cannot be parsed as an integer.
+    ///
+    /// Matches CPython's format: `invalid literal for int() with base 10: '...'`.
+    /// The caller provides the value pre-formatted (e.g. via `StringRepr`).
+    #[must_use]
+    pub(crate) fn value_error_invalid_literal_for_int(value: impl fmt::Display) -> RunError {
+        SimpleException::new_msg(
+            Self::ValueError,
+            format!("invalid literal for int() with base 10: {value}"),
+        )
+        .into()
+    }
+
     /// Creates a ValueError for negative shift count in bitwise shift operations.
     ///
     /// Matches CPython's format: `ValueError: negative shift count`
@@ -930,12 +1078,12 @@ impl ExcType {
         SimpleException::new_msg(Self::ValueError, "negative shift count").into()
     }
 
-    /// Creates an OverflowError for shift count exceeding integer size.
+    /// Creates an OverflowError when converting values to C ssize_t (i64) for operations like length checks.
     ///
     /// Matches CPython's format: `OverflowError: Python int too large to convert to C ssize_t`
     /// Note: CPython uses this message because it tries to convert to ssize_t for the shift amount.
     #[must_use]
-    pub(crate) fn overflow_shift_count() -> RunError {
+    pub(crate) fn overflow_c_ssize_t() -> RunError {
         SimpleException::new_msg(Self::OverflowError, "Python int too large to convert to C ssize_t").into()
     }
 
@@ -1149,6 +1297,79 @@ impl ExcType {
     pub(crate) fn re_pattern_error(msg: impl fmt::Display) -> RunError {
         SimpleException::new_msg(Self::RePatternError, msg).into()
     }
+
+    /// Creates a `json.JSONDecodeError` with CPython-compatible location suffix.
+    ///
+    /// Matches CPython's format:
+    /// `{message}: line {line} column {column} (char {index})`
+    #[must_use]
+    pub(crate) fn json_decode_error(message: &str, line: usize, column: usize, index: usize) -> RunError {
+        SimpleException::new_msg(
+            Self::JsonDecodeError,
+            format!("{message}: line {line} column {column} (char {index})"),
+        )
+        .into()
+    }
+
+    /// Creates the `TypeError` used by `json.loads()` for unsupported input types.
+    ///
+    /// Matches CPython's format:
+    /// `the JSON object must be str, bytes or bytearray, not {type}`
+    #[must_use]
+    pub(crate) fn json_loads_type_error(type_: Type) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("the JSON object must be str, bytes or bytearray, not {type_}"),
+        )
+        .into()
+    }
+
+    /// Creates the `ValueError` used by `json.dumps()` for circular containers.
+    ///
+    /// Matches CPython's format: `Circular reference detected`
+    #[must_use]
+    pub(crate) fn json_circular_reference_error() -> RunError {
+        SimpleException::new_msg(Self::ValueError, "Circular reference detected").into()
+    }
+
+    /// Creates the `TypeError` used by `json.dumps()` for unsupported object types.
+    ///
+    /// Matches CPython's format:
+    /// `Object of type {type} is not JSON serializable`
+    #[must_use]
+    pub(crate) fn json_not_serializable_error(type_: Type) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("Object of type {type_} is not JSON serializable"),
+        )
+        .into()
+    }
+
+    /// Creates the `TypeError` used by `json.dumps()` for unsupported dict keys.
+    ///
+    /// Matches CPython's format:
+    /// `keys must be str, int, float, bool or None, not {type}`
+    #[must_use]
+    pub(crate) fn json_invalid_key_error(type_: Type) -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            format!("keys must be str, int, float, bool or None, not {type_}"),
+        )
+        .into()
+    }
+
+    /// Creates the `ValueError` used by `json.dumps(..., allow_nan=False)`.
+    ///
+    /// Matches CPython's format:
+    /// `Out of range float values are not JSON compliant: {value}`
+    #[must_use]
+    pub(crate) fn json_nan_error(value: &str) -> RunError {
+        SimpleException::new_msg(
+            Self::ValueError,
+            format!("Out of range float values are not JSON compliant: {value}"),
+        )
+        .into()
+    }
 }
 
 /// Simple lightweight representation of an exception.
@@ -1217,13 +1438,17 @@ impl SimpleException {
             (_, None) => String::new(),
         }
     }
+}
 
-    pub(crate) fn py_type(&self) -> Type {
-        Type::Exception(self.exc_type)
+impl<'h> HeapRead<'h, SimpleException> {
+    pub(crate) fn py_type(&self, vm: &VM<'h, impl ResourceTracker>) -> Type {
+        Type::Exception(self.get(vm.heap).exc_type)
     }
+}
 
+impl SimpleException {
     /// Returns the exception formatted as Python would repr it.
-    pub fn py_repr_fmt(&self, f: &mut impl Write) -> std::fmt::Result {
+    pub fn py_repr_fmt(&self, f: &mut impl Write) -> fmt::Result {
         let type_str: &'static str = self.exc_type.into();
         write!(f, "{type_str}(")?;
 
@@ -1249,31 +1474,28 @@ impl SimpleException {
             hide_caret: false,
         }
     }
+}
 
+impl<'h> HeapRead<'h, SimpleException> {
     /// Gets an attribute from this exception.
     ///
     /// Handles the `.args` attribute by allocating a tuple containing the message.
     /// Returns `Err(AttributeError)` for all other attributes.
-    pub fn py_getattr(
-        &self,
-        attr: &EitherStr,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> RunResult<Option<CallResult>> {
+    pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
         // Fast path: interned strings can be matched by ID
         let is_args = attr
             .static_string()
-            .map_or_else(|| attr.as_str(interns) == "args", |ss| ss == StaticStrings::Args);
+            .map_or_else(|| attr.as_str(vm.interns) == "args", |ss| ss == StaticStrings::Args);
 
         if is_args {
             // Construct tuple with 0 or 1 elements based on whether arg exists
-            let elements = if let Some(arg_str) = &self.arg {
-                let str_id = heap.allocate(HeapData::Str(Str::from(arg_str.clone())))?;
+            let elements = if let Some(arg_str) = &self.get(vm.heap).arg {
+                let str_id = vm.heap.allocate(HeapData::Str(Str::from(arg_str.clone())))?;
                 smallvec![Value::Ref(str_id)]
             } else {
                 smallvec![]
             };
-            Ok(Some(CallResult::Value(allocate_tuple(elements, heap)?)))
+            Ok(Some(CallResult::Value(allocate_tuple(elements, vm.heap)?)))
         } else {
             Ok(None)
         }
@@ -1359,15 +1581,45 @@ impl ExceptionRaise {
     ///
     /// Uses `Interns` to resolve `StringId` references to actual strings.
     /// Extracts preview lines from the source code for traceback display.
+    /// Converts this exception into a public `MontyException`, expanding each
+    /// stack frame's raw byte offsets into lines/columns/preview text via a
+    /// caller-provided source lookup.
+    ///
+    /// The caller must supply `source_for` so that frames whose `CodeRange`
+    /// points into a *different* source than the one currently executing can
+    /// still be resolved. In particular, REPL tracebacks can interleave
+    /// frames from multiple snippets (e.g. calling into a function defined
+    /// in an earlier feed); resolving those byte offsets against only the
+    /// current snippet's source would produce wrong line/column/caret
+    /// information. `source_for` is called per unique filename encountered
+    /// in the traceback and its result is cached, so each source is scanned
+    /// at most once regardless of how many frames share it.
     #[must_use]
-    pub fn into_python_exception(self, interns: &Interns, source: &str) -> MontyException {
+    pub fn into_python_exception<'s>(
+        self,
+        interns: &Interns,
+        source_for: impl Fn(&str) -> Option<&'s str>,
+    ) -> MontyException {
+        // Per-filename SourceMap cache. Typical tracebacks touch 1-3 unique
+        // filenames so a tiny `Vec` beats a HashMap on both allocations and
+        // lookup cost.
+        let mut cache: Vec<(StringId, SourceMap<'s>)> = Vec::new();
         let traceback = self
             .frame
             .map(|frame| {
                 let mut frames = Vec::new();
                 let mut current = Some(&frame);
                 while let Some(f) = current {
-                    frames.push(StackFrame::from_raw(f, interns, source));
+                    let fname_id = f.position.filename;
+                    let sm_idx = if let Some(i) = cache.iter().position(|(k, _)| *k == fname_id) {
+                        i
+                    } else {
+                        let fname = interns.get_str(fname_id);
+                        let src = source_for(fname).unwrap_or("");
+                        cache.push((fname_id, SourceMap::new(src)));
+                        cache.len() - 1
+                    };
+                    frames.push(StackFrame::from_raw(f, interns, &cache[sm_idx].1));
                     current = f.parent.as_deref();
                 }
                 // Reverse so outermost frame is first (Python's "most recent call last" ordering)
@@ -1476,14 +1728,35 @@ impl From<FormatError> for RunError {
     }
 }
 
+impl From<fmt::Error> for RunError {
+    /// Converts a `fmt::Error` into a `RunError`.
+    ///
+    /// In practice, writing to a `String` buffer never fails, so `fmt::Error` only
+    /// arises from our explicit error returns (e.g. INT_MAX_STR_DIGITS checks in
+    /// `py_repr_fmt`). This impl exists so `write!()?` in `py_repr_fmt` auto-converts
+    /// when the method returns `RunResult<()>`.
+    fn from(err: fmt::Error) -> Self {
+        Self::internal(format!("unexpected formatting error: {err}"))
+    }
+}
+
 impl RunError {
     /// Converts this runtime error to a `MontyException` for the public API.
     ///
     /// Internal errors are converted to `RuntimeError` exceptions with no traceback.
+    /// Converts this runtime error into a public `MontyException`.
+    ///
+    /// `source_for` is consulted per unique filename referenced by the
+    /// traceback — see [`ExceptionRaise::into_python_exception`] for why
+    /// this is a lookup rather than a single source string.
     #[must_use]
-    pub fn into_python_exception(self, interns: &Interns, source: &str) -> MontyException {
+    pub fn into_python_exception<'s>(
+        self,
+        interns: &Interns,
+        source_for: impl Fn(&str) -> Option<&'s str>,
+    ) -> MontyException {
         match self {
-            Self::Exc(exc) | Self::UncatchableExc(exc) => exc.into_python_exception(interns, source),
+            Self::Exc(exc) | Self::UncatchableExc(exc) => exc.into_python_exception(interns, source_for),
             Self::Internal(err) => MontyException::runtime_error(format!("Internal error in monty: {err}")),
         }
     }

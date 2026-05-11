@@ -1,5 +1,7 @@
-# Isolate this checkout from parent-repository Clippy settings.
-# These values align with Clippy defaults.
+absolute-paths-max-segments = 2
+
 cognitive-complexity-threshold = 25
+
 too-many-arguments-threshold = 7
+
 too-many-lines-threshold = 100

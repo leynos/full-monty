@@ -14,7 +14,7 @@ use crate::{
 ///
 /// Returns a string representing a character whose Unicode code point is the integer.
 /// The valid range for the argument is from 0 through 1,114,111 (0x10FFFF).
-pub fn builtin_chr(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_chr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("chr", vm.heap)?;
     defer_drop!(value, vm);
 
@@ -35,7 +35,7 @@ pub fn builtin_chr(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -
             Ok(allocate_char(c, vm.heap)?)
         }
         _ => {
-            let type_name = value.py_type(vm.heap);
+            let type_name = value.py_type(vm);
             Err(SimpleException::new_msg(
                 ExcType::TypeError,
                 format!("an integer is required (got type {type_name})"),

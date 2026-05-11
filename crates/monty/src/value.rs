@@ -4,7 +4,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::{self, Write},
     hash::{Hash, Hasher},
-    mem::discriminant,
+    mem::{self, discriminant},
     str::FromStr,
 };
 
@@ -12,22 +12,29 @@ use ahash::AHashSet;
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{ToPrimitive, Zero};
+use smallvec::SmallVec;
 
 use crate::{
     asyncio::CallId,
     builtins::Builtins,
     bytecode::{CallResult, VM},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{ContainsHeap, Heap, HeapData, HeapGuard, HeapId},
-    heap_data::HeapDataMut,
+    hash::HashValue,
+    heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapReadOutput},
     intern::{BytesId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
-    resource::{ResourceError, ResourceTracker, check_div_size, check_lshift_size, check_pow_size, check_repeat_size},
+    resource::{
+        ResourceError, ResourceTracker, check_div_size, check_lshift_size, check_mult_size, check_pow_size,
+        check_repeat_size,
+    },
     types::{
-        LongInt, Property, PyTrait, Str, Type,
-        bytes::{bytes_repr_fmt, get_byte_at_index, get_bytes_slice},
+        Bytes, List, LongInt, Property, PyTrait, Str, Type, allocate_tuple,
+        bytes::{bytes_repr_fmt, get_byte_at_index},
+        long_int::check_bits_str_digits_limit,
         path,
-        str::{allocate_char, get_char_at_index, get_str_slice, string_repr_fmt},
+        slice::slice_collect_iterator,
+        str::{allocate_char, get_char_at_index, string_repr_fmt},
+        timedelta,
     },
 };
 
@@ -93,17 +100,23 @@ pub(crate) enum Value {
     Ref(HeapId),
 
     /// Sentinel value indicating this Value was properly cleaned up via `drop_with_heap`.
-    /// Only exists when `ref-count-panic` feature is enabled. Used to verify reference counting
+    /// Only exists when `memory-model-checks` feature is enabled. Used to verify reference counting
     /// correctness - if a `Ref` variant is dropped without calling `drop_with_heap`, the
     /// Drop impl will panic.
-    #[cfg(feature = "ref-count-panic")]
+    #[cfg(feature = "memory-model-checks")]
     Dereferenced,
 }
 
+/// Size of a single `Value` slot in bytes.
+///
+/// Used for memory tracking when containers grow (e.g., `list.append`, `list.extend`).
+/// Must match the per-element unit used by `py_estimate_size` implementations.
+pub(crate) const VALUE_SIZE: usize = mem::size_of::<Value>();
+
 /// Drop implementation that panics if a `Ref` variant is dropped without calling `drop_with_heap`.
 /// This helps catch reference counting bugs during development/testing.
-/// Only enabled when the `ref-count-panic` feature is active.
-#[cfg(feature = "ref-count-panic")]
+/// Only enabled when the `memory-model-checks` feature is active.
+#[cfg(feature = "memory-model-checks")]
 impl Drop for Value {
     fn drop(&mut self) {
         if let Self::Ref(id) = self {
@@ -118,8 +131,8 @@ impl From<bool> for Value {
     }
 }
 
-impl PyTrait for Value {
-    fn py_type(&self, heap: &Heap<impl ResourceTracker>) -> Type {
+impl PyTrait<'_> for Value {
+    fn py_type(&self, vm: &VM<'_, impl ResourceTracker>) -> Type {
         match self {
             Self::Undefined => panic!("Cannot get type of undefined value"),
             Self::Ellipsis => Type::Ellipsis,
@@ -135,32 +148,23 @@ impl PyTrait for Value {
             Self::Marker(m) => m.py_type(),
             Self::Property(_) => Type::Property,
             Self::ExternalFuture(_) => Type::Coroutine,
-            Self::Ref(id) => heap.get(*id).py_type(heap),
-            #[cfg(feature = "ref-count-panic")]
+            Self::Ref(id) => vm.heap.read(*id).py_type(vm),
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
     }
 
-    /// Returns 0 for Value since immediate values are stack-allocated.
-    ///
-    /// Heap-allocated values (Ref variants) have their size tracked when
-    /// the HeapData is allocated, not here.
-    fn py_estimate_size(&self) -> usize {
-        // Value is stack-allocated; heap data is sized separately when allocated
-        0
-    }
-
-    fn py_len(&self, vm: &VM<'_, '_, impl ResourceTracker>) -> Option<usize> {
+    fn py_len(&self, vm: &VM<'_, impl ResourceTracker>) -> Option<usize> {
         match self {
             // Count Unicode characters, not bytes, to match Python semantics
             Self::InternString(string_id) => Some(vm.interns.get_str(*string_id).chars().count()),
             Self::InternBytes(bytes_id) => Some(vm.interns.get_bytes(*bytes_id).len()),
-            Self::Ref(id) => vm.heap.get(*id).py_len(vm),
+            Self::Ref(id) => vm.heap.read(*id).py_len(vm),
             _ => None,
         }
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<bool, ResourceError> {
         let interns = vm.interns;
         match (self, other) {
             (Self::Undefined, _) => Ok(false),
@@ -177,38 +181,22 @@ impl PyTrait for Value {
             (Self::None, Self::None) => Ok(true),
 
             // Int == LongInt comparison
-            (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    Ok(BigInt::from(*a) == *li.inner())
-                } else {
-                    Ok(false)
-                }
+            (Self::Int(a), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                Ok(BigInt::from(*a) == *li.inner())
             }
             // LongInt == Int comparison
-            (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    Ok(*li.inner() == BigInt::from(*b))
-                } else {
-                    Ok(false)
-                }
+            (Self::Ref(id), Self::Int(b)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                Ok(*li.inner() == BigInt::from(*b))
             }
 
             // For interned interns, compare by StringId first (fast path for same interned string)
             (Self::InternString(s1), Self::InternString(s2)) => Ok(s1 == s2),
             // for strings we need to account for the fact they might be either interned or not
-            (Self::InternString(string_id), Self::Ref(id2)) => {
-                if let HeapData::Str(s2) = vm.heap.get(*id2) {
-                    Ok(interns.get_str(*string_id) == s2.as_str())
-                } else {
-                    Ok(false)
-                }
+            (Self::InternString(string_id), Self::Ref(id2)) if let HeapData::Str(s2) = vm.heap.get(*id2) => {
+                Ok(interns.get_str(*string_id) == s2.as_str())
             }
-            (Self::Ref(id1), Self::InternString(string_id)) => {
-                if let HeapData::Str(s1) = vm.heap.get(*id1) {
-                    Ok(s1.as_str() == interns.get_str(*string_id))
-                } else {
-                    Ok(false)
-                }
+            (Self::Ref(id1), Self::InternString(string_id)) if let HeapData::Str(s1) = vm.heap.get(*id1) => {
+                Ok(s1.as_str() == interns.get_str(*string_id))
             }
 
             // For interned bytes, compare by content (bytes are not deduplicated unlike interns)
@@ -217,26 +205,20 @@ impl PyTrait for Value {
                 Ok(b1 == b2 || interns.get_bytes(*b1) == interns.get_bytes(*b2))
             }
             // same for bytes
-            (Self::InternBytes(bytes_id), Self::Ref(id2)) => {
-                if let HeapData::Bytes(b2) = vm.heap.get(*id2) {
-                    Ok(interns.get_bytes(*bytes_id) == b2.as_slice())
-                } else {
-                    Ok(false)
-                }
+            (Self::InternBytes(bytes_id), Self::Ref(id2)) if let HeapData::Bytes(b2) = vm.heap.get(*id2) => {
+                Ok(interns.get_bytes(*bytes_id) == b2.as_slice())
             }
-            (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
-                if let HeapData::Bytes(b1) = vm.heap.get(*id1) {
-                    Ok(b1.as_slice() == interns.get_bytes(*bytes_id))
-                } else {
-                    Ok(false)
-                }
+            (Self::Ref(id1), Self::InternBytes(bytes_id)) if let HeapData::Bytes(b1) = vm.heap.get(*id1) => {
+                Ok(b1.as_slice() == interns.get_bytes(*bytes_id))
             }
 
             (Self::Ref(id1), Self::Ref(id2)) => {
                 if *id1 == *id2 {
                     return Ok(true);
                 }
-                Heap::with_two(vm, *id1, *id2, |vm, left, right| left.py_eq(right, vm))
+                let left = vm.heap.read(*id1);
+                let right = vm.heap.read(*id2);
+                left.py_eq(&right, vm)
             }
 
             // Builtins equality - just check the enums are equal
@@ -253,11 +235,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_cmp(
-        &self,
-        other: &Self,
-        vm: &mut VM<'_, '_, impl ResourceTracker>,
-    ) -> Result<Option<Ordering>, ResourceError> {
+    fn py_cmp(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<Option<Ordering>, ResourceError> {
         let interns = vm.interns;
         // py_cmp handles numbers, strings, bytes, and tuples.
         // Recursion depth tracking for tuples is handled in Tuple::py_cmp.
@@ -271,27 +249,26 @@ impl PyTrait for Value {
             (Self::Bool(s), _) => Self::Int(i64::from(*s)).py_cmp(other, vm),
             (_, Self::Bool(s)) => self.py_cmp(&Self::Int(i64::from(*s)), vm),
             // Int vs LongInt comparison
-            (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    Ok(BigInt::from(*a).partial_cmp(li.inner()))
-                } else {
-                    Ok(None)
-                }
+            (Self::Int(a), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                Ok(BigInt::from(*a).partial_cmp(li.inner()))
             }
             // LongInt vs Int comparison
-            (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    Ok(li.inner().partial_cmp(&BigInt::from(*b)))
-                } else {
-                    Ok(None)
-                }
+            (Self::Ref(id), Self::Int(b)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                Ok(li.inner().partial_cmp(&BigInt::from(*b)))
             }
             // Ref vs Ref comparison: handles LongInt, Str, and Tuple
-            (Self::Ref(id1), Self::Ref(id2)) => match (vm.heap.get(*id1), vm.heap.get(*id2)) {
-                (HeapData::LongInt(a), HeapData::LongInt(b)) => Ok(a.inner().partial_cmp(b.inner())),
-                (HeapData::Str(a), HeapData::Str(b)) => Ok(a.as_str().partial_cmp(b.as_str())),
-                (HeapData::Tuple(_), HeapData::Tuple(_)) => {
-                    Heap::with_two(vm, *id1, *id2, |vm, left, right| left.py_cmp(right, vm))
+            (Self::Ref(id1), Self::Ref(id2)) => match (vm.heap.read(*id1), vm.heap.read(*id2)) {
+                (HeapReadOutput::LongInt(a), HeapReadOutput::LongInt(b)) => {
+                    Ok(a.get(vm.heap).inner().partial_cmp(b.get(vm.heap).inner()))
+                }
+                (HeapReadOutput::Str(a), HeapReadOutput::Str(b)) => {
+                    Ok(a.get(vm.heap).as_str().partial_cmp(b.get(vm.heap).as_str()))
+                }
+                (HeapReadOutput::Tuple(a), HeapReadOutput::Tuple(b)) => a.py_cmp(&b, vm),
+                (HeapReadOutput::Date(a), HeapReadOutput::Date(b)) => Ok(a.get(vm.heap).partial_cmp(b.get(vm.heap))),
+                (HeapReadOutput::DateTime(a), HeapReadOutput::DateTime(b)) => a.py_cmp(&b, vm),
+                (HeapReadOutput::TimeDelta(a), HeapReadOutput::TimeDelta(b)) => {
+                    Ok(a.get(vm.heap).partial_cmp(b.get(vm.heap)))
                 }
                 _ => Ok(None),
             },
@@ -300,19 +277,11 @@ impl PyTrait for Value {
                 Ok(interns.get_str(*s1).partial_cmp(interns.get_str(*s2)))
             }
             // Cross-type string comparisons: interned vs heap-allocated
-            (Self::InternString(s1), Self::Ref(id2)) => {
-                if let HeapData::Str(s2) = vm.heap.get(*id2) {
-                    Ok(interns.get_str(*s1).partial_cmp(s2.as_str()))
-                } else {
-                    Ok(None)
-                }
+            (Self::InternString(s1), Self::Ref(id2)) if let HeapData::Str(s2) = vm.heap.get(*id2) => {
+                Ok(interns.get_str(*s1).partial_cmp(s2.as_str()))
             }
-            (Self::Ref(id1), Self::InternString(s2)) => {
-                if let HeapData::Str(s1) = vm.heap.get(*id1) {
-                    Ok(s1.as_str().partial_cmp(interns.get_str(*s2)))
-                } else {
-                    Ok(None)
-                }
+            (Self::Ref(id1), Self::InternString(s2)) if let HeapData::Str(s1) = vm.heap.get(*id1) => {
+                Ok(s1.as_str().partial_cmp(interns.get_str(*s2)))
             }
             (Self::InternBytes(b1), Self::InternBytes(b2)) => {
                 Ok(interns.get_bytes(*b1).partial_cmp(interns.get_bytes(*b2)))
@@ -321,16 +290,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        if let Self::Ref(id) = self {
-            stack.push(*id);
-            // Mark as Dereferenced to prevent Drop panic
-            #[cfg(feature = "ref-count-panic")]
-            self.dec_ref_forget();
-        }
-    }
-
-    fn py_bool(&self, vm: &VM<'_, '_, impl ResourceTracker>) -> bool {
+    fn py_bool(&self, vm: &mut VM<'_, impl ResourceTracker>) -> bool {
         match self {
             Self::Undefined => false,
             Self::Ellipsis => true,
@@ -347,8 +307,8 @@ impl PyTrait for Value {
             Self::ExternalFuture(_) => true,                    // ExternalFutures are always truthy
             Self::InternString(string_id) => !vm.interns.get_str(*string_id).is_empty(),
             Self::InternBytes(bytes_id) => !vm.interns.get_bytes(*bytes_id).is_empty(),
-            Self::Ref(id) => vm.heap.get(*id).py_bool(vm),
-            #[cfg(feature = "ref-count-panic")]
+            Self::Ref(id) => vm.heap.read(*id).py_bool(vm),
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
     }
@@ -356,72 +316,70 @@ impl PyTrait for Value {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        vm: &VM<'_, '_, impl ResourceTracker>,
+        vm: &mut VM<'_, impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
-    ) -> std::fmt::Result {
+    ) -> RunResult<()> {
         let interns = vm.interns;
         match self {
-            Self::Undefined => f.write_str("Undefined"),
-            Self::Ellipsis => f.write_str("Ellipsis"),
-            Self::None => f.write_str("None"),
-            Self::Bool(true) => f.write_str("True"),
-            Self::Bool(false) => f.write_str("False"),
-            Self::Int(v) => write!(f, "{v}"),
-            Self::InternLongInt(long_int_id) => write!(f, "{}", interns.get_long_int(*long_int_id)),
+            Self::Undefined => Ok(f.write_str("Undefined")?),
+            Self::Ellipsis => Ok(f.write_str("Ellipsis")?),
+            Self::None => Ok(f.write_str("None")?),
+            Self::Bool(true) => Ok(f.write_str("True")?),
+            Self::Bool(false) => Ok(f.write_str("False")?),
+            Self::Int(v) => Ok(write!(f, "{v}")?),
+            Self::InternLongInt(long_int_id) => {
+                let bi = interns.get_long_int(*long_int_id);
+                check_bits_str_digits_limit(bi.bits())?;
+                Ok(write!(f, "{bi}")?)
+            }
             Self::Float(v) => {
                 let s = v.to_string();
                 if s.contains('.') {
-                    f.write_str(&s)
+                    Ok(f.write_str(&s)?)
                 } else {
-                    write!(f, "{s}.0")
+                    Ok(write!(f, "{s}.0")?)
                 }
             }
-            Self::Builtin(b) => b.py_repr_fmt(f),
-            Self::ModuleFunction(mf) => mf.py_repr_fmt(f, self.id()),
-            Self::DefFunction(f_id) => interns.get_function(*f_id).py_repr_fmt(f, interns, self.id()),
-            Self::ExtFunction(name_id) => {
-                write!(f, "<function '{}' external>", interns.get_str(*name_id))
-            }
-            Self::InternString(string_id) => string_repr_fmt(interns.get_str(*string_id), f),
-            Self::InternBytes(bytes_id) => bytes_repr_fmt(interns.get_bytes(*bytes_id), f),
-            Self::Marker(m) => m.py_repr_fmt(f),
-            Self::Property(p) => write!(f, "<property {p:?}>"),
-            Self::ExternalFuture(call_id) => write!(f, "<coroutine external_future({})>", call_id.raw()),
+            Self::Builtin(b) => Ok(b.py_repr_fmt(f)?),
+            Self::ModuleFunction(mf) => Ok(mf.py_repr_fmt(f, self.id())?),
+            Self::DefFunction(f_id) => Ok(interns.get_function(*f_id).py_repr_fmt(f, interns, self.id())?),
+            Self::ExtFunction(name_id) => Ok(write!(f, "<function '{}' external>", interns.get_str(*name_id))?),
+            Self::InternString(string_id) => Ok(string_repr_fmt(interns.get_str(*string_id), f)?),
+            Self::InternBytes(bytes_id) => Ok(bytes_repr_fmt(interns.get_bytes(*bytes_id), f)?),
+            Self::Marker(m) => Ok(m.py_repr_fmt(f)?),
+            Self::Property(p) => Ok(write!(f, "<property {p:?}>")?),
+            Self::ExternalFuture(call_id) => Ok(write!(f, "<coroutine external_future({})>", call_id.raw())?),
             Self::Ref(id) => {
                 if heap_ids.contains(id) {
                     // Cycle detected - write type-specific placeholder following Python semantics
                     match vm.heap.get(*id) {
-                        HeapData::List(_) => f.write_str("[...]"),
-                        HeapData::Tuple(_) => f.write_str("(...)"),
-                        HeapData::Dict(_) => f.write_str("{...}"),
+                        HeapData::List(_) => Ok(f.write_str("[...]")?),
+                        HeapData::Tuple(_) => Ok(f.write_str("(...)")?),
+                        HeapData::Dict(_) => Ok(f.write_str("{...}")?),
                         // Other types don't typically have cycles, but handle gracefully
-                        _ => f.write_str("..."),
+                        _ => Ok(f.write_str("...")?),
                     }
                 } else {
                     heap_ids.insert(*id);
-                    let result = vm.heap.get(*id).py_repr_fmt(f, vm, heap_ids);
+                    let result = vm.heap.read(*id).py_repr_fmt(f, vm, heap_ids);
                     heap_ids.remove(id);
                     result
                 }
             }
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
     }
 
-    fn py_str(&self, vm: &VM<'_, '_, impl ResourceTracker>) -> Cow<'static, str> {
+    fn py_str(&self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Cow<'static, str>> {
         match self {
-            Self::InternString(string_id) => vm.interns.get_str(*string_id).to_owned().into(),
-            Self::Ref(id) => vm.heap.get(*id).py_str(vm),
+            Self::InternString(string_id) => Ok(vm.interns.get_str(*string_id).to_owned().into()),
+            Self::Ref(id) => vm.heap.read(*id).py_str(vm),
             _ => self.py_repr(vm),
         }
     }
 
-    fn py_add(
-        &self,
-        other: &Self,
-        vm: &mut VM<'_, '_, impl ResourceTracker>,
-    ) -> Result<Option<Value>, crate::resource::ResourceError> {
+    fn py_add(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<Option<Value>, ResourceError> {
         let interns = vm.interns;
         match (self, other) {
             // Int + Int with overflow detection
@@ -435,41 +393,33 @@ impl PyTrait for Value {
                 }
             }
             // Int + LongInt
-            (Self::Int(i), Self::Ref(id)) | (Self::Ref(id), Self::Int(i)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    let result = LongInt::new(li.inner() + i);
-                    result.into_value(vm.heap).map(Some)
-                } else {
-                    Ok(None)
-                }
+            (Self::Int(i), Self::Ref(id)) | (Self::Ref(id), Self::Int(i))
+                if let HeapData::LongInt(li) = vm.heap.get(*id) =>
+            {
+                let result = LongInt::new(li.inner() + i);
+                result.into_value(vm.heap).map(Some)
             }
             (Self::Float(v1), Self::Float(v2)) => Ok(Some(Self::Float(v1 + v2))),
             // Int + Float and Float + Int
             (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 + b))),
             (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a + *b as f64))),
             (Self::Ref(id1), Self::Ref(id2)) => {
-                Heap::with_two(vm, *id1, *id2, |vm, left, right| left.py_add(right, vm))
+                let left = vm.heap.read(*id1);
+                let right = vm.heap.read(*id2);
+                left.py_add(&right, vm)
             }
             (Self::InternString(s1), Self::InternString(s2)) => {
                 let concat = format!("{}{}", interns.get_str(*s1), interns.get_str(*s2));
                 Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(concat.into()))?)))
             }
             // for strings we need to account for the fact they might be either interned or not
-            (Self::InternString(string_id), Self::Ref(id2)) => {
-                if let HeapData::Str(s2) = vm.heap.get(*id2) {
-                    let concat = format!("{}{}", interns.get_str(*string_id), s2.as_str());
-                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(concat.into()))?)))
-                } else {
-                    Ok(None)
-                }
+            (Self::InternString(string_id), Self::Ref(id2)) if let HeapData::Str(s2) = vm.heap.get(*id2) => {
+                let concat = format!("{}{}", interns.get_str(*string_id), s2.as_str());
+                Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(concat.into()))?)))
             }
-            (Self::Ref(id1), Self::InternString(string_id)) => {
-                if let HeapData::Str(s1) = vm.heap.get(*id1) {
-                    let concat = format!("{}{}", s1.as_str(), interns.get_str(*string_id));
-                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(concat.into()))?)))
-                } else {
-                    Ok(None)
-                }
+            (Self::Ref(id1), Self::InternString(string_id)) if let HeapData::Str(s1) = vm.heap.get(*id1) => {
+                let concat = format!("{}{}", s1.as_str(), interns.get_str(*string_id));
+                Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(concat.into()))?)))
             }
             // same for bytes
             (Self::InternBytes(b1), Self::InternBytes(b2)) => {
@@ -480,37 +430,25 @@ impl PyTrait for Value {
                 b.extend_from_slice(bytes2);
                 Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(b.into()))?)))
             }
-            (Self::InternBytes(bytes_id), Self::Ref(id2)) => {
-                if let HeapData::Bytes(b2) = vm.heap.get(*id2) {
-                    let bytes1 = interns.get_bytes(*bytes_id);
-                    let mut b = Vec::with_capacity(bytes1.len() + b2.len());
-                    b.extend_from_slice(bytes1);
-                    b.extend_from_slice(b2);
-                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(b.into()))?)))
-                } else {
-                    Ok(None)
-                }
+            (Self::InternBytes(bytes_id), Self::Ref(id2)) if let HeapData::Bytes(b2) = vm.heap.get(*id2) => {
+                let bytes1 = interns.get_bytes(*bytes_id);
+                let mut b = Vec::with_capacity(bytes1.len() + b2.len());
+                b.extend_from_slice(bytes1);
+                b.extend_from_slice(b2);
+                Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(b.into()))?)))
             }
-            (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
-                if let HeapData::Bytes(b1) = vm.heap.get(*id1) {
-                    let bytes2 = interns.get_bytes(*bytes_id);
-                    let mut b = Vec::with_capacity(b1.len() + bytes2.len());
-                    b.extend_from_slice(b1);
-                    b.extend_from_slice(bytes2);
-                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(b.into()))?)))
-                } else {
-                    Ok(None)
-                }
+            (Self::Ref(id1), Self::InternBytes(bytes_id)) if let HeapData::Bytes(b1) = vm.heap.get(*id1) => {
+                let bytes2 = interns.get_bytes(*bytes_id);
+                let mut b = Vec::with_capacity(b1.len() + bytes2.len());
+                b.extend_from_slice(b1);
+                b.extend_from_slice(bytes2);
+                Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(b.into()))?)))
             }
             _ => Ok(None),
         }
     }
 
-    fn py_sub(
-        &self,
-        other: &Self,
-        vm: &mut VM<'_, '_, impl ResourceTracker>,
-    ) -> Result<Option<Self>, crate::resource::ResourceError> {
+    fn py_sub(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<Option<Self>, ResourceError> {
         match (self, other) {
             // Int - Int with overflow detection
             (Self::Int(a), Self::Int(b)) => {
@@ -523,26 +461,20 @@ impl PyTrait for Value {
                 }
             }
             // Int - LongInt
-            (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    let result = LongInt::from(*a) - LongInt::new(li.inner().clone());
-                    result.into_value(vm.heap).map(Some)
-                } else {
-                    Ok(None)
-                }
+            (Self::Int(a), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                let result = LongInt::from(*a) - LongInt::new(li.inner().clone());
+                result.into_value(vm.heap).map(Some)
             }
             // LongInt - Int
-            (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    let result = LongInt::new(li.inner().clone()) - LongInt::from(*b);
-                    result.into_value(vm.heap).map(Some)
-                } else {
-                    Ok(None)
-                }
+            (Self::Ref(id), Self::Int(b)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                let result = LongInt::new(li.inner().clone()) - LongInt::from(*b);
+                result.into_value(vm.heap).map(Some)
             }
             // LongInt - LongInt
             (Self::Ref(id1), Self::Ref(id2)) => {
-                Heap::with_two(vm, *id1, *id2, |vm, left, right| left.py_sub(right, vm))
+                let left = vm.heap.read(*id1);
+                let right = vm.heap.read(*id2);
+                left.py_sub(&right, vm)
             }
             // Float - Float
             (Self::Float(a), Self::Float(b)) => Ok(Some(Self::Float(a - b))),
@@ -553,7 +485,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_mod(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<Self>> {
+    fn py_mod(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Self>> {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => {
                 if *b == 0 {
@@ -568,36 +500,26 @@ impl PyTrait for Value {
                 }
             }
             // Int % LongInt
-            (Self::Int(a), Self::Ref(id)) => {
-                // Clone to avoid borrow conflict with heap mutation
-                let b_clone = if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    if li.is_zero() {
-                        return Err(ExcType::zero_division().into());
-                    }
-                    li.inner().clone()
-                } else {
-                    return Ok(None);
-                };
-                let bi = BigInt::from(*a).mod_floor(&b_clone);
+            (Self::Int(a), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
+                if li.is_zero() {
+                    return Err(ExcType::zero_division().into());
+                }
+                let bi = BigInt::from(*a).mod_floor(li.inner());
                 Ok(Some(LongInt::new(bi).into_value(vm.heap)?))
             }
             // LongInt % Int
-            (Self::Ref(id), Self::Int(b)) => {
+            (Self::Ref(id), Self::Int(b)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
                 if *b == 0 {
                     return Err(ExcType::zero_division().into());
                 }
-                // Clone to avoid borrow conflict with heap mutation
-                let a_clone = if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    li.inner().clone()
-                } else {
-                    return Ok(None);
-                };
-                let bi = a_clone.mod_floor(&BigInt::from(*b));
+                let bi = li.inner().mod_floor(&BigInt::from(*b));
                 Ok(Some(LongInt::new(bi).into_value(vm.heap)?))
             }
             // LongInt % LongInt
             (Self::Ref(id1), Self::Ref(id2)) => {
-                Heap::with_two(vm, *id1, *id2, |vm, left, right| left.py_mod(right, vm))
+                let left = vm.heap.read(*id1);
+                let right = vm.heap.read(*id2);
+                left.py_mod(&right, vm)
             }
             (Self::Float(v1), Self::Float(v2)) => {
                 if *v2 == 0.0 {
@@ -646,9 +568,9 @@ impl PyTrait for Value {
     fn py_iadd(
         &mut self,
         other: &Self,
-        vm: &mut VM<'_, '_, impl ResourceTracker>,
+        vm: &mut VM<'_, impl ResourceTracker>,
         _self_id: Option<HeapId>,
-    ) -> Result<bool, crate::resource::ResourceError> {
+    ) -> Result<bool, ResourceError> {
         let interns = vm.interns;
         match (&self, other) {
             (Self::Int(v1), Self::Int(v2)) => {
@@ -703,14 +625,12 @@ impl PyTrait for Value {
                 };
                 Ok(result)
             }
-            (Self::Ref(id), Self::Ref(_)) => {
-                Heap::with_entry_mut(vm, *id, |vm, mut data| data.py_iadd(other, vm, Some(*id)))
-            }
+            (Self::Ref(id), Self::Ref(_)) => vm.heap.read(*id).py_iadd(other, vm, Some(*id)),
             _ => Ok(false),
         }
     }
 
-    fn py_mult(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
+    fn py_mult(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Value>> {
         let interns = vm.interns;
         match (self, other) {
             // Numeric multiplication with overflow promotion to LongInt
@@ -723,12 +643,131 @@ impl PyTrait for Value {
                     Ok(Some(li.into_value(vm.heap)?))
                 }
             }
-            // Int * Ref (LongInt or sequence)
-            (Self::Int(a), Self::Ref(id)) => vm.heap.mult_ref_by_i64(*id, *a),
-            // Ref * Int (LongInt or sequence)
-            (Self::Ref(id), Self::Int(b)) => vm.heap.mult_ref_by_i64(*id, *b),
-            // Ref * Ref (LongInt * LongInt, sequence * LongInt, etc.)
-            (Self::Ref(id1), Self::Ref(id2)) => vm.heap.mult_heap_values(*id1, *id2),
+            // Int * heap-allocated value (commutative for the supported types).
+            // Covers LongInt and TimeDelta numeric multiplication, plus repetition
+            // of heap-allocated Str/Bytes/List/Tuple sequences by an integer count.
+            (Self::Int(n), Self::Ref(id)) | (Self::Ref(id), Self::Int(n)) => match vm.heap.get(*id) {
+                HeapData::LongInt(li) => {
+                    check_mult_size(li.bits(), i64_bits(*n), vm.heap.tracker())?;
+                    let result = LongInt::new(li.inner().clone()) * LongInt::from(*n);
+                    Ok(Some(result.into_value(vm.heap)?))
+                }
+                HeapData::TimeDelta(td) => {
+                    let total = timedelta::total_microseconds(td)
+                        .checked_mul(i128::from(*n))
+                        .ok_or_else(|| {
+                            SimpleException::new_msg(ExcType::OverflowError, "timedelta multiplication overflow")
+                        })?;
+                    let delta = timedelta::from_total_microseconds(total)?;
+                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::TimeDelta(delta))?)))
+                }
+                HeapData::Str(s) => {
+                    let count = i64_to_repeat_count(*n)?;
+                    check_repeat_size(s.len(), count, vm.heap.tracker())?;
+                    Ok(Some(Self::Ref(
+                        vm.heap.allocate(HeapData::Str(s.as_str().repeat(count).into()))?,
+                    )))
+                }
+                HeapData::Bytes(b) => {
+                    let count = i64_to_repeat_count(*n)?;
+                    check_repeat_size(b.len(), count, vm.heap.tracker())?;
+                    Ok(Some(Self::Ref(
+                        vm.heap.allocate(HeapData::Bytes(b.as_slice().repeat(count).into()))?,
+                    )))
+                }
+                HeapData::List(list) => {
+                    let count = i64_to_repeat_count(*n)?;
+                    check_repeat_size(
+                        list.len().saturating_mul(mem::size_of::<Self>()),
+                        count,
+                        vm.heap.tracker(),
+                    )?;
+                    let mut result = Vec::with_capacity(list.as_slice().len() * count);
+                    for _ in 0..count {
+                        result.extend(list.as_slice().iter().map(|v| v.clone_with_heap(vm.heap)));
+                        vm.heap.check_time()?;
+                    }
+                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::List(List::new(result)))?)))
+                }
+                HeapData::Tuple(tuple) => {
+                    let count = i64_to_repeat_count(*n)?;
+                    if count == 0 {
+                        Ok(Some(vm.heap.get_empty_tuple()))
+                    } else {
+                        check_repeat_size(
+                            tuple.as_slice().len().saturating_mul(mem::size_of::<Self>()),
+                            count,
+                            vm.heap.tracker(),
+                        )?;
+                        let mut result = SmallVec::with_capacity(tuple.as_slice().len() * count);
+                        for _ in 0..count {
+                            result.extend(tuple.as_slice().iter().map(|v| v.clone_with_heap(vm.heap)));
+                            vm.heap.check_time()?;
+                        }
+                        Ok(Some(allocate_tuple(result, vm.heap)?))
+                    }
+                }
+                _ => Ok(None),
+            },
+            // Ref * Ref: LongInt * LongInt is numeric multiplication; LongInt * sequence
+            // (or vice versa) is repetition of a heap-allocated Str/Bytes/List/Tuple.
+            (Self::Ref(id1), Self::Ref(id2)) => {
+                let (seq_id, count) = match (vm.heap.get(*id1), vm.heap.get(*id2)) {
+                    (HeapData::LongInt(a), HeapData::LongInt(b)) => {
+                        check_mult_size(a.bits(), b.bits(), vm.heap.tracker())?;
+                        let result = LongInt::new(a.inner() * b.inner());
+                        return Ok(Some(result.into_value(vm.heap)?));
+                    }
+                    (HeapData::LongInt(li), _) => (*id2, longint_to_repeat_count(li)?),
+                    (_, HeapData::LongInt(li)) => (*id1, longint_to_repeat_count(li)?),
+                    _ => return Ok(None),
+                };
+                match vm.heap.get(seq_id) {
+                    HeapData::Str(s) => {
+                        check_repeat_size(s.len(), count, vm.heap.tracker())?;
+                        Ok(Some(Self::Ref(
+                            vm.heap.allocate(HeapData::Str(s.as_str().repeat(count).into()))?,
+                        )))
+                    }
+                    HeapData::Bytes(b) => {
+                        check_repeat_size(b.len(), count, vm.heap.tracker())?;
+                        Ok(Some(Self::Ref(
+                            vm.heap.allocate(HeapData::Bytes(b.as_slice().repeat(count).into()))?,
+                        )))
+                    }
+                    HeapData::List(list) => {
+                        check_repeat_size(
+                            list.len().saturating_mul(mem::size_of::<Self>()),
+                            count,
+                            vm.heap.tracker(),
+                        )?;
+                        let mut result = Vec::with_capacity(list.as_slice().len() * count);
+                        for _ in 0..count {
+                            result.extend(list.as_slice().iter().map(|v| v.clone_with_heap(vm.heap)));
+                            vm.heap.check_time()?;
+                        }
+                        Ok(Some(Self::Ref(vm.heap.allocate(HeapData::List(List::new(result)))?)))
+                    }
+                    HeapData::Tuple(tuple) => {
+                        if count == 0 {
+                            Ok(Some(vm.heap.get_empty_tuple()))
+                        } else {
+                            check_repeat_size(
+                                tuple.as_slice().len().saturating_mul(mem::size_of::<Self>()),
+                                count,
+                                vm.heap.tracker(),
+                            )?;
+                            let mut result = SmallVec::with_capacity(tuple.as_slice().len() * count);
+                            for _ in 0..count {
+                                result.extend(tuple.as_slice().iter().map(|v| v.clone_with_heap(vm.heap)));
+                                vm.heap.check_time()?;
+                            }
+                            Ok(Some(allocate_tuple(result, vm.heap)?))
+                        }
+                    }
+                    _ => Ok(None),
+                }
+            }
             (Self::Float(a), Self::Float(b)) => Ok(Some(Self::Float(a * b))),
             (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 * b))),
             (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a * *b as f64))),
@@ -774,36 +813,32 @@ impl PyTrait for Value {
             }
 
             // String repetition with LongInt: "ab" * bigint or bigint * "ab"
-            (Self::InternString(s), Self::Ref(id)) | (Self::Ref(id), Self::InternString(s)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    let count = longint_to_repeat_count(li)?;
-                    let str_ref = interns.get_str(*s);
-                    check_repeat_size(str_ref.len(), count, vm.heap.tracker())?;
-                    let result = str_ref.repeat(count);
-                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(result.into()))?)))
-                } else {
-                    Ok(None)
-                }
+            (Self::InternString(s), Self::Ref(id)) | (Self::Ref(id), Self::InternString(s))
+                if let HeapData::LongInt(li) = vm.heap.get(*id) =>
+            {
+                let count = longint_to_repeat_count(li)?;
+                let str_ref = interns.get_str(*s);
+                check_repeat_size(str_ref.len(), count, vm.heap.tracker())?;
+                let result = str_ref.repeat(count);
+                Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Str(result.into()))?)))
             }
 
             // Bytes repetition with LongInt: b"ab" * bigint or bigint * b"ab"
-            (Self::InternBytes(b), Self::Ref(id)) | (Self::Ref(id), Self::InternBytes(b)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
-                    let count = longint_to_repeat_count(li)?;
-                    let bytes_ref = interns.get_bytes(*b);
-                    check_repeat_size(bytes_ref.len(), count, vm.heap.tracker())?;
-                    let result: Vec<u8> = bytes_ref.repeat(count);
-                    Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(result.into()))?)))
-                } else {
-                    Ok(None)
-                }
+            (Self::InternBytes(b), Self::Ref(id)) | (Self::Ref(id), Self::InternBytes(b))
+                if let HeapData::LongInt(li) = vm.heap.get(*id) =>
+            {
+                let count = longint_to_repeat_count(li)?;
+                let bytes_ref = interns.get_bytes(*b);
+                check_repeat_size(bytes_ref.len(), count, vm.heap.tracker())?;
+                let result: Vec<u8> = bytes_ref.repeat(count);
+                Ok(Some(Self::Ref(vm.heap.allocate(HeapData::Bytes(result.into()))?)))
             }
 
             _ => Ok(None),
         }
     }
 
-    fn py_div(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
+    fn py_div(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Value>> {
         let interns = vm.interns;
         match (self, other) {
             // True division always returns float
@@ -829,9 +864,9 @@ impl PyTrait for Value {
                     Ok(None)
                 }
             }
-            // LongInt / Int
-            (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
+            // LongInt / Int or TimeDelta / Int
+            (Self::Ref(id), Self::Int(b)) => match vm.heap.get(*id) {
+                HeapData::LongInt(li) => {
                     if *b == 0 {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -840,10 +875,19 @@ impl PyTrait for Value {
                         let b_f64 = *b as f64;
                         Ok(Some(Self::Float(a_f64 / b_f64)))
                     }
-                } else {
-                    Ok(None)
                 }
-            }
+                HeapData::TimeDelta(td) => {
+                    if *b == 0 {
+                        Err(ExcType::zero_division().into())
+                    } else {
+                        let total = timedelta::total_microseconds(td);
+                        let result = timedelta::div_microseconds_round_ties_even(total, i128::from(*b));
+                        let delta = timedelta::from_total_microseconds(result)?;
+                        Ok(Some(Self::Ref(vm.heap.allocate(HeapData::TimeDelta(delta))?)))
+                    }
+                }
+                _ => Ok(None),
+            },
             // LongInt / LongInt
             (Self::Ref(id1), Self::Ref(id2)) => match (vm.heap.get(*id1), vm.heap.get(*id2)) {
                 (HeapData::LongInt(li1), HeapData::LongInt(li2)) => {
@@ -952,7 +996,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_floordiv(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
+    fn py_floordiv(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Value>> {
         match (self, other) {
             // Floor division: int // int returns int
             (Self::Int(a), Self::Int(b)) => {
@@ -980,19 +1024,28 @@ impl PyTrait for Value {
                     Ok(None)
                 }
             }
-            // LongInt // Int
-            (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = vm.heap.get(*id) {
+            // LongInt // Int or TimeDelta // Int
+            (Self::Ref(id), Self::Int(b)) => match vm.heap.get(*id) {
+                HeapData::LongInt(li) => {
                     if *b == 0 {
                         Err(ExcType::zero_division().into())
                     } else {
                         let bi = li.inner().div_floor(&BigInt::from(*b));
                         Ok(Some(LongInt::new(bi).into_value(vm.heap)?))
                     }
-                } else {
-                    Ok(None)
                 }
-            }
+                HeapData::TimeDelta(td) => {
+                    if *b == 0 {
+                        Err(ExcType::zero_division().into())
+                    } else {
+                        let total = timedelta::total_microseconds(td);
+                        let result = total.div_euclid(i128::from(*b));
+                        let delta = timedelta::from_total_microseconds(result)?;
+                        Ok(Some(Self::Ref(vm.heap.allocate(HeapData::TimeDelta(delta))?)))
+                    }
+                }
+                _ => Ok(None),
+            },
             // LongInt // LongInt
             (Self::Ref(id1), Self::Ref(id2)) => match (vm.heap.get(*id1), vm.heap.get(*id2)) {
                 (HeapData::LongInt(li1), HeapData::LongInt(li2)) => {
@@ -1072,7 +1125,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_pow(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
+    fn py_pow(&self, other: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Value>> {
         match (self, other) {
             (Self::Int(base), Self::Int(exp)) => {
                 if *base == 0 && *exp < 0 {
@@ -1280,22 +1333,18 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_getitem(&self, key: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Self> {
+    fn py_getitem(&self, key: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Self> {
         let interns = vm.interns;
         match self {
-            Self::Ref(id) => Heap::with_entry_mut(vm, *id, |vm, data| data.py_getitem(key, vm)),
+            Self::Ref(id) => vm.heap.read(*id).py_getitem(key, vm),
             Self::InternString(string_id) => {
                 // Check for slice first
                 if let Self::Ref(key_id) = key
                     && let HeapData::Slice(slice_obj) = vm.heap.get(*key_id)
                 {
                     let s = interns.get_str(*string_id);
-                    let char_count = s.chars().count();
-                    let (start, stop, step) = slice_obj
-                        .indices(char_count)
-                        .map_err(|()| ExcType::value_error_slice_step_zero())?;
-                    let result_str = get_str_slice(s, start, stop, step);
-                    let heap_id = vm.heap.allocate(HeapData::Str(Str::from(result_str)))?;
+                    let result_str = slice_collect_iterator(vm, slice_obj, s.chars(), |c| c)?;
+                    let heap_id = vm.heap.allocate(HeapData::Str(Str::from_boxed(result_str)))?;
                     return Ok(Self::Ref(heap_id));
                 }
 
@@ -1303,7 +1352,7 @@ impl PyTrait for Value {
                 let index = match key {
                     Self::Int(i) => *i,
                     Self::Bool(b) => i64::from(*b),
-                    _ => return Err(ExcType::type_error_indices(Type::Str, key.py_type(vm.heap))),
+                    _ => return Err(ExcType::type_error_indices(Type::Str, key.py_type(vm))),
                 };
 
                 let s = interns.get_str(*string_id);
@@ -1316,13 +1365,8 @@ impl PyTrait for Value {
                     && let HeapData::Slice(slice_obj) = vm.heap.get(*key_id)
                 {
                     let bytes = interns.get_bytes(*bytes_id);
-                    let (start, stop, step) = slice_obj
-                        .indices(bytes.len())
-                        .map_err(|()| ExcType::value_error_slice_step_zero())?;
-                    let result_bytes = get_bytes_slice(bytes, start, stop, step);
-                    let heap_id = vm
-                        .heap
-                        .allocate(HeapData::Bytes(crate::types::Bytes::new(result_bytes)))?;
+                    let result_bytes = slice_collect_iterator(vm, slice_obj, bytes.iter(), |b| *b)?;
+                    let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(result_bytes)))?;
                     return Ok(Self::Ref(heap_id));
                 }
 
@@ -1330,29 +1374,55 @@ impl PyTrait for Value {
                 let index = match key {
                     Self::Int(i) => *i,
                     Self::Bool(b) => i64::from(*b),
-                    _ => return Err(ExcType::type_error_indices(Type::Bytes, key.py_type(vm.heap))),
+                    _ => return Err(ExcType::type_error_indices(Type::Bytes, key.py_type(vm))),
                 };
 
                 let bytes = interns.get_bytes(*bytes_id);
                 let byte = get_byte_at_index(bytes, index).ok_or_else(ExcType::bytes_index_error)?;
                 Ok(Self::Int(i64::from(byte)))
             }
-            _ => Err(ExcType::type_error_not_sub(self.py_type(vm.heap))),
+            _ => Err(ExcType::type_error_not_sub(self.py_type(vm))),
         }
     }
 
-    fn py_setitem(&mut self, key: Self, value: Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<()> {
+    fn py_setitem(&mut self, key: Self, value: Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<()> {
         match self {
-            Self::Ref(id) => Heap::with_entry_mut(vm, *id, |vm, mut data| data.py_setitem(key, value, vm)),
+            Self::Ref(id) => vm.heap.read(*id).py_setitem(key, value, vm),
             _ => Err(ExcType::type_error(format!(
                 "'{}' object does not support item assignment",
-                self.py_type(vm.heap)
+                self.py_type(vm)
             ))),
         }
     }
 }
 
 impl Value {
+    /// Returns the Python `Type` for immediate (non-heap) values without VM access.
+    ///
+    /// For `Value::Ref` variants this cannot determine the concrete type (that requires
+    /// reading from the heap), so it falls back to `Type::NoneType` as a sentinel.
+    /// Callers handling `Ref` should use `HeapData::py_type()` on the resolved data instead.
+    #[must_use]
+    pub(crate) fn py_type_shallow(&self) -> Type {
+        match self {
+            Self::Undefined | Self::None => Type::NoneType,
+            Self::Ellipsis => Type::Ellipsis,
+            Self::Bool(_) => Type::Bool,
+            Self::Int(_) | Self::InternLongInt(_) => Type::Int,
+            Self::Float(_) => Type::Float,
+            Self::InternString(_) => Type::Str,
+            Self::InternBytes(_) => Type::Bytes,
+            Self::Builtin(_) => Type::BuiltinFunction,
+            Self::ModuleFunction(_) | Self::DefFunction(_) | Self::ExtFunction(_) => Type::Function,
+            Self::Marker(_) => Type::SpecialForm,
+            Self::Property(_) => Type::Property,
+            Self::ExternalFuture(_) => Type::Coroutine,
+            Self::Ref(_) => Type::NoneType, // callers should resolve Ref via HeapData::py_type()
+            #[cfg(feature = "memory-model-checks")]
+            Self::Dereferenced => Type::NoneType,
+        }
+    }
+
     /// Returns a stable, unique identifier for this value.
     ///
     /// Should match Python's `id()` function conceptually.
@@ -1398,7 +1468,7 @@ impl Value {
             Self::Property(p) => property_value_id(*p),
             // ExternalFutures get IDs based on their call_id
             Self::ExternalFuture(call_id) => external_future_value_id(*call_id),
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot get id of Dereferenced object"),
         }
     }
@@ -1414,10 +1484,10 @@ impl Value {
     /// Returns the module name if this value is a module, otherwise returns "<unknown>".
     ///
     /// Used for error messages in `from module import name` when the name doesn't exist.
-    pub fn module_name(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> String {
+    pub fn module_name(&self, vm: &mut VM<'_, impl ResourceTracker>) -> String {
         match self {
-            Self::Ref(id) => match heap.get(*id) {
-                HeapData::Module(module) => interns.get_str(module.name()).to_string(),
+            Self::Ref(id) => match vm.heap.get(*id) {
+                HeapData::Module(module) => vm.interns.get_str(module.name()).to_string(),
                 _ => "<unknown>".to_string(),
             },
             _ => "<unknown>".to_string(),
@@ -1440,52 +1510,34 @@ impl Value {
     ///
     /// For heap-allocated values (Ref variant), this computes the hash lazily
     /// on first use and caches it for subsequent calls.
-    ///
-    /// The `interns` parameter is needed for InternString/InternBytes to look up
-    /// their actual content and hash it consistently with equivalent heap Str/Bytes.
-    pub fn py_hash(
-        &self,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> Result<Option<u64>, ResourceError> {
-        // strings bytes bigints and heap allocated values have their own hashing logic
-        match self {
-            // Hash just the actual string or bytes content for consistency with heap Str/Bytes
-            // hence we don't include the discriminant
-            Self::InternString(string_id) => {
-                let mut hasher = DefaultHasher::new();
-                interns.get_str(*string_id).hash(&mut hasher);
-                return Ok(Some(hasher.finish()));
-            }
-            Self::InternBytes(bytes_id) => {
-                let mut hasher = DefaultHasher::new();
-                interns.get_bytes(*bytes_id).hash(&mut hasher);
-                return Ok(Some(hasher.finish()));
-            }
-            // Hash BigInt consistently with LongInt (using sign and bytes for large values)
-            Self::InternLongInt(long_int_id) => {
-                let bi = interns.get_long_int(*long_int_id);
-                let mut hasher = DefaultHasher::new();
-                let (sign, bytes) = bi.to_bytes_le();
-                sign.hash(&mut hasher);
-                bytes.hash(&mut hasher);
-                return Ok(Some(hasher.finish()));
-            }
-            // For heap-allocated values (includes Range and Exception), compute hash lazily and cache it
-            Self::Ref(id) => return heap.get_or_compute_hash(*id, interns),
-            _ => {}
-        }
-
+    pub fn py_hash(&self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
-        // hash based on discriminant to avoid collisions with different types
-        discriminant(self).hash(&mut hasher);
         match self {
-            // Immediate values can be hashed directly
-            Self::Undefined | Self::Ellipsis | Self::None => {}
-            Self::Bool(b) => b.hash(&mut hasher),
-            Self::Int(i) => i.hash(&mut hasher),
-            // Hash the bit representation of float for consistency
-            Self::Float(f) => f.to_bits().hash(&mut hasher),
+            Self::InternString(string_id) => return Ok(Some(vm.interns.str_hash(*string_id))),
+            Self::InternBytes(bytes_id) => return Ok(Some(vm.interns.bytes_hash(*bytes_id))),
+            Self::InternLongInt(long_int_id) => return Ok(Some(vm.interns.long_int_hash(*long_int_id))),
+            // Bool and int hash directly as their value, and are equivalent
+            Self::Bool(b) => return Ok(Some(HashValue::new((*b).into()))),
+            Self::Int(i) => return Ok(Some(HashValue::new(i.cast_unsigned()))),
+            Self::Float(f) => {
+                return {
+                    if f.fract() == 0.0 && *f >= (i64::MIN as f64) && *f <= (i64::MAX as f64) {
+                        // Hash floats that are mathematically integers the same as Ints (e.g., 1.0 hashes the same as 1)
+                        #[expect(clippy::cast_possible_truncation)]
+                        Ok(Some(HashValue::new((*f as i64).cast_unsigned())))
+                    } else {
+                        // Hash the bit representation of the float
+                        Ok(Some(HashValue::new(f.to_bits())))
+                    }
+                };
+            }
+            // For heap-allocated values, dispatch to the per-type `py_hash`
+            // impl. Types that benefit from caching (Str/Bytes/Tuple/
+            // NamedTuple/FrozenSet/Path) carry an inline `cached_hash`;
+            // cheap-to-hash types recompute each call.
+            Self::Ref(id) => return vm.heap.read(*id).py_hash(*id, vm),
+            // Singleton values can be hashed directly
+            Self::Undefined | Self::Ellipsis | Self::None => discriminant(self).hash(&mut hasher),
             Self::Builtin(b) => b.hash(&mut hasher),
             Self::ModuleFunction(mf) => mf.hash(&mut hasher),
             // Hash functions based on function ID
@@ -1497,13 +1549,11 @@ impl Value {
             Self::Property(p) => p.hash(&mut hasher),
             // ExternalFutures are hashable based on their call ID
             Self::ExternalFuture(call_id) => call_id.raw().hash(&mut hasher),
-            Self::InternString(_) | Self::InternBytes(_) | Self::InternLongInt(_) | Self::Ref(_) => {
-                unreachable!("covered above")
-            }
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
-        Ok(Some(hasher.finish()))
+
+        Ok(Some(HashValue::new(hasher.finish())))
     }
 
     /// TODO this doesn't have many tests!!! also doesn't cover bytes
@@ -1514,104 +1564,134 @@ impl Value {
     /// - Dict: key lookup
     /// - Set/FrozenSet: element lookup
     /// - Str: substring search
-    pub fn py_contains(&self, item: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<bool> {
+    pub fn py_contains(&self, item: &Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<bool> {
         match self {
-            Self::Ref(heap_id) => Heap::with_entry_mut(vm, *heap_id, |vm, data| match data {
-                HeapDataMut::List(list) => {
-                    for el in list.as_slice() {
-                        if item.py_eq(el, vm)? {
-                            return Ok(true);
+            Self::Ref(heap_id) => {
+                let output = vm.heap.read(*heap_id);
+                match output {
+                    HeapReadOutput::List(list) => {
+                        let len = list.get(vm.heap).len();
+                        for i in 0..len {
+                            let el = list.clone_item(i, vm);
+                            let eq = item.py_eq(&el, vm);
+                            el.drop_with_heap(vm);
+                            if eq? {
+                                return Ok(true);
+                            }
                         }
+                        Ok(false)
                     }
-                    Ok(false)
-                }
-                HeapDataMut::Tuple(tuple) => {
-                    for el in tuple.as_slice() {
-                        if item.py_eq(el, vm)? {
-                            return Ok(true);
+                    HeapReadOutput::Tuple(tuple) => {
+                        let len = tuple.get(vm.heap).as_slice().len();
+                        for i in 0..len {
+                            let el = tuple.clone_item(i, vm);
+                            let eq = item.py_eq(&el, vm);
+                            el.drop_with_heap(vm);
+                            if eq? {
+                                return Ok(true);
+                            }
                         }
+                        Ok(false)
                     }
-                    Ok(false)
-                }
-                HeapDataMut::Dict(dict) => dict.get(item, vm).map(|m| m.is_some()),
-                HeapDataMut::DictKeysView(view) => Heap::with_entry_mut(vm, view.dict_id(), |vm, dict_data| {
-                    let HeapDataMut::Dict(dict) = dict_data else {
-                        panic!("dict_keys view must reference a dict");
-                    };
-                    dict.get(item, vm).map(|m| m.is_some())
-                }),
-                HeapDataMut::DictItemsView(view) => {
-                    let Some((key, value)) = cloned_items_view_candidate(item, vm) else {
-                        return Ok(false);
-                    };
-                    let mut key_guard = HeapGuard::new(key, vm);
-                    let (key, vm) = key_guard.as_parts_mut();
-                    let mut value_guard = HeapGuard::new(value, vm);
-                    let (value, vm) = value_guard.as_parts_mut();
-                    Heap::with_entry_mut(vm, view.dict_id(), |vm, dict_data| {
-                        let HeapDataMut::Dict(dict) = dict_data else {
+                    HeapReadOutput::Dict(dict) => dict.contains_key(item, vm),
+                    HeapReadOutput::DictKeysView(view) => {
+                        let dict_id = view.get(vm.heap).dict_id();
+                        let HeapReadOutput::Dict(dict) = vm.heap.read(dict_id) else {
+                            panic!("dict_keys view must reference a dict");
+                        };
+                        dict.contains_key(item, vm)
+                    }
+                    HeapReadOutput::DictItemsView(view) => {
+                        let dict_id = view.get(vm.heap).dict_id();
+                        let Some((key, value)) = cloned_items_view_candidate(item, vm) else {
+                            return Ok(false);
+                        };
+                        let mut key_guard = HeapGuard::new(key, vm);
+                        let (key, vm) = key_guard.as_parts_mut();
+                        let mut value_guard = HeapGuard::new(value, vm);
+                        let (value, vm) = value_guard.as_parts_mut();
+                        let HeapReadOutput::Dict(dict) = vm.heap.read(dict_id) else {
                             panic!("dict_items view must reference a dict");
                         };
-                        match dict.get(key, vm) {
-                            Ok(Some(existing_value)) => value.py_eq(existing_value, vm).map_err(RunError::from),
+                        match dict.dict_get(key, vm) {
+                            Ok(Some(existing_value)) => {
+                                let result = value.py_eq(&existing_value, vm);
+                                existing_value.drop_with_heap(vm);
+                                result.map_err(RunError::from)
+                            }
                             Ok(None) => Ok(false),
                             Err(e) => Err(e),
                         }
-                    })
-                }
-                HeapDataMut::DictValuesView(view) => Heap::with_entry_mut(vm, view.dict_id(), |vm, dict_data| {
-                    let HeapDataMut::Dict(dict) = dict_data else {
-                        panic!("dict_values view must reference a dict");
-                    };
-                    for (_, value) in dict.iter() {
-                        if item.py_eq(value, vm)? {
-                            return Ok(true);
-                        }
                     }
-                    Ok(false)
-                }),
-                HeapDataMut::Set(set) => set.contains(item, vm),
-                HeapDataMut::FrozenSet(fset) => fset.contains(item, vm),
-                HeapDataMut::Str(s) => str_contains(s.as_str(), item, vm.heap, vm.interns),
-                HeapDataMut::Range(range) => {
-                    // Range containment is O(1) - check bounds and step alignment
-                    let n = match item {
-                        Self::Int(i) => *i,
-                        Self::Bool(b) => i64::from(*b),
-                        Self::Float(f) => {
-                            // Floats are contained if they equal an integer in the range
-                            // e.g., 3.0 in range(5) is True, but 3.5 in range(5) is False
-                            if f.fract() != 0.0 {
-                                return Ok(false);
+                    HeapReadOutput::DictValuesView(view) => {
+                        let dict_id = view.get(vm.heap).dict_id();
+                        let HeapReadOutput::Dict(dict) = vm.heap.read(dict_id) else {
+                            panic!("dict_values view must reference a dict");
+                        };
+                        // Iterate by index, cloning each value for py_eq comparison
+                        let len = dict.get(vm.heap).len();
+                        for i in 0..len {
+                            // Two-phase clone: read ref discriminant, then inc_ref
+                            let ref_id = match dict.get(vm.heap).value_at(i) {
+                                Some(Self::Ref(id)) => Some(*id),
+                                _ => None,
+                            };
+                            let el = if let Some(id) = ref_id {
+                                vm.heap.inc_ref(id);
+                                Self::Ref(id)
+                            } else {
+                                dict.get(vm.heap).value_at(i).expect("index valid").clone_immediate()
+                            };
+                            let eq = item.py_eq(&el, vm);
+                            el.drop_with_heap(vm);
+                            if eq? {
+                                return Ok(true);
                             }
-                            // Check if float is within i64 range and convert safely
-                            // f64 can represent integers up to 2^53 exactly
-                            let int_val = f.trunc();
-                            if int_val < i64::MIN as f64 || int_val > i64::MAX as f64 {
-                                return Ok(false);
-                            }
-                            // Safe conversion: we've verified it's a whole number in i64 range
-                            #[expect(clippy::cast_possible_truncation)]
-                            let n = int_val as i64;
-                            n
                         }
-                        _ => return Ok(false),
-                    };
-                    Ok(range.contains(n))
+                        Ok(false)
+                    }
+                    HeapReadOutput::Set(set) => set.contains(item, vm),
+                    HeapReadOutput::FrozenSet(fset) => fset.contains(item, vm),
+                    HeapReadOutput::Str(s) => {
+                        let s_str = s.get(vm.heap).as_str();
+                        str_contains(s_str, item, vm.heap, vm.interns)
+                    }
+                    HeapReadOutput::Range(range) => {
+                        // Range containment is O(1) - check bounds and step alignment
+                        let range = range.get(vm.heap);
+                        let n = match item {
+                            Self::Int(i) => *i,
+                            Self::Bool(b) => i64::from(*b),
+                            Self::Float(f) => {
+                                if f.fract() != 0.0 {
+                                    return Ok(false);
+                                }
+                                let int_val = f.trunc();
+                                if int_val < i64::MIN as f64 || int_val > i64::MAX as f64 {
+                                    return Ok(false);
+                                }
+                                #[expect(clippy::cast_possible_truncation)]
+                                let n = int_val as i64;
+                                n
+                            }
+                            _ => return Ok(false),
+                        };
+                        Ok(range.contains(n))
+                    }
+                    _ => {
+                        let type_name = self.py_type(vm);
+                        Err(ExcType::type_error(format!(
+                            "argument of type '{type_name}' is not iterable"
+                        )))
+                    }
                 }
-                other => {
-                    let type_name = other.py_type(vm.heap);
-                    Err(ExcType::type_error(format!(
-                        "argument of type '{type_name}' is not iterable"
-                    )))
-                }
-            }),
+            }
             Self::InternString(string_id) => {
                 let container_str = vm.interns.get_str(*string_id);
                 str_contains(container_str, item, vm.heap, vm.interns)
             }
             _ => {
-                let type_name = self.py_type(vm.heap);
+                let type_name = self.py_type(vm);
                 Err(ExcType::type_error(format!(
                     "argument of type '{type_name}' is not iterable"
                 )))
@@ -1625,13 +1705,10 @@ impl Value {
     /// Accepts `EitherStr` to support both interned and heap-allocated attribute names.
     ///
     /// Returns `AttributeError` for other types or unknown attributes.
-    pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<CallResult> {
+    pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<CallResult> {
         match self {
             Self::Ref(heap_id) => {
-                // Use with_entry_mut to get access to both data and heap without borrow conflicts.
-                // This allows py_getattr to allocate (for computed attributes) while we hold the data.
-                let opt_result = Heap::with_entry_mut(vm, *heap_id, |vm, data| data.py_getattr(attr, vm))?;
-                if let Some(call_result) = opt_result {
+                if let Some(call_result) = vm.heap.read(*heap_id).py_getattr(attr, vm)? {
                     return Ok(call_result);
                 }
             }
@@ -1646,10 +1723,13 @@ impl Value {
                     let str_id = vm.heap.allocate(HeapData::Str(Str::from(name_str)))?;
                     return Ok(CallResult::Value(Self::Ref(str_id)));
                 }
+                if *t == Type::TimeZone && attr.as_str(vm.interns) == "utc" {
+                    return Ok(CallResult::Value(vm.heap.get_timezone_utc()?));
+                }
             }
             _ => {}
         }
-        let type_name = self.py_type(vm.heap);
+        let type_name = self.py_type(vm);
         Err(ExcType::attribute_error(type_name, attr.as_str(vm.interns)))
     }
 
@@ -1660,44 +1740,30 @@ impl Value {
     ///
     /// Takes ownership of `value` and drops it on error.
     /// On success, drops the old attribute value if one existed.
-    pub fn py_set_attr(
-        &self,
-        name_id: StringId,
-        value: Self,
-        vm: &mut VM<'_, '_, impl ResourceTracker>,
-    ) -> RunResult<()> {
-        let attr_name = vm.interns.get_str(name_id);
-
+    pub fn py_set_attr(&self, name: &EitherStr, value: Self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<()> {
         if let Self::Ref(heap_id) = self {
-            let heap_id = *heap_id;
-            let is_dataclass = matches!(vm.heap.get(heap_id), HeapData::Dataclass(_));
-
-            if is_dataclass {
-                let name_value = Self::InternString(name_id);
-                Heap::with_entry_mut(vm, heap_id, |vm, data| {
-                    if let HeapDataMut::Dataclass(dc) = data {
-                        match dc.set_attr(name_value, value, vm) {
-                            Ok(old_value) => {
-                                if let Some(old) = old_value {
-                                    old.drop_with_heap(vm.heap);
-                                }
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        unreachable!("type changed during borrow")
-                    }
-                })
-            } else {
-                let type_name = vm.heap.get(heap_id).py_type(vm.heap);
-                value.drop_with_heap(vm.heap);
-                Err(ExcType::attribute_error_no_setattr(type_name, attr_name))
+            match vm.heap.read(*heap_id) {
+                HeapReadOutput::Dataclass(mut dc) => {
+                    let name_value = match name {
+                        EitherStr::Interned(string_id) => Self::InternString(*string_id),
+                        // TODO: should avoid needing to clone String via `EitherStr` - maybe
+                        // `EitherStr` should store a `HeapRead<Str>`?
+                        EitherStr::Heap(s) => Self::Ref(vm.heap.allocate(HeapData::Str(Str::from(s.to_owned())))?),
+                    };
+                    let old_value = dc.set_attr(name_value, value, vm)?;
+                    old_value.drop_with_heap(vm);
+                    Ok(())
+                }
+                other => {
+                    let type_name = other.py_type(vm);
+                    value.drop_with_heap(vm);
+                    Err(ExcType::attribute_error_no_setattr(type_name, name.as_str(vm.interns)))
+                }
             }
         } else {
-            let type_name = self.py_type(vm.heap);
-            value.drop_with_heap(vm.heap);
-            Err(ExcType::attribute_error_no_setattr(type_name, attr_name))
+            let type_name = self.py_type(vm);
+            value.drop_with_heap(vm);
+            Err(ExcType::attribute_error_no_setattr(type_name, name.as_str(vm.interns)))
         }
     }
 
@@ -1710,19 +1776,19 @@ impl Value {
     /// heap-allocated `LongInt` values always exceed i64 range because `LongInt::into_value()`
     /// automatically demotes i64-fitting values to `Value::Int`. However, this path could be
     /// reached via deserialization of crafted snapshot data.
-    pub fn as_int(&self, heap: &Heap<impl ResourceTracker>) -> RunResult<i64> {
+    pub fn as_int(&self, vm: &VM<'_, impl ResourceTracker>) -> RunResult<i64> {
         match self {
             Self::Int(i) => Ok(*i),
             Self::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = heap.get(*heap_id) {
-                    li.to_i64().ok_or_else(ExcType::overflow_shift_count)
+                if let HeapData::LongInt(li) = vm.heap.get(*heap_id) {
+                    li.to_i64().ok_or_else(ExcType::overflow_c_ssize_t)
                 } else {
-                    let msg = format!("'{}' object cannot be interpreted as an integer", self.py_type(heap));
+                    let msg = format!("'{}' object cannot be interpreted as an integer", self.py_type(vm));
                     Err(SimpleException::new_msg(ExcType::TypeError, msg).into())
                 }
             }
             _ => {
-                let msg = format!("'{}' object cannot be interpreted as an integer", self.py_type(heap));
+                let msg = format!("'{}' object cannot be interpreted as an integer", self.py_type(vm));
                 Err(SimpleException::new_msg(ExcType::TypeError, msg).into())
             }
         }
@@ -1738,18 +1804,18 @@ impl Value {
     /// heap-allocated `LongInt` values always exceed i64 range because `LongInt::into_value()`
     /// automatically demotes i64-fitting values to `Value::Int`. However, this path could be
     /// reached via deserialization of crafted snapshot data.
-    pub fn as_index(&self, heap: &Heap<impl ResourceTracker>, container_type: Type) -> RunResult<i64> {
+    pub fn as_index(&self, vm: &VM<'_, impl ResourceTracker>, container_type: Type) -> RunResult<i64> {
         match self {
             Self::Int(i) => Ok(*i),
             Self::Bool(b) => Ok(i64::from(*b)),
             Self::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = heap.get(*heap_id) {
+                if let HeapData::LongInt(li) = vm.heap.get(*heap_id) {
                     li.to_i64().ok_or_else(ExcType::index_error_int_too_large)
                 } else {
-                    Err(ExcType::type_error_indices(container_type, self.py_type(heap)))
+                    Err(ExcType::type_error_indices(container_type, self.py_type(vm)))
                 }
             }
-            _ => Err(ExcType::type_error_indices(container_type, self.py_type(heap))),
+            _ => Err(ExcType::type_error_indices(container_type, self.py_type(vm))),
         }
     }
 
@@ -1766,15 +1832,15 @@ impl Value {
         &self,
         other: &Self,
         op: BitwiseOp,
-        heap: &mut Heap<impl ResourceTracker>,
+        vm: &mut VM<'_, impl ResourceTracker>,
     ) -> Result<Self, RunError> {
         // Capture types for error messages
-        let lhs_type = self.py_type(heap);
-        let rhs_type = other.py_type(heap);
+        let lhs_type = self.py_type(vm);
+        let rhs_type = other.py_type(vm);
 
         // Extract BigInt from all numeric types
-        let lhs_bigint = extract_bigint(self, heap);
-        let rhs_bigint = extract_bigint(other, heap);
+        let lhs_bigint = extract_bigint(self, vm.heap);
+        let rhs_bigint = extract_bigint(other, vm.heap);
 
         if let (Some(l), Some(r)) = (lhs_bigint, rhs_bigint) {
             let result = match op {
@@ -1793,13 +1859,13 @@ impl Value {
                         #[expect(clippy::cast_sign_loss)]
                         let shift_u64 = shift as u64;
                         // Check size before computing to prevent DoS
-                        check_lshift_size(l.bits(), shift_u64, heap.tracker())?;
+                        check_lshift_size(l.bits(), shift_u64, vm.heap.tracker())?;
                         l << shift_u64
                     } else if r.sign() == num_bigint::Sign::Minus {
                         return Err(ExcType::value_error_negative_shift_count());
                     } else {
                         // Shift amount too large to fit in i64 - this would be astronomically large
-                        return Err(ExcType::overflow_shift_count());
+                        return Err(ExcType::overflow_c_ssize_t());
                     }
                 }
                 BitwiseOp::RShift => {
@@ -1826,7 +1892,7 @@ impl Value {
                 }
             };
             // Convert result back to Value, demoting to i64 if it fits
-            LongInt::new(result).into_value(heap).map_err(Into::into)
+            LongInt::new(result).into_value(vm.heap).map_err(Into::into)
         } else {
             Err(ExcType::binary_type_error(op.as_str(), lhs_type, rhs_type))
         }
@@ -1872,22 +1938,22 @@ impl Value {
     /// # Important
     /// This method MUST be called before overwriting a namespace slot or discarding
     /// a value to prevent memory leaks.
-    #[cfg(not(feature = "ref-count-panic"))]
+    #[cfg(not(feature = "memory-model-checks"))]
     #[inline]
     pub fn drop_with_heap(self, heap: &mut impl ContainsHeap) {
         if let Self::Ref(id) = self {
             heap.heap_mut().dec_ref(id);
         }
     }
-    /// With `ref-count-panic` enabled, `Ref` variants are replaced with `Dereferenced` and
+    /// With `memory-model-checks` enabled, `Ref` variants are replaced with `Dereferenced` and
     /// the original is forgotten to prevent the Drop impl from panicking. Non-Ref variants
     /// are left unchanged since they don't trigger the Drop panic.
-    #[cfg(feature = "ref-count-panic")]
+    #[cfg(feature = "memory-model-checks")]
     pub fn drop_with_heap(mut self, heap: &mut impl ContainsHeap) {
-        let old = std::mem::replace(&mut self, Self::Dereferenced);
+        let old = mem::replace(&mut self, Self::Dereferenced);
         if let Self::Ref(id) = &old {
             heap.heap_mut().dec_ref(*id);
-            std::mem::forget(old);
+            mem::forget(old);
         }
     }
 
@@ -1914,7 +1980,7 @@ impl Value {
             Self::Property(p) => Self::Property(*p),
             Self::ExternalFuture(call_id) => Self::ExternalFuture(*call_id),
             Self::Ref(_) => panic!("Ref clones must go through clone_with_heap to maintain refcounts"),
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot copy Dereferenced object"),
         }
     }
@@ -1922,10 +1988,23 @@ impl Value {
     /// Mark as Dereferenced to prevent Drop panic
     ///
     /// This should be called from `py_dec_ref_ids` methods only
-    #[cfg(feature = "ref-count-panic")]
+    #[cfg(feature = "memory-model-checks")]
     pub fn dec_ref_forget(&mut self) {
-        let old = std::mem::replace(self, Self::Dereferenced);
-        std::mem::forget(old);
+        let old = mem::replace(self, Self::Dereferenced);
+        mem::forget(old);
+    }
+
+    /// Pushes any contained `HeapId` onto the stack for reference counting.
+    ///
+    /// For `Value::Ref` variants, pushes the heap ID so the referenced object's
+    /// refcount can be decremented. When `memory-model-checks` is enabled, also marks
+    /// this value as `Dereferenced` to prevent Drop panics.
+    pub fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+        if let Self::Ref(id) = self {
+            stack.push(*id);
+            #[cfg(feature = "memory-model-checks")]
+            self.dec_ref_forget();
+        }
     }
 
     /// Converts the value into a keyword string representation if possible.
@@ -2096,7 +2175,7 @@ impl Marker {
     /// System markers have special repr formats ("<stdout>", "<stderr>").
     /// `typing.Union` uses `<class 'typing.Union'>` format (matching CPython).
     /// Other typing markers are prefixed with "typing." (e.g., "typing.Any").
-    fn py_repr_fmt(self, f: &mut impl Write) -> fmt::Result {
+    pub(crate) fn py_repr_fmt(self, f: &mut impl Write) -> fmt::Result {
         let s: &'static str = self.0.into();
         match self.0 {
             StaticStrings::Stdout => f.write_str("<stdout>")?,
@@ -2368,7 +2447,7 @@ fn cloned_items_view_candidate(item: &Value, heap: &impl ContainsHeap) -> Option
 fn str_contains(
     container_str: &str,
     item: &Value,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &Heap<impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<bool> {
     match item {
@@ -2433,17 +2512,23 @@ mod tests {
     use num_bigint::BigInt;
 
     use super::*;
-    use crate::resource::NoLimitTracker;
+    use crate::{PrintWriter, heap::HeapReader, intern::InternerBuilder, resource::NoLimitTracker};
 
     /// Creates a heap and directly allocates a LongInt with the given BigInt value.
     ///
     /// This bypasses `LongInt::into_value()` which would demote i64-fitting values.
     /// Used to test defensive code paths that handle LongInt-as-index scenarios.
     fn create_heap_with_longint(value: BigInt) -> (Heap<NoLimitTracker>, HeapId) {
-        let mut heap = Heap::new(16, NoLimitTracker);
+        let heap = Heap::new(16, NoLimitTracker);
         let long_int = LongInt::new(value);
         let heap_id = heap.allocate(HeapData::LongInt(long_int)).unwrap();
         (heap, heap_id)
+    }
+
+    /// Creates a minimal Interns for testing.
+    fn create_test_interns() -> Interns {
+        let interner = InternerBuilder::new("");
+        Interns::new(interner, vec![])
     }
 
     /// Tests that `as_index()` correctly handles a LongInt containing an i64-fitting value.
@@ -2456,7 +2541,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(42));
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert_eq!(result.unwrap(), 42);
         value.drop_with_heap(&mut heap);
     }
@@ -2467,7 +2556,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(-100));
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert_eq!(result.unwrap(), -100);
         value.drop_with_heap(&mut heap);
     }
@@ -2480,7 +2573,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert!(result.is_err());
         value.drop_with_heap(&mut heap);
     }
@@ -2493,7 +2590,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(12345));
         let value = Value::Ref(heap_id);
 
-        let result = value.as_int(&heap);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_int(&vm)
+        });
         assert_eq!(result.unwrap(), 12345);
         value.drop_with_heap(&mut heap);
     }
@@ -2505,7 +2606,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let result = value.as_int(&heap);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_int(&vm)
+        });
         assert!(result.is_err());
         value.drop_with_heap(&mut heap);
     }
@@ -2516,7 +2621,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(i64::MAX));
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert_eq!(result.unwrap(), i64::MAX);
         value.drop_with_heap(&mut heap);
     }
@@ -2527,7 +2636,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(i64::MIN));
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert_eq!(result.unwrap(), i64::MIN);
         value.drop_with_heap(&mut heap);
     }
@@ -2539,7 +2652,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert!(result.is_err());
         value.drop_with_heap(&mut heap);
     }
@@ -2551,7 +2668,11 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let result = value.as_index(&heap, Type::List);
+        let mut interns = create_test_interns();
+        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            value.as_index(&vm, Type::List)
+        });
         assert!(result.is_err());
         value.drop_with_heap(&mut heap);
     }

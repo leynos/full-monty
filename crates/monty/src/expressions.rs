@@ -83,6 +83,19 @@ impl Identifier {
     }
 }
 
+/// A single module in an `import` statement (e.g., `sys` in `import sys` or `sys as s`).
+///
+/// Each entry in `import a, b as c` becomes one `ImportName` with its own
+/// module name and binding target.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImportName {
+    /// The module name to import (e.g., "sys", "typing").
+    pub module_name: StringId,
+    /// The binding target — the alias if provided, otherwise the module name.
+    /// After the prepare phase, this includes the resolved namespace slot.
+    pub binding: Identifier,
+}
+
 /// Target of a function call expression.
 ///
 /// Represents a callable that can be either:
@@ -356,6 +369,45 @@ pub enum UnpackTarget {
     Starred(Identifier),
 }
 
+/// Target of a single assignment step within a chained assignment.
+///
+/// Chained assignments (`a = b[i] = obj.x = expr`) evaluate `expr` once and
+/// then assign the resulting value to each target in left-to-right order.
+/// `AssignTarget` captures just the target portion of each of the usual
+/// single-target assignment node variants (`Assign`, `SubscriptAssign`,
+/// `AttrAssign`, `UnpackAssign`) so they can share a common list in
+/// `Node::ChainAssign` without embedding a dummy source expression.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum AssignTarget {
+    /// Simple name target: `a`.
+    Name(Identifier),
+    /// Subscript target: `container[index]`.
+    Subscript {
+        /// Expression evaluating to the container object.
+        target: ExprLoc,
+        /// Expression evaluating to the index/key.
+        index: ExprLoc,
+        /// Position of the full subscript expression (for traceback carets).
+        target_position: CodeRange,
+    },
+    /// Attribute target: `obj.attr`.
+    Attr {
+        /// Expression evaluating to the object whose attribute is being set.
+        object: ExprLoc,
+        /// The attribute name.
+        attr: EitherStr,
+        /// Position of the full attribute expression (for traceback carets).
+        target_position: CodeRange,
+    },
+    /// Tuple/list unpacking target: `a, b` or `[a, *rest]`.
+    Unpack {
+        /// The individual unpack targets (can be names, starred, or nested tuples).
+        targets: Vec<UnpackTarget>,
+        /// Source position covering all targets (for error caret placement).
+        targets_position: CodeRange,
+    },
+}
+
 /// A generator clause in a comprehension: `for target in iter [if cond1] [if cond2]...`
 ///
 /// Represents one `for` clause with zero or more `if` filters. Multiple generators
@@ -474,27 +526,49 @@ pub enum Node<F> {
     OpAssign {
         target: Identifier,
         op: Operator,
-        object: ExprLoc,
+        /// The right-hand side value of the augmented assignment (e.g., `1` in `x += 1`).
+        value: ExprLoc,
     },
-    /// Augmented subscript assignment (e.g., `totals[key] += value`).
+    /// Augmented subscript assignment (e.g., `totals[key] += value` or `a[0][1] += 1`).
     ///
-    /// This evaluates the container and index exactly once, then performs the
+    /// This evaluates the container expression and index exactly once, then performs the
     /// inplace operation on the current item before storing the result back.
     /// Limiting duplicate evaluation is important because index expressions may
     /// have side effects and CPython only evaluates them once.
+    /// The `target` is an arbitrary expression evaluating to the container — it can be
+    /// a simple name, a nested subscript (`a[0]`), or an attribute access (`obj.field`).
     SubscriptOpAssign {
-        target: Identifier,
+        target: ExprLoc,
         index: ExprLoc,
         op: Operator,
-        object: ExprLoc,
+        /// The right-hand side value of the augmented assignment (e.g., `1` in `a[0] += 1`).
+        value: ExprLoc,
         /// Position of the subscript expression (e.g., `totals[key]`) for traceback carets.
         target_position: CodeRange,
     },
+    /// Subscript assignment (e.g., `lst[0] = value` or `a[0][1] = value`).
+    ///
+    /// The `target` is an arbitrary expression evaluating to the container — it can be
+    /// a simple name, a nested subscript (`a[0]`), or an attribute access (`obj.field`).
     SubscriptAssign {
-        target: Identifier,
+        target: ExprLoc,
         index: ExprLoc,
         value: ExprLoc,
         /// Position of the subscript expression (e.g., `lst[10]`) for traceback carets.
+        target_position: CodeRange,
+    },
+    /// Augmented attribute assignment (e.g., `point.x += 1` or `a.b.c -= 5`).
+    ///
+    /// Evaluates the object expression once, loads the attribute, performs the
+    /// inplace operation with the right-hand side, then stores the result back.
+    /// The `object` is an arbitrary expression — it can be a name, a subscript,
+    /// or a chained attribute access.
+    AttrOpAssign {
+        object: ExprLoc,
+        attr: EitherStr,
+        op: Operator,
+        value: ExprLoc,
+        /// Position of the attribute expression (e.g., `point.x`) for traceback carets.
         target_position: CodeRange,
     },
     /// Attribute assignment (e.g., `point.x = 5` or `a.b.c = 5`).
@@ -507,6 +581,22 @@ pub enum Node<F> {
         attr: EitherStr,
         target_position: CodeRange,
         value: ExprLoc,
+    },
+    /// Chained assignment (e.g., `a = b = c = value` or `a = lst[i] = obj.x = value`).
+    ///
+    /// Python evaluates the right-hand side exactly once and then assigns the resulting
+    /// value to each target in left-to-right source order. The compiler realises this
+    /// by evaluating `object`, duplicating its value on the stack before each non-final
+    /// target's store, and letting the final target consume the remaining copy.
+    ///
+    /// Only emitted when there are two or more targets; single-target assignments still
+    /// use the simpler `Assign`/`UnpackAssign`/`SubscriptAssign`/`AttrAssign` variants
+    /// so the hot path stays flat.
+    ChainAssign {
+        /// Targets to assign to, in left-to-right source order.
+        targets: Vec<AssignTarget>,
+        /// The right-hand side expression, evaluated exactly once.
+        object: ExprLoc,
     },
     For {
         /// Loop target - either a single identifier or tuple unpacking pattern.
@@ -565,15 +655,14 @@ pub enum Node<F> {
     /// Executes body, catches matching exceptions with handlers, runs else if no exception,
     /// and always runs finally.
     Try(Try<Self>),
-    /// Import statement (e.g., `import sys`, `import sys as s`).
+    /// Import statement (e.g., `import sys`, `import sys, os`, `import sys as s`).
     ///
-    /// Loads a module and binds it to a name in the current namespace.
+    /// Loads one or more modules and binds them to names in the current namespace.
+    /// Multi-module imports like `import sys, os` are represented as a single node
+    /// with multiple entries in the vector.
     Import {
-        /// The module name to import (e.g., "sys", "typing").
-        module_name: StringId,
-        /// The binding target - contains the name (or alias), position, and namespace slot.
-        /// After prepare phase, this includes the resolved namespace slot for storing the module.
-        binding: Identifier,
+        /// The modules to import, each with a module name and binding target.
+        names: Vec<ImportName>,
     },
     /// From-import statement (e.g., `from typing import TYPE_CHECKING`).
     ///

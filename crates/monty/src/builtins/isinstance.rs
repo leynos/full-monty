@@ -15,13 +15,12 @@ use crate::{
 /// Implementation of the isinstance() builtin function.
 ///
 /// Checks if an object is an instance of a class or a tuple of classes.
-pub fn builtin_isinstance(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_isinstance(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (obj, classinfo) = args.get_two_args("isinstance", vm.heap)?;
     defer_drop!(obj, vm);
     defer_drop!(classinfo, vm);
+    let obj_type = obj.py_type(vm);
     let heap = &mut *vm.heap;
-
-    let obj_type = obj.py_type(heap);
 
     match isinstance_check(obj_type, classinfo, heap) {
         Ok(result) => Ok(Value::Bool(result)),

@@ -15,7 +15,13 @@
 ///
 /// This type is used for `sys.version_info` and similar structured tuples where
 /// named access improves usability and readability.
-use std::fmt::Write;
+use std::{
+    cell::Cell,
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::{Hash, Hasher},
+    mem,
+};
 
 use ahash::AHashSet;
 
@@ -24,7 +30,8 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapId},
+    hash::HashValue,
+    heap::{HeapId, HeapItem, HeapRead},
     intern::{Interns, StringId},
     resource::{ResourceError, ResourceTracker},
     types::Type,
@@ -57,6 +64,9 @@ pub(crate) struct NamedTuple {
     items: Vec<Value>,
     /// True if any item is a `Value::Ref`. Set at creation time since named tuples are immutable.
     contains_refs: bool,
+    /// Lazily-computed Python hash. Same rationale as [`super::Tuple::cached_hash`].
+    #[serde(skip)]
+    cached_hash: Cell<Option<HashValue>>,
 }
 
 impl NamedTuple {
@@ -84,6 +94,7 @@ impl NamedTuple {
             field_names,
             items,
             contains_refs,
+            cached_hash: Cell::new(None),
         }
     }
 
@@ -134,72 +145,184 @@ impl NamedTuple {
             .position(|field_name| field_name.as_str(interns) == name_str)
             .map(|idx| &self.items[idx])
     }
+}
 
-    /// Gets a field value by index, supporting negative indexing.
-    ///
+impl<'h> HeapRead<'h, NamedTuple> {
     /// Returns `Some(value)` if the index is in bounds, `None` otherwise.
     /// Uses `index + len` instead of `-index` to avoid overflow on `i64::MIN`.
     #[must_use]
-    pub fn get_by_index(&self, index: i64) -> Option<&Value> {
-        let len = i64::try_from(self.items.len()).ok()?;
+    pub fn get_by_index<'a>(&'a self, vm: &'a VM<'h, impl ResourceTracker>, index: i64) -> Option<&'a Value> {
+        let len = i64::try_from(self.get(vm.heap).items.len()).ok()?;
         let normalized = if index < 0 { index + len } else { index };
         if normalized < 0 || normalized >= len {
             return None;
         }
-        self.items.get(usize::try_from(normalized).ok()?)
+        self.get(vm.heap).items.get(usize::try_from(normalized).ok()?)
+    }
+
+    /// Clones a single item.
+    pub(crate) fn clone_item(&self, index: usize, vm: &mut VM<'h, impl ResourceTracker>) -> Value {
+        self.get(vm.heap).items[index].clone_with_heap(vm)
+    }
+
+    /// Cross-type equality between NamedTuple and Tuple via HeapRead.
+    ///
+    /// Uses index-based item access with short-lived borrows to compare elements
+    /// without holding a heap borrow across `py_eq` calls.
+    pub(crate) fn eq_tuple(
+        &self,
+        other: &HeapRead<'h, super::Tuple>,
+        vm: &mut VM<'h, impl ResourceTracker>,
+    ) -> Result<bool, ResourceError> {
+        let a_len = self.get(vm.heap).len();
+        if a_len != other.get(vm.heap).as_slice().len() {
+            return Ok(false);
+        }
+        let token = vm.heap.incr_recursion_depth()?;
+        defer_drop!(token, vm);
+        for i in 0..a_len {
+            vm.heap.check_time()?;
+            let a_val = self.clone_item(i, vm);
+            let b_val = other.clone_item(i, vm);
+            let result = a_val.py_eq(&b_val, vm);
+            a_val.drop_with_heap(vm);
+            b_val.drop_with_heap(vm);
+            if !result? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
-impl PyTrait for NamedTuple {
-    fn py_type(&self, _heap: &Heap<impl ResourceTracker>) -> Type {
+/// `PyTrait` implementation for `HeapRead<NamedTuple>`, providing all Python operations
+/// on heap-allocated named tuples via short-lived borrow patterns.
+impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
+    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
         Type::NamedTuple
     }
 
-    fn py_estimate_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.name.py_estimate_size()
-            + self.field_names.len() * std::mem::size_of::<StringId>()
-            + self.items.len() * std::mem::size_of::<Value>()
+    fn py_len(&self, vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
+        Some(self.get(vm.heap).len())
     }
 
-    fn py_len(&self, _vm: &VM<'_, '_, impl ResourceTracker>) -> Option<usize> {
-        Some(self.items.len())
-    }
-
-    fn py_getitem(&self, key: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
         // Extract integer index from key, returning TypeError if not an int
         let index = match key {
             Value::Int(i) => *i,
-            _ => return Err(ExcType::type_error_indices(Type::NamedTuple, key.py_type(vm.heap))),
+            _ => return Err(ExcType::type_error_indices(Type::NamedTuple, key.py_type(vm))),
         };
 
         // Get by index with bounds checking
-        match self.get_by_index(index) {
+        match self.get_by_index(vm, index) {
             Some(value) => Ok(value.clone_with_heap(vm.heap)),
             None => Err(ExcType::tuple_index_error()),
         }
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
-        // Compare only by items (not type_name) to match tuple semantics
-        // This allows sys.version_info == (3, 14, 0, 'final', 0) to work
-        if self.items.len() != other.items.len() {
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+        let a_len = self.get(vm.heap).len();
+        if a_len != other.get(vm.heap).len() {
             return Ok(false);
         }
         let token = vm.heap.incr_recursion_depth()?;
         defer_drop!(token, vm);
-        for (i1, i2) in self.items.iter().zip(&other.items) {
-            if !i1.py_eq(i2, vm)? {
+        for i in 0..a_len {
+            vm.heap.check_time()?;
+            let a_val = self.clone_item(i, vm);
+            let b_val = other.clone_item(i, vm);
+            let result = a_val.py_eq(&b_val, vm);
+            a_val.drop_with_heap(vm);
+            b_val.drop_with_heap(vm);
+            if !result? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
+    /// Hashes by element only (not by class name), matching `Tuple::py_hash`
+    /// so a `NamedTuple` and a `Tuple` with equal elements share the same hash.
+    /// Caches the computed hash on first call (see `Tuple::py_hash` for the
+    /// caching rationale).
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
+        if let Some(cached) = self.get(vm.heap).cached_hash.get() {
+            return Ok(Some(cached));
+        }
+        let token = vm.heap.incr_recursion_depth()?;
+        defer_drop!(token, vm);
+        let len = self.get(vm.heap).len();
+        let mut hasher = DefaultHasher::new();
+        for i in 0..len {
+            let item = self.clone_item(i, vm);
+            defer_drop!(item, vm);
+            match item.py_hash(vm)? {
+                Some(h) => h.hash(&mut hasher),
+                None => return Ok(None),
+            }
+        }
+        let hash = HashValue::new(hasher.finish());
+        self.get(vm.heap).cached_hash.set(Some(hash));
+        Ok(Some(hash))
+    }
+
+    fn py_bool(&self, vm: &mut VM<'h, impl ResourceTracker>) -> bool {
+        self.get(vm.heap).len() > 0
+    }
+
+    fn py_repr_fmt(
+        &self,
+        f: &mut impl Write,
+        vm: &mut VM<'h, impl ResourceTracker>,
+        heap_ids: &mut AHashSet<HeapId>,
+    ) -> RunResult<()> {
+        // Check depth limit before recursing
+        let Ok(token) = vm.heap.incr_recursion_depth() else {
+            return Ok(f.write_str("...")?);
+        };
+        defer_drop!(token, vm);
+
+        write!(f, "{}(", self.get(vm.heap).name.as_str(vm.interns))?;
+
+        let len = self.get(vm.heap).items.len();
+        for i in 0..len {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(self.get(vm.heap).field_names[i].as_str(vm.interns))?;
+            f.write_char('=')?;
+            let value = self.clone_item(i, vm);
+            defer_drop!(value, vm);
+            value.py_repr_fmt(f, vm, heap_ids)?;
+        }
+
+        f.write_char(')')?;
+        Ok(())
+    }
+
+    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
+        let attr_name = attr.as_str(vm.interns);
+        if let Some(value) = self.get(vm.heap).get_by_name(attr_name, vm.interns) {
+            Ok(Some(CallResult::Value(value.clone_with_heap(vm.heap))))
+        } else {
+            // we use name here, not `self.py_type(heap)` hence returning a Ok(None)
+            Err(ExcType::attribute_error(self.get(vm.heap).name(vm.interns), attr_name))
+        }
+    }
+}
+
+impl HeapItem for NamedTuple {
+    fn py_estimate_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + self.name.py_estimate_size()
+            + self.field_names.len() * mem::size_of::<StringId>()
+            + self.items.len() * mem::size_of::<Value>()
+    }
+
     /// Pushes all heap IDs contained in this named tuple onto the stack.
     ///
     /// Called during garbage collection to decrement refcounts of nested values.
-    /// When `ref-count-panic` is enabled, also marks all Values as Dereferenced.
+    /// When `memory-model-checks` is enabled, also marks all Values as Dereferenced.
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Skip iteration if no refs - GC optimization for tuples of primitives
         if !self.contains_refs {
@@ -208,54 +331,9 @@ impl PyTrait for NamedTuple {
         for obj in &mut self.items {
             if let Value::Ref(id) = obj {
                 stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
+                #[cfg(feature = "memory-model-checks")]
                 obj.dec_ref_forget();
             }
-        }
-    }
-
-    fn py_bool(&self, _vm: &VM<'_, '_, impl ResourceTracker>) -> bool {
-        !self.items.is_empty()
-    }
-
-    fn py_repr_fmt(
-        &self,
-        f: &mut impl Write,
-        vm: &VM<'_, '_, impl ResourceTracker>,
-        heap_ids: &mut AHashSet<HeapId>,
-    ) -> std::fmt::Result {
-        // Check depth limit before recursing
-        let heap = &*vm.heap;
-        let Some(token) = heap.incr_recursion_depth_for_repr() else {
-            return f.write_str("...");
-        };
-        crate::defer_drop_immutable_heap!(token, heap);
-
-        // Format: type_name(field1=value1, field2=value2, ...)
-        write!(f, "{}(", self.name.as_str(vm.interns))?;
-
-        let mut first = true;
-        for (field_name, value) in self.field_names.iter().zip(&self.items) {
-            if !first {
-                f.write_str(", ")?;
-            }
-            first = false;
-            f.write_str(field_name.as_str(vm.interns))?;
-            f.write_char('=')?;
-            value.py_repr_fmt(f, vm, heap_ids)?;
-        }
-
-        f.write_char(')')?;
-        Ok(())
-    }
-
-    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
-        let attr_name = attr.as_str(vm.interns);
-        if let Some(value) = self.get_by_name(attr_name, vm.interns) {
-            Ok(Some(CallResult::Value(value.clone_with_heap(vm.heap))))
-        } else {
-            // we use name here, not `self.py_type(heap)` hence returning a Ok(None)
-            Err(ExcType::attribute_error(self.name(vm.interns), attr_name))
         }
     }
 }

@@ -1,5 +1,7 @@
 //! Comparison operation helpers for the VM.
 
+use std::cmp::Ordering;
+
 use super::VM;
 use crate::{
     defer_drop,
@@ -9,7 +11,7 @@ use crate::{
     value::Value,
 };
 
-impl<T: ResourceTracker> VM<'_, '_, T> {
+impl<T: ResourceTracker> VM<'_, T> {
     /// Equality comparison.
     pub(super) fn compare_eq(&mut self) -> Result<(), RunError> {
         let this = self;
@@ -45,7 +47,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// Ordering comparison with a predicate.
     pub(super) fn compare_ord<F>(&mut self, check: F) -> Result<(), RunError>
     where
-        F: FnOnce(std::cmp::Ordering) -> bool,
+        F: FnOnce(Ordering) -> bool,
     {
         let this = self;
 

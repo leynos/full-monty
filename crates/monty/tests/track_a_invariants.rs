@@ -120,14 +120,14 @@ fn run_observer_modes_match_baseline_function_call_and_completion(
 ) {
     let run = build_run(FUNCTION_CALL_SCRIPT);
     let mut baseline_output = String::new();
-    let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
+    let mut baseline_print = PrintWriter::CollectString(&mut baseline_output);
     let baseline_progress = start_run_with_mode(&run, BenchmarkMode::Baseline, baseline_print.reborrow());
     let baseline_call = baseline_progress
         .into_function_call()
         .expect("baseline should suspend at function call");
 
     let mut observer_output = String::new();
-    let mut observer_print = PrintWriter::Collect(&mut observer_output);
+    let mut observer_print = PrintWriter::CollectString(&mut observer_output);
     let observer_progress = start_run_with_mode(&run, BenchmarkMode::Observer(mode), observer_print.reborrow());
     let observer_call = observer_progress
         .into_function_call()
@@ -185,14 +185,14 @@ fn run_observer_modes_match_baseline_error_path(#[case] mode: ObserverMode, trac
 fn run_observer_modes_match_baseline_os_call_path(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let run = build_run(OS_CALL_SCRIPT);
     let mut baseline_output = String::new();
-    let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
+    let mut baseline_print = PrintWriter::CollectString(&mut baseline_output);
     let baseline_progress = start_run_with_mode(&run, BenchmarkMode::Baseline, baseline_print.reborrow());
     let baseline_call = baseline_progress
         .into_os_call()
         .expect("baseline should suspend at OS call");
 
     let mut observer_output = String::new();
-    let mut observer_print = PrintWriter::Collect(&mut observer_output);
+    let mut observer_print = PrintWriter::CollectString(&mut observer_output);
     let observer_progress = start_run_with_mode(&run, BenchmarkMode::Observer(mode), observer_print.reborrow());
     let observer_call = observer_progress
         .into_os_call()
@@ -258,7 +258,7 @@ fn repl_observer_modes_match_baseline_completion(#[case] mode: ObserverMode, tra
 fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode, track_a_guard: TrackATestGuard) {
     let baseline_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut baseline_output = String::new();
-    let mut baseline_print = PrintWriter::Collect(&mut baseline_output);
+    let mut baseline_print = PrintWriter::CollectString(&mut baseline_output);
     let baseline_progress = start_repl_with_mode(
         baseline_repl,
         REPL_SNAPSHOT_SNIPPET,
@@ -272,7 +272,7 @@ fn repl_snapshot_round_trip_matches_baseline(#[case] mode: ObserverMode, track_a
 
     let observer_repl = init_repl("track_a_repl.py", REPL_INIT_SCRIPT);
     let mut observer_output = String::new();
-    let mut observer_print = PrintWriter::Collect(&mut observer_output);
+    let mut observer_print = PrintWriter::CollectString(&mut observer_output);
     let observer_progress = start_repl_with_mode(
         observer_repl,
         REPL_SNAPSHOT_SNIPPET,

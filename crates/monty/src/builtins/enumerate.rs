@@ -17,7 +17,7 @@ use crate::{
 ///
 /// Returns a list of (index, value) tuples.
 /// Note: In Python this returns an iterator, but we return a list for simplicity.
-pub fn builtin_enumerate(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_enumerate(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (iterable, start) = args.get_one_two_args("enumerate", vm.heap)?;
     let iter = MontyIter::new(iterable, vm)?;
     defer_drop_mut!(iter, vm);
@@ -28,7 +28,7 @@ pub fn builtin_enumerate(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgVal
         Some(Value::Int(n)) => *n,
         Some(Value::Bool(b)) => i64::from(*b),
         Some(v) => {
-            let type_name = v.py_type(vm.heap);
+            let type_name = v.py_type(vm);
             return Err(SimpleException::new_msg(
                 ExcType::TypeError,
                 format!("'{type_name}' object cannot be interpreted as an integer"),

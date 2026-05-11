@@ -10,7 +10,7 @@ use crate::{
     value::EitherStr,
 };
 
-impl<T: ResourceTracker> VM<'_, '_, T> {
+impl<T: ResourceTracker> VM<'_, T> {
     /// Loads an attribute from an object and pushes it onto the stack.
     ///
     /// Returns an AttributeError if the attribute doesn't exist.
@@ -39,7 +39,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             Ok(result) => Ok(result),
             Err(RunError::Exc(exc)) if exc.exc.exc_type() == ExcType::AttributeError => {
                 // Only compute module_name when we need it for the error message
-                let module_name = obj.module_name(this.heap, this.interns);
+                let module_name = obj.module_name(this);
                 let name_str = this.interns.get_str(name_id);
                 Err(ExcType::cannot_import_name(name_str, &module_name))
             }
@@ -58,6 +58,6 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         let value = this.pop();
         // py_set_attr takes ownership of value and drops it on error
-        obj.py_set_attr(name_id, value, this)
+        obj.py_set_attr(&EitherStr::Interned(name_id), value, this)
     }
 }

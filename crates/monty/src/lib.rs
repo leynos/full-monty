@@ -1,5 +1,6 @@
 #![doc = include_str!("../../../README.md")]
-// first to include defer_drop macro
+// these files first because they include macros for the rest of the crate to use
+mod heap;
 mod heap_traits;
 
 mod args;
@@ -9,16 +10,17 @@ mod bytecode;
 mod exception_private;
 mod exception_public;
 mod expressions;
+pub mod fs;
 mod fstring;
 mod function;
-mod heap;
+mod hash;
 mod heap_data;
 mod intern;
 mod io;
 mod modules;
 mod namespace;
 mod object;
-
+mod object_json;
 mod observer;
 mod os;
 mod parse;
@@ -39,8 +41,9 @@ pub use crate::run::RefCountOutput;
 pub use crate::{
     exception_private::ExcType,
     exception_public::{CodeLoc, MontyException, StackFrame},
-    io::{PrintWriter, PrintWriterCallback},
-    object::{DictPairs, InvalidInputError, MontyObject},
+    io::{PrintStream, PrintWriter, PrintWriterCallback},
+    object::{DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta, MontyTimeZone},
+    object_json::{JsonMontyArray, JsonMontyObject, JsonMontyPairs},
     observer::{
         ControlConditionEvent, ExternalCallKind, ExternalCallRequestedEvent, ExternalCallReturnKind,
         ExternalCallReturnedEvent, NoopRuntimeObserver, OpInputIds, OpResultEvent, RuntimeObserver,

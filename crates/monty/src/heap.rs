@@ -1,34 +1,46 @@
 use std::{
-    cell::Cell,
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    mem::size_of,
-    vec,
+    cell::{Cell, UnsafeCell},
+    fmt,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+    ptr::{self, NonNull},
 };
 
-use smallvec::SmallVec;
+use serde::ser::SerializeStruct;
 
 // Re-export items moved to `heap_traits` so that `crate::heap::HeapGuard` etc. continue
 // to resolve (used by the `defer_drop!` macros and throughout the codebase).
 pub(crate) use crate::heap_data::HeapData;
-pub(crate) use crate::heap_traits::{ContainsHeap, DropWithHeap, HeapGuard, ImmutableHeapGuard};
+pub(crate) use crate::heap_traits::{ContainsHeap, DropWithHeap, HeapGuard, HeapItem};
 use crate::{
-    args::ArgValues,
-    asyncio::GatherItem,
-    bytecode::{CallResult, VM},
-    exception_private::{ExcType, RunResult},
-    heap_data::HeapDataMut,
-    intern::Interns,
-    resource::{ResourceError, ResourceTracker, check_mult_size, check_repeat_size},
-    types::{List, LongInt, PyTrait, Tuple, allocate_tuple},
-    value::{EitherStr, Value},
+    asyncio::{Coroutine, GatherFuture, GatherItem},
+    exception_private::SimpleException,
+    heap_data::{CellValue, Closure, FunctionDefaults},
+    resource::{ResourceError, ResourceTracker},
+    types::{
+        Bytes, Dataclass, Dict, DictItemsView, DictKeysView, DictValuesView, FrozenSet, List, LongInt, Module,
+        MontyIter, NamedTuple, Path, Range, ReMatch, RePattern, Set, Slice, Str, TimeZone, Tuple, date, datetime,
+        timedelta, timezone,
+    },
+    value::Value,
 };
+
+mod free_list;
+mod stable_heap;
+use stable_heap::StableHeap;
 
 /// Unique identifier for values stored inside the heap arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HeapId(usize);
 
 impl HeapId {
+    /// Creates a `HeapId` from a raw index.
+    #[inline]
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
     /// Returns the raw index value.
     #[inline]
     pub fn index(self) -> usize {
@@ -39,85 +51,559 @@ impl HeapId {
 /// The empty tuple is a singleton which is allocated at startup.
 const EMPTY_TUPLE_ID: HeapId = HeapId(0);
 
-/// Hash caching state stored alongside each heap entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum HashState {
-    /// Hash has not yet been computed but the value might be hashable.
-    Unknown,
-    /// Cached hash value for immutable types that have been hashed at least once.
-    Cached(u64),
-    /// Value is unhashable (mutable types or tuples containing unhashables).
-    Unhashable,
+/// Color tag used by the trial-deletion cycle collector (Bacon–Rajan, ECOOP 2001).
+///
+/// Each [`HeapEntry`] carries a color that represents what the collector currently
+/// believes about the entry. Outside of a running collection, every reachable
+/// entry is either [`Black`](Self::Black) (live, not part of any suspected cycle)
+/// or [`Purple`](Self::Purple) (a candidate cycle root discovered by `dec_ref`,
+/// awaiting investigation). [`Gray`](Self::Gray) and [`White`](Self::White) are
+/// transient states used only during a [`Heap::collect_cycles`] call.
+///
+/// The encoding fits in a single byte and is serialized as part of every
+/// [`HeapEntry`]: a snapshot taken with cycles pending must round-trip through
+/// serde so the entries stay enrolled as candidates after restore (otherwise a
+/// graph that becomes garbage just before snapshot would leak permanently).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CcColor {
+    /// Live and not currently a cycle candidate. Default state for every newly
+    /// allocated entry.
+    #[default]
+    Black,
+    /// Visited by `MarkGray` during a collection cycle. Children's refcounts
+    /// have been provisionally decremented; a later `Scan` pass decides whether
+    /// to resurrect (back to [`Black`](Self::Black)) or condemn
+    /// ([`White`](Self::White)) the entry.
+    Gray,
+    /// Confirmed unreachable by the current collection: every reference into
+    /// the entry comes from another condemned entry. `CollectWhite` will free
+    /// it. Only seen mid-collection.
+    White,
+    /// Candidate cycle root. Set by `dec_ref` whenever a GC-tracked entry's
+    /// refcount drops to a non-zero value — the only situation in which a new
+    /// reference cycle can become unreachable. The collector seeds its work
+    /// from every entry currently flagged Purple.
+    Purple,
 }
 
-impl HashState {
-    fn for_data(data: &HeapData) -> Self {
-        match data {
-            // Cells are hashable by identity (like all Python objects without __hash__ override)
-            // FrozenSet is immutable and hashable
-            // Range is immutable and hashable
-            // Slice is immutable and hashable (like in CPython)
-            // LongInt is immutable and hashable
-            // NamedTuple is immutable and hashable (like Tuple)
-            HeapData::Str(_)
-            | HeapData::Bytes(_)
-            | HeapData::Tuple(_)
-            | HeapData::NamedTuple(_)
-            | HeapData::FrozenSet(_)
-            | HeapData::Cell(_)
-            | HeapData::Closure(_)
-            | HeapData::FunctionDefaults(_)
-            | HeapData::Range(_)
-            | HeapData::Slice(_)
-            | HeapData::LongInt(_) => Self::Unknown,
-            // Dataclass hashability depends on the mutable flag
-            HeapData::Dataclass(dc) => {
-                if dc.is_frozen() {
-                    Self::Unknown
-                } else {
-                    Self::Unhashable
-                }
+/// This structure allows for reading into the heap more efficiently than repeated calls to `Heap::get` and
+/// `Heap::get_mut` by performing the indexing and type lookup once, and then using the borrow checker to
+/// safely deference the resulting pointers for short-lived borrows.
+///
+/// The safety boundary is primarily that `HeapRead` pointers generated by the `HeapReader::read` API must remain valid
+/// for their lifetime, see the safety notes in `HeapRead::get` for how that is guaranteed.
+pub(crate) struct HeapReader<'a, T: ResourceTracker> {
+    pub(crate) heap: &'a mut Heap<T>,
+    /// Makes the lifetime `'a` invariant.
+    phantom: PhantomData<fn(&'a T) -> &'a T>,
+}
+
+impl<T: ResourceTracker> HeapReader<'_, T> {
+    /// The ONLY way to get a `HeapReader`. By only providing an API which takes a closure which
+    /// must be satisfied for all `'a`, it's impossible to create other `HeapReader` with the
+    /// exact same lifetime `'a`.
+    ///
+    /// To allow other data to be borrowed alongside the `HeapReader`, the closure is given a
+    /// `&'a mut D` with the same lifetime as the `HeapReader`, which is forwarded from the
+    /// `&mut D` passed to this function. This rebranding lets callers (most notably the
+    /// `VM`) hold borrows whose lifetime matches the `HeapReader`'s invariant brand `'a`,
+    /// which is what allows the `VM` to be parameterized by a single lifetime.
+    pub fn with<R, D: ?Sized>(
+        heap: &mut Heap<T>,
+        data: &mut D,
+        f: impl for<'a> FnOnce(&'a mut HeapReader<'a, T>, &'a mut D) -> R,
+    ) -> R {
+        f(
+            &mut HeapReader {
+                heap: &mut *heap,
+                phantom: PhantomData,
+            },
+            data,
+        )
+    }
+}
+
+impl<'a, T: ResourceTracker> HeapReader<'a, T> {
+    /// Indexes into the heap
+    pub fn read(&self, id: HeapId) -> HeapReadOutput<'a> {
+        /// Computes a `HeapRead` from the raw `UnsafeCell` pointer and a shared reference
+        /// to the variant field. The `&T` is only used to compute the field's byte offset
+        /// within the `HeapData` enum; the returned `NonNull` is derived from the original
+        /// `*mut HeapData` pointer so it inherits the `SharedReadWrite` permission from
+        /// the `UnsafeCell`, allowing both reads and writes.
+        #[inline]
+        fn heap_read<'a, T>(base: *mut HeapData, field: &T, readers: NonNull<Cell<usize>>) -> HeapRead<'a, T> {
+            let base_addr = base as usize;
+            let field_addr = ptr::from_ref(field) as usize;
+            let offset = field_addr - base_addr;
+            HeapRead {
+                // SAFETY: The pointer is derived from the UnsafeCell's `*mut` via byte
+                // offset, preserving the `SharedReadWrite` permission. No reference retag
+                // occurs — we only use the `&T` for its address, not to derive the pointer.
+                value: unsafe { NonNull::new_unchecked(base.byte_add(offset).cast::<T>()) },
+                readers,
+                borrow: PhantomData,
             }
-            // Path is immutable and hashable
-            HeapData::Path(_) => Self::Unknown,
-            // ExtFunction is hashable (by identity, like closures)
-            HeapData::ExtFunction(_) => Self::Unknown,
-            // other types are unhashable
-            _ => Self::Unhashable,
+        }
+
+        /// Like `heap_read` but for `Box<T>` fields inside `HeapData` variants.
+        ///
+        /// For boxed variants, the `Box`'s heap allocation lives at a separate
+        /// address from the `HeapData` enum, so the offset-from-base trick used
+        /// by `heap_read` doesn't work. Instead we derive the pointer directly
+        /// from the `Box`'s inner allocation. The pointer remains valid for the
+        /// `HeapReader`'s lifetime because the `HeapData` (and its `Box`) stay
+        /// alive as long as the reader exists.
+        #[expect(
+            clippy::borrowed_box,
+            reason = "We intentionally take &Box<T> to signal this is for boxed HeapData variants; &T would lose that context"
+        )]
+        fn heap_read_boxed<'a, T>(boxed: &Box<T>, readers: NonNull<Cell<usize>>) -> HeapRead<'a, T> {
+            HeapRead {
+                // SAFETY: The Box's allocation is valid for reads/writes as long as the
+                // HeapData containing it is alive. The HeapReader guarantees the entry
+                // won't be deallocated. We cast away the shared reference to get a mutable
+                // pointer — this is sound because all mutation goes through `get_mut` which
+                // requires `&mut HeapReader`, ensuring exclusive access.
+                value: unsafe { NonNull::new_unchecked(ptr::from_ref(boxed.as_ref()).cast_mut()) },
+                readers,
+                borrow: PhantomData,
+            }
+        }
+
+        let heap = self.heap.heap();
+        let entry = heap.entries.get(id);
+
+        // Increment the reader count for this entry. The corresponding decrement
+        // happens in `HeapRead::drop`.
+        entry.readers.set(entry.readers.get() + 1);
+        let readers = NonNull::from(&entry.readers);
+
+        // Get the raw pointer from the UnsafeCell — this has SharedReadWrite permission.
+        let base: *mut HeapData = entry.data.0.get();
+
+        // SAFETY: Match on a shared reference (`&*base`) to read the discriminant without
+        // creating a Unique retag. The shared retag is compatible with existing
+        // SharedReadWrite permissions from prior `read()` calls into the same UnsafeCell.
+        // The `heap_read` helper then derives the NonNull from `base` (not from `&T`),
+        // so the returned pointer retains full SharedReadWrite permission.
+        match unsafe { &*base } {
+            HeapData::Str(s) => HeapReadOutput::Str(heap_read(base, s, readers)),
+            HeapData::Bytes(bytes) => HeapReadOutput::Bytes(heap_read(base, bytes, readers)),
+            HeapData::List(list) => HeapReadOutput::List(heap_read(base, list, readers)),
+            HeapData::Tuple(tuple) => HeapReadOutput::Tuple(heap_read(base, tuple, readers)),
+            HeapData::NamedTuple(named_tuple) => HeapReadOutput::NamedTuple(heap_read(base, named_tuple, readers)),
+            HeapData::Dict(dict) => HeapReadOutput::Dict(heap_read(base, dict, readers)),
+            HeapData::DictItemsView(v) => HeapReadOutput::DictItemsView(heap_read(base, v, readers)),
+            HeapData::DictKeysView(v) => HeapReadOutput::DictKeysView(heap_read(base, v, readers)),
+            HeapData::DictValuesView(v) => HeapReadOutput::DictValuesView(heap_read(base, v, readers)),
+            HeapData::Set(set) => HeapReadOutput::Set(heap_read(base, set, readers)),
+            HeapData::FrozenSet(frozen_set) => HeapReadOutput::FrozenSet(heap_read(base, frozen_set, readers)),
+            HeapData::Closure(closure) => HeapReadOutput::Closure(heap_read(base, closure, readers)),
+            HeapData::FunctionDefaults(function_defaults) => {
+                HeapReadOutput::FunctionDefaults(heap_read(base, function_defaults, readers))
+            }
+            HeapData::ExtFunction(name) => HeapReadOutput::ExtFunction(heap_read(base, name, readers)),
+            HeapData::Cell(cell_value) => HeapReadOutput::Cell(heap_read(base, cell_value, readers)),
+            HeapData::Range(range) => HeapReadOutput::Range(heap_read(base, range, readers)),
+            HeapData::Slice(slice) => HeapReadOutput::Slice(heap_read(base, slice, readers)),
+            HeapData::Exception(simple_exception) => {
+                HeapReadOutput::Exception(heap_read(base, simple_exception, readers))
+            }
+            HeapData::Dataclass(dataclass) => HeapReadOutput::Dataclass(heap_read(base, dataclass, readers)),
+            HeapData::Iter(monty_iter) => HeapReadOutput::Iter(heap_read(base, monty_iter, readers)),
+            HeapData::LongInt(l) => HeapReadOutput::LongInt(heap_read(base, l, readers)),
+            HeapData::Module(module) => HeapReadOutput::Module(heap_read(base, module, readers)),
+            HeapData::Coroutine(coroutine) => HeapReadOutput::Coroutine(heap_read(base, coroutine, readers)),
+            HeapData::GatherFuture(gather_future) => {
+                HeapReadOutput::GatherFuture(heap_read(base, gather_future, readers))
+            }
+            HeapData::Path(path) => HeapReadOutput::Path(heap_read(base, path, readers)),
+            HeapData::RePattern(re_pattern) => HeapReadOutput::RePattern(heap_read_boxed(re_pattern, readers)),
+            HeapData::ReMatch(re_match) => HeapReadOutput::ReMatch(heap_read(base, re_match, readers)),
+            HeapData::Date(d) => HeapReadOutput::Date(heap_read(base, d, readers)),
+            HeapData::DateTime(d) => HeapReadOutput::DateTime(heap_read(base, d, readers)),
+            HeapData::TimeDelta(d) => HeapReadOutput::TimeDelta(heap_read(base, d, readers)),
+            HeapData::TimeZone(d) => HeapReadOutput::TimeZone(heap_read(base, d, readers)),
+        }
+    }
+
+    #[expect(clippy::unused_self, reason = "'a lifetime is used to create the safety guarantees")]
+    pub fn protect<'t, U: ?Sized>(&mut self, value: &'t U) -> BorrowedHeapRead<'t, 'a, U> {
+        BorrowedHeapRead {
+            inner: ManuallyDrop::new(HeapRead {
+                value: NonNull::from(value),
+                readers: NonNull::dangling(),
+                borrow: PhantomData,
+            }),
+            original: PhantomData,
+        }
+    }
+
+    #[expect(clippy::unused_self, reason = "'a lifetime is used to create the safety guarantees")]
+    pub fn protect_mut<'t, U: ?Sized>(&mut self, value: &'t mut U) -> BorrowedHeapReadMut<'t, 'a, U> {
+        BorrowedHeapReadMut {
+            inner: ManuallyDrop::new(HeapRead {
+                value: NonNull::from(value),
+                readers: NonNull::dangling(),
+                borrow: PhantomData,
+            }),
+            original: PhantomData,
         }
     }
 }
 
-/// A single entry inside the heap arena, storing refcount, payload, and hash metadata.
+impl<T: ResourceTracker> ContainsHeap for HeapReader<'_, T> {
+    type ResourceTracker = T;
+
+    fn heap(&self) -> &Heap<T> {
+        self.heap.heap()
+    }
+    fn heap_mut(&mut self) -> &mut Heap<T> {
+        self.heap.heap_mut()
+    }
+}
+
+impl<T: ResourceTracker> Deref for HeapReader<'_, T> {
+    type Target = Heap<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.heap
+    }
+}
+
+impl<T: ResourceTracker> DerefMut for HeapReader<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.heap
+    }
+}
+
+pub enum HeapReadOutput<'a> {
+    Str(HeapRead<'a, Str>),
+    Bytes(HeapRead<'a, Bytes>),
+    List(HeapRead<'a, List>),
+    Tuple(HeapRead<'a, Tuple>),
+    NamedTuple(HeapRead<'a, NamedTuple>),
+    Dict(HeapRead<'a, Dict>),
+    DictItemsView(HeapRead<'a, DictItemsView>),
+    DictKeysView(HeapRead<'a, DictKeysView>),
+    DictValuesView(HeapRead<'a, DictValuesView>),
+    Set(HeapRead<'a, Set>),
+    FrozenSet(HeapRead<'a, FrozenSet>),
+    Closure(HeapRead<'a, Closure>),
+    FunctionDefaults(HeapRead<'a, FunctionDefaults>),
+    ExtFunction(HeapRead<'a, String>),
+    Cell(HeapRead<'a, CellValue>),
+    Range(HeapRead<'a, Range>),
+    Slice(HeapRead<'a, Slice>),
+    Exception(HeapRead<'a, SimpleException>),
+    Dataclass(HeapRead<'a, Dataclass>),
+    Iter(HeapRead<'a, MontyIter>),
+    LongInt(HeapRead<'a, LongInt>),
+    Module(HeapRead<'a, Module>),
+    Coroutine(HeapRead<'a, Coroutine>),
+    GatherFuture(HeapRead<'a, GatherFuture>),
+    Path(HeapRead<'a, Path>),
+    RePattern(HeapRead<'a, RePattern>),
+    ReMatch(HeapRead<'a, ReMatch>),
+    Date(HeapRead<'a, date::Date>),
+    DateTime(HeapRead<'a, datetime::DateTime>),
+    TimeDelta(HeapRead<'a, timedelta::TimeDelta>),
+    TimeZone(HeapRead<'a, timezone::TimeZone>),
+}
+
+pub struct HeapRead<'a, T: ?Sized> {
+    value: NonNull<T>,
+    /// Pointer to the `readers` counter in the owning `HeapValue`.
+    ///
+    /// Incremented on creation, decremented on drop. This ensures `dec_ref`
+    /// cannot free the entry while any `HeapRead` pointing into it exists.
+    readers: NonNull<Cell<usize>>,
+    /// Makes the lifetime `'a` invariant. In combination with the invariant lifetime
+    /// on `HeapReader` and the `HeapReader::with` API, this guarantees that this
+    /// `HeapRead` originated from that matching `HeapReader` (there is no way to
+    /// construct another `HeapReader` with the same lifetime).
+    borrow: PhantomData<fn(&'a T) -> &'a T>,
+}
+
+impl<T: ?Sized> Drop for HeapRead<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: (DH) the readers pointer is valid for the lifetime of the HeapValue,
+        // which is guaranteed by the paged storage (addresses never move) and the
+        // reader count itself (dec_ref cannot free an entry with active readers).
+        let cell = unsafe { self.readers.as_ref() };
+        cell.set(cell.get() - 1);
+    }
+}
+
+impl<'a, T: ?Sized> HeapRead<'a, T> {
+    /// Accesses the value contained in this reference.
+    pub fn get<'r, RT: ResourceTracker>(&self, _: &'r HeapReader<'a, RT>) -> &'r T {
+        // SAFETY: (DH)
+        //  - The HeapReader has an invariant lifetime 'a which guarantees that this HeapRead
+        //    came from the heap borrowed by this HeapReader.
+        //  - The address of the `HeapValue` never changes because entries are stored in
+        //    paged storage (`HeapEntries`) where each page is never reallocated or moved.
+        //  - The HeapRead holds a strong reader reference (via the `readers` counter in
+        //    `HeapValue`) which guarantees the entry will never be freed by `dec_ref`
+        //    or `collect_cycles` while this `HeapRead` exists. The cycle collector's
+        //    `Scan` phase treats `readers > 0` as an external reference and resurrects
+        //    the entry to Black instead of condemning it as White.
+        //  - The type of the `HeapValue` can never change once allocated. This is
+        //    guaranteed by never exposing `&mut HeapData` outside of this module.
+        //  - The borrow on `HeapReader` guarantees that there are no mutable borrows on any heap
+        //    data while the return value of this function is alive.
+        unsafe { self.value.as_ref() }
+    }
+
+    /// Mutably accesses the value contained in this reference.
+    pub fn get_mut<'r>(&mut self, _: &'r mut HeapReader<'a, impl ResourceTracker>) -> &'r mut T {
+        // SAFETY: see same constraints as in get() above.
+        unsafe { self.value.as_mut() }
+    }
+
+    /// Casts this reader to a field of type `U` at some `offset` within the struct.
+    ///
+    /// Transfers ownership of the reader count from `self` to the returned `HeapRead`.
+    ///
+    /// # Safety
+    ///   - The field of type `U` must ALWAYS exist at `offset` within `T` (i.e. `T` cannot be an enum, union etc)
+    unsafe fn cast_as_member_ref<U>(&self, offset: usize) -> BorrowedHeapRead<'_, 'a, U> {
+        BorrowedHeapRead {
+            // SAFETY: (DH) - caller of this function guarantees the offset & cast is valid
+            inner: ManuallyDrop::new(HeapRead {
+                // SAFETY: caller guarantees offset points to a valid field of type U within T
+                value: unsafe { self.value.byte_add(offset) }.cast(),
+                // dangling is fine because this heapread will never be dropped, and it is
+                // also not `Clone` so there's no risk of this value ever being used
+                readers: NonNull::dangling(),
+                borrow: PhantomData,
+            }),
+            original: PhantomData,
+        }
+    }
+
+    /// Casts this reader to a field of type `U` at some `offset` within the struct.
+    ///
+    /// Transfers ownership of the reader count from `self` to the returned `HeapRead`.
+    ///
+    /// # Safety
+    ///   - The field of type `U` must ALWAYS exist at `offset` within `T` (i.e. `T` cannot be an enum, union etc)
+    unsafe fn cast_as_member_ref_mut<U>(&mut self, offset: usize) -> BorrowedHeapReadMut<'_, 'a, U> {
+        BorrowedHeapReadMut {
+            // SAFETY: (DH) - caller of this function guarantees the offset & cast is valid
+            inner: ManuallyDrop::new(HeapRead {
+                // SAFETY: caller guarantees offset points to a valid field of type U within T
+                value: unsafe { self.value.byte_add(offset) }.cast(),
+                // dangling is fine because this heapread will never be dropped, and it is
+                // also not `Clone` so there's no risk of this value ever being used
+                readers: NonNull::dangling(),
+                borrow: PhantomData,
+            }),
+            original: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> HeapRead<'a, Vec<T>> {
+    pub fn as_slice(&self, reader: &HeapReader<'a, impl ResourceTracker>) -> BorrowedHeapRead<'_, 'a, [T]> {
+        BorrowedHeapRead {
+            inner: ManuallyDrop::new(HeapRead {
+                value: NonNull::from(self.get(reader).as_slice()),
+                readers: NonNull::dangling(),
+                borrow: PhantomData,
+            }),
+            original: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: ?Sized> HeapRead<'a, Box<T>> {
+    pub fn as_box_value(&self, reader: &HeapReader<'a, impl ResourceTracker>) -> BorrowedHeapRead<'_, 'a, T> {
+        BorrowedHeapRead {
+            inner: ManuallyDrop::new(HeapRead {
+                value: NonNull::from(self.get(reader).as_ref()),
+                readers: NonNull::dangling(),
+                borrow: PhantomData,
+            }),
+            original: PhantomData,
+        }
+    }
+}
+
+/// Represents the reborrow of a `HeapRead` as a reference to a field of the original type.
+pub struct BorrowedHeapRead<'original, 'a, U: ?Sized> {
+    // inner is a projected HeapRead which will never be dropped
+    inner: ManuallyDrop<HeapRead<'a, U>>,
+    original: PhantomData<&'original U>,
+}
+
+// NB no DerefMut - would need to have a `BorrowedHeapReadMut`
+impl<'a, U: ?Sized> Deref for BorrowedHeapRead<'_, 'a, U> {
+    type Target = HeapRead<'a, U>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Unsafe helper for `heap_read_as_field`, do not use. Same safety invariants as `HeapRead::cast_as_member`.
+pub(crate) unsafe fn cast_as_member_ref_type_hinted<'r, 'a, T, U>(
+    heap_read: &'r HeapRead<'a, T>,
+    offset: usize,
+    _type_hint: impl for<'s> Fn(&'s HeapRead<'a, T>) -> *const U,
+) -> BorrowedHeapRead<'r, 'a, U> {
+    // SAFETY: (DH) - caller upholds `cast_as_member` contract
+    unsafe { heap_read.cast_as_member_ref(offset) }
+}
+
+macro_rules! heap_read_ref_as_field {
+    ($heap_read:ident, $ty:ty, $field:tt) => {{
+        let offset = std::mem::offset_of!($ty, $field);
+        #[expect(unreachable_code)]
+        let type_hint = |read: &$crate::heap::HeapRead<'_, $ty>| {
+            &raw const read.get::<$crate::NoLimitTracker>(unreachable!()).$field
+        };
+        // SAFETY: (DH)
+        //  - `std::mem::offset_of!` guarantees there is a field at fixed offset
+        //  - `type_hint` guarantees that the field is of type `U` for the safety contract
+        unsafe { $crate::heap::cast_as_member_ref_type_hinted($heap_read, offset, type_hint) }
+    }};
+}
+
+pub(crate) use heap_read_ref_as_field;
+
+/// Represents the reborrow of a `HeapRead` as a reference to a field of the original type.
+pub struct BorrowedHeapReadMut<'original, 'a, U: ?Sized> {
+    // inner is a projected HeapRead which will never be dropped
+    inner: ManuallyDrop<HeapRead<'a, U>>,
+    original: PhantomData<&'original mut U>,
+}
+
+impl<'a, U: ?Sized> Deref for BorrowedHeapReadMut<'_, 'a, U> {
+    type Target = HeapRead<'a, U>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<U: ?Sized> DerefMut for BorrowedHeapReadMut<'_, '_, U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+/// Unsafe helper for `heap_read_as_field`, do not use. Same safety invariants as `HeapRead::cast_as_member`.
+pub(crate) unsafe fn cast_as_member_ref_mut_type_hinted<'r, 'a, T, U>(
+    heap_read: &'r mut HeapRead<'a, T>,
+    offset: usize,
+    _type_hint: impl for<'s> Fn(&'s HeapRead<'a, T>) -> *const U,
+) -> BorrowedHeapReadMut<'r, 'a, U> {
+    // SAFETY: (DH) - caller upholds `cast_as_member` contract
+    unsafe { heap_read.cast_as_member_ref_mut(offset) }
+}
+
+macro_rules! heap_read_ref_as_field_mut {
+    ($heap_read:ident, $ty:ty, $field:tt) => {{
+        let offset = std::mem::offset_of!($ty, $field);
+        #[expect(unreachable_code)]
+        let type_hint = |read: &$crate::heap::HeapRead<'_, $ty>| {
+            &raw const read.get::<$crate::NoLimitTracker>(unreachable!()).$field
+        };
+        // SAFETY: (DH)
+        //  - `std::mem::offset_of!` guarantees there is a field at fixed offset
+        //  - `type_hint` guarantees that the field is of type `U` for the safety contract
+        unsafe { $crate::heap::cast_as_member_ref_mut_type_hinted($heap_read, offset, type_hint) }
+    }};
+}
+
+pub(crate) use heap_read_ref_as_field_mut;
+
+/// A single entry inside the heap arena, storing refcount and payload.
 ///
-/// The `hash_state` field tracks whether the heap entry is hashable and, if so,
-/// caches the computed hash. Mutable types (List, Dict) start as `Unhashable` and
-/// will raise TypeError if used as dict keys.
+/// Hashing state lives on the per-type structs that benefit from it
+/// ([`Str`], [`Bytes`], [`Tuple`], [`NamedTuple`], [`FrozenSet`] (via
+/// `SetStorage`), [`Path`]). Cheap-to-hash types ([`Range`], [`Slice`],
+/// dates etc.) recompute on demand. Unhashable types ([`List`], [`Dict`],
+/// [`Set`]) return `None` from `py_hash` directly. None of these need
+/// per-entry metadata.
 ///
-/// The `data` field is an Option to support temporary borrowing: when methods like
-/// `with_entry_mut` or `call_attr` need mutable access to both the data and the heap,
-/// they can `.take()` the data out (leaving `None`), pass `&mut Heap` to user code,
-/// then restore the data. This avoids unsafe code while keeping `refcount` accessible
-/// for `inc_ref`/`dec_ref` during the borrow.
+/// The `color` field encodes the entry's state for the trial-deletion cycle
+/// collector (see [`CcColor`]). Outside of a running collection, every live
+/// entry is either Black (uninteresting) or Purple (a cycle-root candidate
+/// queued for investigation); Gray and White are transient states only seen
+/// during [`Heap::collect_cycles`]. Cell-typed for symmetry with `refcount`
+/// — every write goes through an `&mut Heap` path (`dec_ref` and the
+/// collector's `mark_gray`/`scan`/`scan_black`).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct HeapValue {
+pub struct HeapEntry {
     refcount: Cell<usize>,
-    /// The payload data. Temporarily `None` while borrowed via `with_entry_mut`/`call_attr`.
-    data: Option<HeapData>,
-    /// Current hashing status / cached hash value
-    hash_state: HashState,
+    /// Number of active `HeapRead` pointers into this entry's data.
+    ///
+    /// Incremented when `HeapReader::read` creates a `HeapRead`, decremented when
+    /// the `HeapRead` is dropped. `dec_ref` panics if it would free an entry that
+    /// still has active readers — this guarantees that `HeapRead` pointers remain
+    /// valid for as long as they exist.
+    #[serde(skip, default)] // should always be 0 during serde ops
+    readers: Cell<usize>,
+    /// The payload data
+    data: UnsafeHeapData,
+    /// Cycle-collector color. See [`CcColor`].
+    ///
+    /// Round-trips through serde because a snapshot taken between bytecode
+    /// instructions can capture entries in the [`Purple`](CcColor::Purple)
+    /// pending-collection state; dropping the color on restore would leak
+    /// any cycle that became unreachable just before the snapshot.
+    #[serde(default)]
+    color: CcColor,
+}
+
+/// This wrapper containing `UnsafeCell` exists to allow for data inside of `HeapValue`
+/// to be safely pointed to via the `HeapReader` API.
+///
+/// The safety invariants are protected by the `Heap` / `HeapReader` API:
+///   - It is never possible to alias mutable and immutable borrows into heap values,
+///     whether they are the same or different value.
+///   - When a mutable borrow of a heap value exists, no other heap value may be
+///     borrowed. (See `Heap::get_mut` and `HeapRead::get`, which both require a `&mut`
+///     borrow on the heap.)
+struct UnsafeHeapData(UnsafeCell<HeapData>);
+
+impl fmt::Debug for UnsafeHeapData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: (DH) Debug formatting is read-only and never called concurrently
+        // with mutation. This matches the safety invariants of the HeapReader API.
+        let data = unsafe { &*self.0.get() };
+        f.debug_tuple("UnsafeHeapData").field(data).finish()
+    }
+}
+
+impl serde::Serialize for UnsafeHeapData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // SAFETY: when heap data is being serialized, there is no mutable borrow
+        // possible on any data contents
+        HeapData::serialize(unsafe { &*self.0.get() }, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UnsafeHeapData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self(UnsafeCell::new(HeapData::deserialize(deserializer)?)))
+    }
 }
 
 /// Zero-size token returned by [`Heap::incr_recursion_depth`].
 ///
 /// Represents one level of recursion depth that must be released when the
-/// recursive operation completes. There are two ways to release the token:
-///
-/// - **`DropWithHeap`** — for `&mut Heap` paths (e.g., `py_eq`). Compatible with
-///   `defer_drop!` and `HeapGuard` for automatic cleanup on all code paths.
-/// - **`DropWithImmutableHeap`** — for `&Heap` paths (e.g., `py_repr_fmt`) where
-///   only shared access is available. Compatible with `defer_drop_immutable_heap!`
-///   and `ImmutableHeapGuard`.
+/// recursive operation completes. Released via [`DropWithHeap`] — compatible
+/// with [`defer_drop!`] and [`HeapGuard`] for automatic cleanup on all code paths.
 #[derive(Debug)]
 pub(crate) struct RecursionToken(());
 
@@ -135,6 +621,12 @@ impl DropWithHeap for RecursionToken {
 /// When an value is freed via `dec_ref`, its slot ID is added to the free list.
 /// New allocations pop from the free list when available, otherwise append.
 ///
+/// Cycle collection uses Bacon–Rajan trial deletion: candidates come from
+/// `dec_ref` (every container whose refcount drops to a non-zero value is
+/// flagged [`Purple`](CcColor::Purple)), so the VM does not enumerate live
+/// roots — refcount math itself proves reachability and values held only on
+/// the Rust stack are correctly preserved by their non-zero refcount.
+///
 /// Generic over `T: ResourceTracker` to support different resource tracking strategies.
 /// When `T = NoLimitTracker` (the default), all resource checks compile away to no-ops.
 ///
@@ -142,32 +634,59 @@ impl DropWithHeap for RecursionToken {
 /// handles the Drop constraint by using `std::mem::take` during serialization.
 #[derive(Debug)]
 pub(crate) struct Heap<T: ResourceTracker> {
-    entries: Vec<Option<HeapValue>>,
-    /// IDs of freed slots available for reuse. Populated by `dec_ref`, consumed by `allocate`.
-    free_list: Vec<HeapId>,
+    /// Paged storage for heap entries with integrated free list.
+    entries: StableHeap<HeapEntry>,
     /// Resource tracker for enforcing limits and scheduling GC.
     tracker: T,
-    /// True if reference cycles may exist. Set when a container stores a Ref,
-    /// cleared after GC completes. When false, GC can skip mark-sweep entirely.
-    may_have_cycles: bool,
-    /// Number of GC applicable allocations since the last GC.
-    allocations_since_gc: u32,
+    /// Number of entries currently flagged [`Purple`](CcColor::Purple) — i.e.,
+    /// suspected cycle roots awaiting collection.
+    ///
+    /// Used as an early-out: when zero, `collect_cycles` has no candidates
+    /// and skips its heap walk entirely. The actual GC *frequency* is still
+    /// driven by `allocations_since_gc` against the configured interval, so
+    /// programs that produce no cycle candidates pay no collector cost
+    /// regardless of how many allocations they perform.
+    ///
+    /// All `dec_ref` paths that mutate this counter take `&mut self`, so a
+    /// plain `usize` is sufficient (no interior mutability needed).
+    purple_count: usize,
+    /// Number of GC-applicable allocations since the last cycle collection.
+    ///
+    /// Incremented for every GC-tracked allocation (see [`HeapData::is_gc_tracked`])
+    /// and reset to zero at the end of every successful [`collect_cycles`]
+    /// call. Combined with [`purple_count`](Self::purple_count) to gate
+    /// automatic collections in [`should_gc`](Self::should_gc).
+    ///
+    /// Uses `Cell` for interior mutability so that `allocate(&self)` can
+    /// increment.
+    allocations_since_gc: Cell<u32>,
+    /// When true, [`should_gc`](Self::should_gc) returns false regardless of
+    /// the candidate count, suppressing automatic cycle-collection passes.
+    /// Toggled by the `gc.disable()` / `gc.enable()` Python helpers (only
+    /// registered under the `test-hooks` feature). Explicit `gc.collect()`
+    /// calls still run.
+    #[cfg(feature = "test-hooks")]
+    gc_disabled: bool,
     /// Current recursion depth — incremented on function calls and data structure traversals.
     ///
     /// Uses `Cell` for interior mutability so that methods with only `&Heap`
     /// (like `py_repr_fmt`) can still increment/decrement the depth counter.
     recursion_depth: Cell<usize>,
+    /// Cached HeapId for the `datetime.timezone.utc` singleton.
+    ///
+    /// Lazily allocated on first access to `timezone.utc`. Once created, the refcount
+    /// is incremented on each access so the caller can drop their reference normally.
+    timezone_utc: Option<HeapId>,
 }
 
 impl<T: ResourceTracker + serde::Serialize> serde::Serialize for Heap<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Heap", 6)?;
+        let mut state = serializer.serialize_struct("Heap", 5)?;
         state.serialize_field("entries", &self.entries)?;
-        state.serialize_field("free_list", &self.free_list)?;
         state.serialize_field("tracker", &self.tracker)?;
-        state.serialize_field("may_have_cycles", &self.may_have_cycles)?;
-        state.serialize_field("allocations_since_gc", &self.allocations_since_gc)?;
+        state.serialize_field("purple_count", &self.purple_count)?;
+        state.serialize_field("allocations_since_gc", &self.allocations_since_gc.get())?;
+        state.serialize_field("timezone_utc", &self.timezone_utc)?;
         state.end()
     }
 }
@@ -176,74 +695,74 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
         struct HeapFields<T> {
-            entries: Vec<Option<HeapValue>>,
-            free_list: Vec<HeapId>,
+            entries: StableHeap<HeapEntry>,
             tracker: T,
-            may_have_cycles: bool,
+            #[serde(default)]
+            purple_count: usize,
+            #[serde(default)]
             allocations_since_gc: u32,
+            #[serde(default)]
+            timezone_utc: Option<HeapId>,
         }
         let fields = HeapFields::<T>::deserialize(deserializer)?;
         Ok(Self {
             entries: fields.entries,
-            free_list: fields.free_list,
             tracker: fields.tracker,
-            may_have_cycles: fields.may_have_cycles,
-            allocations_since_gc: fields.allocations_since_gc,
+            purple_count: fields.purple_count,
+            allocations_since_gc: Cell::new(fields.allocations_since_gc),
+            #[cfg(feature = "test-hooks")]
+            gc_disabled: false,
             recursion_depth: Cell::new(0),
+            timezone_utc: fields.timezone_utc,
         })
     }
 }
 
-macro_rules! take_data {
-    ($self:ident, $id:expr, $func_name:literal) => {
-        $self
-            .entries
-            .get_mut($id.index())
-            .expect(concat!("Heap::", $func_name, ": slot missing"))
-            .as_mut()
-            .expect(concat!("Heap::", $func_name, ": object already freed"))
-            .data
-            .take()
-            .expect(concat!("Heap::", $func_name, ": data already borrowed"))
-    };
-}
-
-macro_rules! restore_data {
-    ($self:ident, $id:expr, $new_data:expr, $func_name:literal) => {{
-        let entry = $self
-            .entries
-            .get_mut($id.index())
-            .expect(concat!("Heap::", $func_name, ": slot missing"))
-            .as_mut()
-            .expect(concat!("Heap::", $func_name, ": object already freed"));
-        entry.data = Some($new_data);
-    }};
-}
-
-/// GC interval - run GC every 100,000 applicable allocations.
+/// Default GC interval — run cycle collection every 100 000 GC-tracked
+/// allocations unless the configured resource tracker overrides it.
 ///
-/// This is intentionally infrequent to minimize overhead while still
-/// eventually collecting reference cycles.
-const GC_INTERVAL: u32 = 100_000;
+/// The trial-deletion collector additionally short-circuits the trace when
+/// `purple_count == 0`, so programs that produce no cycle candidates pay no
+/// collector cost regardless of their allocation rate.
+///
+/// When the `memory-model-checks` feature is enabled, this is reduced to 1 to
+/// stress-test GC behavior on every allocation.
+const DEFAULT_GC_INTERVAL: usize = if cfg!(feature = "memory-model-checks") {
+    1
+} else {
+    100_000
+};
 
 impl<T: ResourceTracker> Heap<T> {
     /// Creates a new heap with the given resource tracker.
     ///
     /// Use this to create heaps with custom resource limits or GC scheduling.
     pub fn new(capacity: usize, tracker: T) -> Self {
-        let mut this = Self {
-            entries: Vec::with_capacity(capacity),
-            free_list: Vec::new(),
+        let this = Self {
+            entries: StableHeap::with_capacity(capacity),
             tracker,
-            may_have_cycles: false,
-            allocations_since_gc: 0,
+            purple_count: 0,
+            allocations_since_gc: Cell::new(0),
+            #[cfg(feature = "test-hooks")]
+            gc_disabled: false,
             recursion_depth: Cell::new(0),
+            timezone_utc: None,
         };
-        // TBC: should the empty tuple contribute to the resource limits?
-        // If not, can just place it in `entries` directly without going through `allocate()`.
-        let empty_tuple = this
-            .allocate(HeapData::Tuple(Tuple::default()))
-            .expect("Failed to allocate empty tuple singleton");
+
+        // The empty-tuple singleton starts with refcount = 1 — that single ref *is* the
+        // permanent heap-owned reference. `get_empty_tuple` bumps the refcount on each
+        // hand-out so callers can `dec_ref` normally; the heap-owned ref keeps the
+        // singleton's rc ≥ 1 forever, which is why trial deletion needs no special-case
+        // rooting for it (a debug_assert in `dec_ref` enforces the invariant).
+        let empty_tuple = HeapData::Tuple(Tuple::default());
+        let new_entry = HeapEntry {
+            refcount: Cell::new(1),
+            readers: Cell::new(0),
+            data: UnsafeHeapData(UnsafeCell::new(empty_tuple)),
+            color: CcColor::Black,
+        };
+
+        let empty_tuple = this.entries.allocate(new_entry);
         debug_assert_eq!(empty_tuple, EMPTY_TUPLE_ID);
         this
     }
@@ -272,11 +791,23 @@ impl<T: ResourceTracker> Heap<T> {
         self.tracker.check_time()
     }
 
+    /// Tracks in-place memory growth of an existing heap object.
+    ///
+    /// Call this before performing mutations that grow containers (append, insert,
+    /// extend, dict set, set add). Returns `Err(ResourceError::Memory)` if the
+    /// growth would exceed configured memory limits.
+    ///
+    /// Does not increment the allocation count since no new heap object is created.
+    #[inline]
+    pub fn track_growth(&self, additional_bytes: usize) -> Result<(), ResourceError> {
+        self.tracker.on_grow(additional_bytes)
+    }
+
     /// Increments the recursion depth and checks the limit via the `ResourceTracker`.
     ///
     /// Returns `Ok(RecursionToken)` if within limits. The caller must ensure the
-    /// token is released on all code paths — either via `defer_drop!`/`HeapGuard`
-    /// (for `&mut Heap` contexts) or via `RecursionToken::release()` (for `&Heap` contexts).
+    /// token is released on all code paths — typically via `defer_drop!` or `HeapGuard`,
+    /// which call [`DropWithHeap::drop_with_heap`] on the token.
     ///
     /// Returns `Err(ResourceError::Recursion)` if the limit would be exceeded.
     #[inline]
@@ -285,16 +816,6 @@ impl<T: ResourceTracker> Heap<T> {
         self.tracker.check_recursion_depth(depth)?;
         self.recursion_depth.set(depth + 1);
         Ok(RecursionToken(()))
-    }
-
-    /// Increments the recursion depth, returning `Some(RecursionToken)` if within
-    /// limits, or `None` if the limit is exceeded.
-    ///
-    /// Use this in repr-like contexts where exceeding the limit should produce
-    /// truncated output (e.g., `[...]`) rather than an error.
-    #[inline]
-    pub fn incr_recursion_depth_for_repr(&self) -> Option<RecursionToken> {
-        self.incr_recursion_depth().ok()
     }
 
     /// Decrements the recursion depth.
@@ -326,28 +847,20 @@ impl<T: ResourceTracker> Heap<T> {
         self.recursion_depth.set(depth);
     }
 
-    /// Number of entries in the heap
+    /// Number of entries in the heap (including freed slots).
     pub fn size(&self) -> usize {
         self.entries.len()
     }
 
-    /// Marks that a reference cycle may exist in the heap.
+    /// Returns the number of GC-tracked allocations since the last cycle
+    /// collection. Reset to zero by [`collect_cycles`](Self::collect_cycles).
     ///
-    /// Call this when a container (list, dict, tuple, etc.) stores a reference
-    /// to another heap object. This enables the GC to skip mark-sweep entirely
-    /// when no cycles are possible.
-    #[inline]
-    pub fn mark_potential_cycle(&mut self) {
-        self.may_have_cycles = true;
-    }
-
-    /// Returns the number of GC-tracked allocations since the last garbage collection.
-    ///
-    /// This counter increments for each allocation of a GC-tracked type (List, Dict, etc.)
-    /// and resets to 0 when `collect_garbage` runs. Useful for testing GC behavior.
+    /// Used by `run_ref_counts` to expose the GC trigger metric to tests:
+    /// a value much smaller than the configured `gc_interval` after many
+    /// allocations is evidence that collection ran.
     #[cfg(feature = "ref-count-return")]
     pub fn get_allocations_since_gc(&self) -> u32 {
-        self.allocations_since_gc
+        self.allocations_since_gc.get()
     }
 
     /// Allocates a new heap entry.
@@ -355,41 +868,26 @@ impl<T: ResourceTracker> Heap<T> {
     /// Returns `Err(ResourceError)` if allocation would exceed configured limits.
     /// Use this when you need to handle resource limit errors gracefully.
     ///
-    /// Only GC-tracked types (containers that can hold references) count toward the
-    /// GC allocation threshold. Leaf types like strings don't trigger GC.
-    ///
-    /// When allocating a container that contains heap references, marks potential
-    /// cycles to enable garbage collection.
-    pub fn allocate(&mut self, data: HeapData) -> Result<HeapId, ResourceError> {
+    /// GC-tracked types bump `allocations_since_gc` so that
+    /// [`should_gc`](Self::should_gc) eventually fires; trial deletion's own
+    /// candidate enrollment happens later, at `dec_ref` time. Leaf types
+    /// (strings, bytes, …) cannot participate in cycles and don't count
+    /// against the GC interval.
+    pub fn allocate(&self, data: HeapData) -> Result<HeapId, ResourceError> {
         self.tracker.on_allocate(|| data.py_estimate_size())?;
         if data.is_gc_tracked() {
-            self.allocations_since_gc = self.allocations_since_gc.wrapping_add(1);
-            // Mark potential cycles if this container has heap references.
-            // This is essential for types like Dict where setitem doesn't call
-            // mark_potential_cycle() - the allocation is the only place to detect refs.
-            if data.has_refs() {
-                self.may_have_cycles = true;
-            }
+            self.allocations_since_gc
+                .set(self.allocations_since_gc.get().wrapping_add(1));
         }
 
-        let hash_state = HashState::for_data(&data);
-        let new_entry = HeapValue {
+        let new_entry = HeapEntry {
             refcount: Cell::new(1),
-            data: Some(data),
-            hash_state,
+            readers: Cell::new(0),
+            data: UnsafeHeapData(UnsafeCell::new(data)),
+            color: CcColor::Black,
         };
 
-        let id = if let Some(id) = self.free_list.pop() {
-            // Reuse a freed slot
-            self.entries[id.index()] = Some(new_entry);
-            id
-        } else {
-            // No free slots, append new entry
-            let id = self.entries.len();
-            self.entries.push(Some(new_entry));
-            HeapId(id)
-        };
-
+        let id = self.entries.allocate(new_entry);
         Ok(id)
     }
 
@@ -401,10 +899,28 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// The returned `Value` has its reference count incremented, so the caller
     /// owns a reference and must call `dec_ref` when done.
-    pub fn get_empty_tuple(&mut self) -> Value {
+    pub fn get_empty_tuple(&self) -> Value {
         // Return existing singleton with incremented refcount
         self.inc_ref(EMPTY_TUPLE_ID);
         Value::Ref(EMPTY_TUPLE_ID)
+    }
+
+    /// Returns the cached `datetime.timezone.utc` singleton, lazily creating it on first access.
+    ///
+    /// The returned `Value::Ref` has its refcount incremented so the caller can drop
+    /// it normally. The singleton itself is kept alive by the `timezone_utc` field.
+    pub fn get_timezone_utc(&mut self) -> Result<Value, ResourceError> {
+        if let Some(id) = self.timezone_utc {
+            self.inc_ref(id);
+            Ok(Value::Ref(id))
+        } else {
+            let tz = TimeZone::utc();
+            let id = self.allocate(HeapData::TimeZone(tz))?;
+            // Keep an extra refcount for the singleton cache
+            self.inc_ref(id);
+            self.timezone_utc = Some(id);
+            Ok(Value::Ref(id))
+        }
     }
 
     /// Increments the reference count for an existing heap entry.
@@ -412,12 +928,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
     pub fn inc_ref(&self, id: HeapId) {
-        let value = self
-            .entries
-            .get(id.index())
-            .expect("Heap::inc_ref: slot missing")
-            .as_ref()
-            .expect("Heap::inc_ref: object already freed");
+        let value = self.entries.get(id);
         value.refcount.update(|r| r + 1);
     }
 
@@ -427,33 +938,60 @@ impl<T: ResourceTracker> Heap<T> {
     /// when freeing deeply nested containers (e.g., a list nested 10,000 levels deep).
     /// This is analogous to CPython's "trashcan" mechanism for safe deallocation.
     ///
+    /// Implements the candidate-enrollment side of Bacon–Rajan trial deletion: any
+    /// GC-tracked entry whose refcount survives the decrement gets flagged
+    /// [`Purple`](CcColor::Purple), so the next [`collect_cycles`](Self::collect_cycles)
+    /// can investigate it. Entries that drop to zero are freed immediately on the
+    /// existing fast path; if such an entry was Purple, the heap-wide
+    /// `purple_count` is rebalanced so it stays in sync with the actual number
+    /// of Purple entries.
+    ///
     /// # Panics
-    /// Panics if the value ID is invalid or the value has already been freed.
+    /// Panics if the value ID is invalid, the value has already been freed, or
+    /// the refcount would reach zero while active `HeapRead` readers exist.
     pub fn dec_ref(&mut self, id: HeapId) {
         let mut current_id = id;
         let mut work_stack = Vec::new();
         loop {
-            let slot = self
+            let mut entry = self
                 .entries
-                .get_mut(current_id.index())
-                .expect("Heap::dec_ref: slot missing");
-            let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
-            if entry.refcount.get() > 1 {
-                entry.refcount.update(|r| r - 1);
-            } else if let Some(value) = slot.take() {
-                // refcount == 1, free the value and add slot to free list for reuse
-                self.free_list.push(current_id);
+                .entry(current_id)
+                .expect("Heap::dec_ref: value already freed");
+            let heap_entry = entry.get_mut();
+            if heap_entry.refcount.get() > 1 {
+                heap_entry.refcount.update(|r| r - 1);
+
+                let is_gc_tracked = heap_entry.data.0.get_mut().is_gc_tracked();
+                if is_gc_tracked && heap_entry.color != CcColor::Purple {
+                    // The refcount survived — a newly unreachable cycle could
+                    // now be hiding. Flag it as a candidate for the next `collect_cycles`.
+                    heap_entry.color = CcColor::Purple;
+                    self.purple_count += 1;
+                }
+            } else {
+                debug_assert!(
+                    current_id != EMPTY_TUPLE_ID,
+                    "Heap::dec_ref: empty-tuple singleton's heap-owned refcount must never reach zero",
+                );
+                assert!(
+                    heap_entry.readers.get() == 0,
+                    "Heap::dec_ref: cannot free HeapId({}) with {} active reader(s)",
+                    current_id.index(),
+                    heap_entry.readers.get(),
+                );
+                // If the entry was a pending cycle candidate, decrement
+                // `purple_count` to reflect that it is leaving the heap before
+                // the collector reaches it.
+                if heap_entry.color == CcColor::Purple {
+                    self.purple_count -= 1;
+                }
+                let mut value = entry.free();
 
                 // Notify tracker of freed memory
-                if let Some(ref data) = value.data {
-                    self.tracker.on_free(|| data.py_estimate_size());
-                }
+                self.tracker.on_free(|| value.data.0.get_mut().py_estimate_size());
 
                 // Collect child IDs and push onto work stack for iterative processing
-                if let Some(mut data) = value.data {
-                    data.py_dec_ref_ids(&mut work_stack);
-                    drop(data);
-                }
+                py_dec_ref_ids_for_data(value.data.0.get_mut(), &mut work_stack);
             }
 
             let Some(next_id) = work_stack.pop() else {
@@ -470,170 +1008,9 @@ impl<T: ResourceTracker> Heap<T> {
     /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
     #[must_use]
     pub fn get(&self, id: HeapId) -> &HeapData {
-        self.entries
-            .get(id.index())
-            .expect("Heap::get: slot missing")
-            .as_ref()
-            .expect("Heap::get: object already freed")
-            .data
-            .as_ref()
-            .expect("Heap::get: data currently borrowed")
-    }
-
-    /// Returns a mutable reference to the heap data stored at the given ID.
-    ///
-    /// # Panics
-    /// Panics if the value ID is invalid, the value has already been freed,
-    /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
-    pub fn get_mut(&mut self, id: HeapId) -> HeapDataMut<'_> {
-        self.entries
-            .get_mut(id.index())
-            .expect("Heap::get_mut: slot missing")
-            .as_mut()
-            .expect("Heap::get_mut: object already freed")
-            .data
-            .as_mut()
-            .expect("Heap::get_mut: data currently borrowed")
-            .to_mut()
-    }
-
-    /// Returns or computes the hash for the heap entry at the given ID.
-    ///
-    /// Hashes are computed lazily on first use and then cached. Returns
-    /// `Ok(Some(hash))` for immutable types, `Ok(None)` for mutable types,
-    /// or `Err(ResourceError::Recursion)` if the recursion limit is exceeded.
-    ///
-    /// # Panics
-    /// Panics if the value ID is invalid or the value has already been freed.
-    pub fn get_or_compute_hash(&mut self, id: HeapId, interns: &Interns) -> Result<Option<u64>, ResourceError> {
-        let entry = self
-            .entries
-            .get_mut(id.index())
-            .expect("Heap::get_or_compute_hash: slot missing")
-            .as_mut()
-            .expect("Heap::get_or_compute_hash: object already freed");
-
-        match entry.hash_state {
-            HashState::Unhashable => return Ok(None),
-            HashState::Cached(hash) => return Ok(Some(hash)),
-            HashState::Unknown => {}
-        }
-
-        // Handle Cell specially - uses identity-based hashing (like Python cell objects)
-        if let Some(HeapData::Cell(_)) = &entry.data {
-            let mut hasher = DefaultHasher::new();
-            id.hash(&mut hasher);
-            let hash = hasher.finish();
-            entry.hash_state = HashState::Cached(hash);
-            return Ok(Some(hash));
-        }
-
-        // Compute hash lazily - need to temporarily take data to avoid borrow conflict.
-        // IMPORTANT: data must be restored to the entry on ALL paths (including errors)
-        // to avoid dropping HeapData containing Value::Ref without proper cleanup.
-        let mut data = entry.data.take().expect("Heap::get_or_compute_hash: data borrowed");
-        let hash = data.to_mut().compute_hash_if_immutable(self, interns);
-
-        // Restore data before handling the result
-        let entry = self
-            .entries
-            .get_mut(id.index())
-            .expect("Heap::get_or_compute_hash: slot missing after compute")
-            .as_mut()
-            .expect("Heap::get_or_compute_hash: object freed during compute");
-        entry.data = Some(data);
-
-        // Now handle the result and cache if successful
-        let hash = hash?;
-        entry.hash_state = match hash {
-            Some(value) => HashState::Cached(value),
-            None => HashState::Unhashable,
-        };
-        Ok(hash)
-    }
-
-    /// Calls an attribute on the heap entry, returning an `CallResult` that may signal
-    /// OS, external, or method calls.
-    ///
-    /// Temporarily takes ownership of the payload to avoid borrow conflicts when attribute
-    /// implementations also need mutable heap access (e.g. for refcounting).
-    ///
-    /// Returns `CallResult` which may be:
-    /// - `Value(v)` - Method completed synchronously with value `v`
-    /// - `OsCall(func, args)` - Method needs OS operation; VM should yield to host
-    /// - `ExternalCall(id, args)` - Method needs external function call
-    /// - `MethodCall(name, args)` - Dataclass method call; VM should yield to host
-    pub fn call_attr(vm: &mut VM<'_, '_, T>, id: HeapId, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
-        // Take data out so the borrow of self.entries ends
-        let heap = &mut *vm.heap;
-        let mut data = take_data!(heap, id, "call_attr");
-
-        let result = data.py_call_attr(id, vm, attr, args);
-
-        // Restore data
-        let heap = &mut *vm.heap;
-        restore_data!(heap, id, data, "call_attr");
-        result
-    }
-
-    /// Gives mutable access to a heap entry while allowing reentrant heap usage
-    /// inside the closure (e.g. to read other values or allocate results).
-    ///
-    /// The data is temporarily taken from the heap entry, so the closure can safely
-    /// mutate both the entry data and the heap (e.g. to allocate new values).
-    /// The data is automatically restored after the closure completes.
-    pub fn with_entry_mut<'a, 'p, F, R>(vm: &mut VM<'a, 'p, T>, id: HeapId, f: F) -> R
-    where
-        F: FnOnce(&mut VM<'a, 'p, T>, HeapDataMut) -> R,
-    {
-        // Take data out in a block so the borrow of self.entries ends
-        let heap = &mut *vm.heap;
-        let mut data = take_data!(heap, id, "with_entry_mut");
-
-        let result = f(vm, data.to_mut());
-
-        // Restore data
-        let heap = &mut *vm.heap;
-        restore_data!(heap, id, data, "with_entry_mut");
-        result
-    }
-
-    /// Temporarily takes ownership of two heap entries so their data can be borrowed
-    /// simultaneously while still permitting mutable access to the VM (e.g. to
-    /// allocate results). Automatically restores both entries after the closure
-    /// finishes executing.
-    ///
-    /// This is a static method that takes `&mut VM` instead of `&mut self` so that
-    /// the closure receives `&mut VM` — matching the `with_entry_mut` pattern and
-    /// allowing the closure to call methods that need `vm` (e.g. `py_eq`).
-    pub fn with_two<'a, 'p, F, R>(vm: &mut VM<'a, 'p, T>, left: HeapId, right: HeapId, f: F) -> R
-    where
-        F: FnOnce(&mut VM<'a, 'p, T>, &HeapData, &HeapData) -> R,
-    {
-        if left == right {
-            // Same value - take data once and pass it twice
-            let heap = &mut *vm.heap;
-            let data = take_data!(heap, left, "with_two");
-
-            let result = f(vm, &data, &data);
-
-            let heap = &mut *vm.heap;
-            restore_data!(heap, left, data, "with_two");
-            result
-        } else {
-            // Different values - take both
-            let heap = &mut *vm.heap;
-            let left_data = take_data!(heap, left, "with_two (left)");
-            let right_data = take_data!(heap, right, "with_two (right)");
-
-            let result = f(vm, &left_data, &right_data);
-
-            // Restore in reverse order
-            let heap = &mut *vm.heap;
-            restore_data!(heap, right, right_data, "with_two (right)");
-            restore_data!(heap, left, left_data, "with_two (left)");
-            result
-        }
+        let data = &self.entries.get(id).data;
+        // SAFETY: (DH) no mutable references into `HeapData` is possible while the heap is borrowed
+        unsafe { &*data.0.get() }
     }
 
     /// Returns the reference count for the heap entry at the given ID.
@@ -645,13 +1022,7 @@ impl<T: ResourceTracker> Heap<T> {
     #[must_use]
     #[cfg(feature = "ref-count-return")]
     pub fn get_refcount(&self, id: HeapId) -> usize {
-        self.entries
-            .get(id.index())
-            .expect("Heap::get_refcount: slot missing")
-            .as_ref()
-            .expect("Heap::get_refcount: object already freed")
-            .refcount
-            .get()
+        self.entries.get(id).refcount.get()
     }
 
     /// Returns the number of live (non-freed) values on the heap.
@@ -664,237 +1035,260 @@ impl<T: ResourceTracker> Heap<T> {
     #[must_use]
     #[cfg(feature = "ref-count-return")]
     pub fn entry_count(&self) -> usize {
-        // 1.. to skip index 0 which is the empty tuple singleton
-        self.entries[1..].iter().filter(|o| o.is_some()).count()
+        // Skip index 0 which is the empty tuple singleton
+        self.entries.iter().skip(1).count()
     }
 
-    /// Helper for List in-place add: extends the destination vec with items from a heap list.
+    /// Returns whether cycle collection should run.
     ///
-    /// This method exists to work around borrow checker limitations when List::py_iadd
-    /// needs to read from one heap entry while extending another. By keeping both
-    /// the read and the refcount increments within Heap's impl block, we can use the
-    /// take/restore pattern to avoid the lifetime propagation issues.
+    /// True when the configured allocation interval has elapsed *and* at
+    /// least one [`Purple`](CcColor::Purple) candidate is pending. The
+    /// alloc-count check sets the maximum collector frequency the user
+    /// asked for; the `purple_count` check is an additional early-out so
+    /// programs that produce no cycle candidates pay no collector cost
+    /// regardless of their allocation rate.
     ///
-    /// Returns `true` if successful, `false` if the source ID is not a List.
-    pub fn iadd_extend_list(&mut self, source_id: HeapId, dest: &mut Vec<Value>) -> bool {
-        if let HeapData::List(list) = self.get(source_id) {
-            let items: Vec<Value> = list.as_slice().iter().map(|v| v.clone_with_heap(self)).collect();
-            dest.extend(items);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Multiplies a heap-allocated value by an `i64`.
-    ///
-    /// If `id` refers to a `LongInt`, performs integer multiplication with a size
-    /// pre-check. Otherwise, treats `id` as a sequence and `int_val` as the repeat
-    /// count. This avoids multiple `heap.get()` calls by looking up the data once.
-    ///
-    /// Returns `Ok(None)` if the heap entry is neither a LongInt nor a sequence type.
-    pub fn mult_ref_by_i64(&mut self, id: HeapId, int_val: i64) -> RunResult<Option<Value>> {
-        if let HeapData::LongInt(li) = self.get(id) {
-            check_mult_size(li.bits(), i64_bits(int_val), &self.tracker)?;
-            let result = LongInt::new(li.inner().clone()) * LongInt::from(int_val);
-            Ok(Some(result.into_value(self)?))
-        } else {
-            let count = i64_to_repeat_count(int_val)?;
-            self.mult_sequence(id, count)
-        }
-    }
-
-    /// Multiplies two heap-allocated values.
-    ///
-    /// Returns Ok(None) for unsupported type combinations.
-    pub fn mult_heap_values(&mut self, id1: HeapId, id2: HeapId) -> RunResult<Option<Value>> {
-        let (seq_id, count) = match (self.get(id1), self.get(id2)) {
-            (HeapData::LongInt(a), HeapData::LongInt(b)) => {
-                check_mult_size(a.bits(), b.bits(), &self.tracker)?;
-                let result = LongInt::new(a.inner() * b.inner());
-                return Ok(Some(result.into_value(self)?));
-            }
-            (HeapData::LongInt(li), _) => {
-                let count = longint_to_repeat_count(li)?;
-                (id2, count)
-            }
-            (_, HeapData::LongInt(li)) => {
-                let count = longint_to_repeat_count(li)?;
-                (id1, count)
-            }
-            _ => return Ok(None),
-        };
-
-        self.mult_sequence(seq_id, count)
-    }
-
-    /// Multiplies (repeats) a sequence by an integer count.
-    ///
-    /// This method handles sequence repetition for Python's `*` operator when applied
-    /// to sequences (str, bytes, list, tuple). It creates a new heap-allocated sequence
-    /// with the elements repeated `count` times.
-    ///
-    /// # Arguments
-    /// * `id` - HeapId of the sequence to repeat
-    /// * `count` - Number of times to repeat (0 returns empty sequence)
-    ///
-    /// # Returns
-    /// * `Ok(Some(Value))` - The new repeated sequence
-    /// * `Ok(None)` - If the heap entry is not a sequence type
-    /// * `Err` - If allocation fails due to resource limits
-    pub fn mult_sequence(&mut self, id: HeapId, count: usize) -> RunResult<Option<Value>> {
-        match self.get(id) {
-            HeapData::Str(s) => {
-                check_repeat_size(s.len(), count, &self.tracker)?;
-                Ok(Some(Value::Ref(
-                    self.allocate(HeapData::Str(s.as_str().repeat(count).into()))?,
-                )))
-            }
-            HeapData::Bytes(b) => {
-                check_repeat_size(b.len(), count, &self.tracker)?;
-                Ok(Some(Value::Ref(
-                    self.allocate(HeapData::Bytes(b.as_slice().repeat(count).into()))?,
-                )))
-            }
-            HeapData::List(list) => {
-                check_repeat_size(list.len().saturating_mul(size_of::<Value>()), count, &self.tracker)?;
-                let mut result = Vec::with_capacity(list.as_slice().len() * count);
-                for _ in 0..count {
-                    result.extend(list.as_slice().iter().map(|v| v.clone_with_heap(self)));
-                    self.check_time()?;
-                }
-                Ok(Some(Value::Ref(self.allocate(HeapData::List(List::new(result)))?)))
-            }
-            HeapData::Tuple(tuple) => {
-                if count == 0 {
-                    return Ok(Some(self.get_empty_tuple()));
-                }
-                check_repeat_size(
-                    tuple.as_slice().len().saturating_mul(size_of::<Value>()),
-                    count,
-                    &self.tracker,
-                )?;
-                let mut result = SmallVec::with_capacity(tuple.as_slice().len() * count);
-                for _ in 0..count {
-                    result.extend(tuple.as_slice().iter().map(|v| v.clone_with_heap(self)));
-                    self.check_time()?;
-                }
-                Ok(Some(allocate_tuple(result, self)?))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Returns whether garbage collection should run.
-    ///
-    /// True if reference cycles count exist in the heap
-    /// and the number of allocations since the last GC exceeds the interval.
+    /// Always returns false when [`disable_gc`](Self::disable_gc) has been
+    /// called without a matching [`enable_gc`](Self::enable_gc); explicit
+    /// [`collect_cycles`](Self::collect_cycles) calls still run regardless.
     #[inline]
     pub fn should_gc(&self) -> bool {
-        self.may_have_cycles && self.allocations_since_gc >= GC_INTERVAL
+        #[cfg(feature = "test-hooks")]
+        if self.gc_disabled {
+            return false;
+        }
+        if self.purple_count == 0 {
+            return false;
+        }
+        let interval = self.tracker.gc_interval().unwrap_or(DEFAULT_GC_INTERVAL);
+        (self.allocations_since_gc.get() as usize) >= interval
     }
 
-    /// Runs mark-sweep garbage collection to free unreachable cycles.
+    /// Suppresses automatic garbage collection until [`enable_gc`](Self::enable_gc)
+    /// is called.
     ///
-    /// This method takes a closure that provides an iterator of root HeapIds
-    /// (typically from the VM's globals and stack). It marks all reachable objects starting
-    /// from roots, then sweeps (frees) any unreachable objects.
+    /// Explicit [`collect_cycles`](Self::collect_cycles) calls still run while
+    /// disabled, so a script can build a known amount of garbage and then time
+    /// exactly one collection pass.
+    #[cfg(feature = "test-hooks")]
+    pub fn disable_gc(&mut self) {
+        self.gc_disabled = true;
+    }
+
+    /// Resumes automatic garbage collection after a prior [`disable_gc`](Self::disable_gc).
     ///
-    /// This is necessary because reference counting alone cannot free cycles
-    /// where objects reference each other but are unreachable from the program.
+    /// Calling [`enable_gc`](Self::enable_gc) on an already-enabled heap is a no-op.
+    #[cfg(feature = "test-hooks")]
+    pub fn enable_gc(&mut self) {
+        self.gc_disabled = false;
+    }
+
+    /// Runs Bacon–Rajan trial-deletion cycle collection.
+    ///
+    /// Walks every entry currently flagged [`Purple`](CcColor::Purple) (the
+    /// candidates accumulated by `dec_ref`) and frees any references that turn
+    /// out to live entirely inside an unreachable cycle. Refcount math itself
+    /// proves liveness — entries reachable from outside the candidate set
+    /// (including those held only on the Rust stack and those with active
+    /// `HeapRead` readers) survive automatically because their refcount or
+    /// reader count remains non-zero — so no explicit root walk is required.
+    ///
+    /// Phases:
+    ///
+    /// 1. **`MarkRoots`** — single linear pass over `entries` that finds
+    ///    Purple entries, runs `MarkGray` on each, and collects the resulting
+    ///    seed list. Purple entries reached transitively by an earlier seed's
+    ///    `MarkGray` turn Gray and are correctly skipped, so each cycle root
+    ///    is only seeded once.
+    /// 2. **`Scan`** — for each seed, decide whether the subtree is alive
+    ///    (`s.refcount > 0 || s.readers > 0`, resurrect to Black) or condemned
+    ///    (mark White and recurse).
+    /// 3. **`CollectWhite`** — free White entries iteratively. Child
+    ///    refcounts were already balanced by `MarkGray`/`ScanBlack`, so this
+    ///    phase does **not** call `dec_ref` on children — it only walks them
+    ///    to free transitively.
+    ///
+    /// All four phases iterate via explicit work stacks instead of recursion
+    /// (the textbook formulation is recursive); a 10 000-deep nested cycle
+    /// must collect without a Rust stack overflow.
+    ///
+    /// Returns the number of unreachable entries that were freed during the sweep.
     ///
     /// # Caller Responsibility
-    /// The caller should check `should_gc()` before calling this method.
-    /// If no cycles are possible, the caller can skip GC entirely.
+    /// The caller should check [`should_gc`](Self::should_gc) before calling
+    /// this method. With `purple_count == 0` the function returns immediately
+    /// without touching the heap.
+    pub fn collect_cycles(&mut self) -> usize {
+        if self.purple_count == 0 {
+            return 0;
+        }
+
+        let mut roots = Vec::new();
+        let mut work_stack = Vec::new();
+
+        // 1. Discover roots by finding Purple entries. Mark each root (and its subtree) Gray.
+        for i in 0..self.entries.len() {
+            let id = HeapId(i);
+            let Some(entry) = self.entries.get_mut(id) else {
+                continue;
+            };
+            if entry.color != CcColor::Purple {
+                continue;
+            }
+            if entry.readers.get() > 0 {
+                // This entry cannot possibly be a root since it has active readers; reset
+                // to Black so it won't be a candidate in the next cycle.
+                entry.color = CcColor::Black;
+                continue;
+            }
+            roots.push(id);
+            entry.color = CcColor::Gray;
+
+            // Mark the subtree reachable from this root as gray and decrement refcounts
+            // during edge traversal
+            collect_child_ids(entry.data.0.get_mut(), &mut work_stack);
+            self.mark_gray(&mut work_stack);
+        }
+
+        // 2. For each root, scan and resurrect if alive (refcount > 0 or active readers).
+        work_stack.extend(roots.iter().copied());
+        self.scan(&mut work_stack);
+
+        // 3. Collect each root's White children as unreachable garbage.
+        let freed = self.collect_white(&mut roots);
+
+        // After `MarkRoots` no Purple entries remain in the heap; zero the
+        // counter so the next `dec_ref` event re-seeds from a clean baseline,
+        // and reset the alloc-count gate so the next interval starts now.
+        self.purple_count = 0;
+        self.allocations_since_gc.set(0);
+        freed
+    }
+
+    /// `MarkGray` (iterative): paint `s` and its transitive children Gray,
+    /// decrementing each child's refcount once per traversal edge.
     ///
-    /// # Arguments
-    /// * `root` - HeapIds that are roots
-    pub fn collect_garbage(&mut self, root: Vec<HeapId>) {
-        // Mark phase: collect all reachable IDs using BFS
-        // Use Vec<bool> instead of HashSet for O(1) operations without hashing overhead
-        let mut reachable: Vec<bool> = vec![false; self.entries.len()];
-        let mut work_list: Vec<HeapId> = root;
+    /// After this completes for every root, every Gray entry's refcount equals
+    /// the count of *external* references into it (refs originating outside
+    /// the candidate subgraph). `Scan` uses that property to decide
+    /// alive/condemned.
+    fn mark_gray(&mut self, work_stack: &mut Vec<HeapId>) {
+        while let Some(id) = work_stack.pop() {
+            let entry = self.entries.get_mut(id).expect("mark_gray: entry already freed");
 
-        while let Some(id) = work_list.pop() {
-            let idx = id.index();
-            // Skip if out of bounds or already visited
-            if idx >= reachable.len() || reachable[idx] {
-                continue;
-            }
-            reachable[idx] = true;
+            debug_assert!(entry.refcount.get() > 0, "mark_gray: refcount underflow at {id:?}");
+            entry.refcount.update(|r| r - 1);
 
-            // Add children to work list
-            if let Some(Some(entry)) = self.entries.get(idx)
-                && let Some(ref data) = entry.data
-            {
-                collect_child_ids(data, &mut work_list);
-            }
-        }
-
-        // Sweep phase: free unreachable values
-        for (id, value) in self.entries.iter_mut().enumerate() {
-            if reachable[id] {
+            if entry.color == CcColor::Gray {
+                // Already marked via another edge
                 continue;
             }
 
-            // This entry is unreachable - free it
-            if let Some(value) = value.take() {
-                // Notify tracker of freed memory
-                if let Some(ref data) = value.data {
-                    self.tracker.on_free(|| data.py_estimate_size());
-                }
+            entry.color = CcColor::Gray;
+            collect_child_ids(entry.data.0.get_mut(), work_stack);
+        }
+    }
 
-                self.free_list.push(HeapId(id));
+    /// `Scan` (iterative): each Gray entry is either resurrected via
+    /// `ScanBlack` (external reference exists — refcount > 0 or active
+    /// `HeapRead` reader) or painted White and its Gray children recursed.
+    fn scan(&mut self, work_stack: &mut Vec<HeapId>) {
+        let mut black_work_stack = Vec::new();
+        while let Some(id) = work_stack.pop() {
+            let entry = self.entries.get_mut(id).expect("scan: entry already freed");
+            if entry.color != CcColor::Gray {
+                // Already processed via another edge
+                continue;
+            }
 
-                // Mark Values as Dereferenced when ref-count-panic is enabled
-                #[cfg(feature = "ref-count-panic")]
-                if let Some(mut data) = value.data {
-                    data.py_dec_ref_ids(&mut Vec::new());
-                }
+            if entry.refcount.get() == 0 && entry.readers.get() == 0 {
+                entry.color = CcColor::White;
+                collect_child_ids(entry.data.0.get_mut(), work_stack);
+            } else {
+                // External reference exists (either a refcount we couldn't
+                // account for inside the candidate set, or a live `HeapRead`
+                // pointing into the entry). Resurrect this entry and its
+                // transitive Gray children back to Black via `scan_black`.
+                entry.color = CcColor::Black;
+
+                collect_child_ids(entry.data.0.get_mut(), &mut black_work_stack);
+                self.mark_black(&mut black_work_stack);
+                debug_assert!(black_work_stack.is_empty());
             }
         }
+    }
 
-        // Reset cycle flag after GC - cycles have been collected
-        self.may_have_cycles = false;
-        self.allocations_since_gc = 0;
+    /// `ScanBlack` (iterative): resurrect a subtree by re-incrementing
+    /// children's refcounts that `MarkGray` previously decremented, restoring
+    /// the heap to the state it would have had if no cycle was suspected.
+    ///
+    /// Children's refcounts are incremented once per traversal edge — even if
+    /// the child is already Black — so multi-edge graphs (a child reachable
+    /// from two parents in the resurrected subtree) balance the matching
+    /// per-edge decrements `MarkGray` performed. Recursion only descends into
+    /// non-Black children so each entry is processed at most once.
+    fn mark_black(&mut self, work_stack: &mut Vec<HeapId>) {
+        while let Some(id) = work_stack.pop() {
+            let mut entry = self.entries.entry(id).expect("scan_black: entry already freed");
+
+            entry.refcount.update(|r| r + 1);
+
+            if entry.color == CcColor::Black {
+                // Already marked via another edge
+                continue;
+            }
+
+            entry.color = CcColor::Black;
+            collect_child_ids(entry.data.0.get_mut(), work_stack);
+        }
+    }
+
+    fn collect_white(&mut self, work_stack: &mut Vec<HeapId>) -> usize {
+        let mut freed = 0;
+        while let Some(id) = work_stack.pop() {
+            let Some(mut entry) = self.entries.entry(id) else {
+                // Already freed via another seed's traversal — ignore.
+                continue;
+            };
+            let heap_entry = entry.get_mut();
+            if heap_entry.color != CcColor::White {
+                // Either resurrected to Black by `Scan` or never visited
+                // (still Black/Gray from somewhere). Don't free.
+                continue;
+            }
+            debug_assert!(
+                heap_entry.readers.get() == 0,
+                "collect_white: cannot free HeapId({}) with {} active reader(s)",
+                id.index(),
+                heap_entry.readers.get(),
+            );
+            let mut value = entry.free();
+            self.tracker.on_free(|| value.data.0.get_mut().py_estimate_size());
+            freed += 1;
+            // Walk children, marking child `Value::Ref`s as `Dereferenced`
+            // under `memory-model-checks` so dropping the freed entry's data
+            // doesn't trip a Drop-panic on a live `Value::Ref` payload. The
+            // pushed child IDs feed the work stack so we recursively walk
+            // White grandchildren — we do *not* `dec_ref` these children
+            // (`MarkGray`/`ScanBlack` already balanced their refcounts).
+            py_dec_ref_ids_for_data(value.data.0.get_mut(), work_stack);
+        }
+        freed
     }
 }
 
-/// Computes the number of significant bits in an `i64`.
-///
-/// Returns 0 for zero, otherwise returns the position of the highest set bit
-/// plus one. Uses unsigned absolute value to handle negative numbers correctly.
-fn i64_bits(value: i64) -> u64 {
-    if value == 0 {
-        0
-    } else {
-        u64::from(64 - value.unsigned_abs().leading_zeros())
-    }
-}
-
-/// Converts an `i64` repeat count to `usize` for sequence repetition.
-///
-/// Returns 0 for negative values (Python treats negative repeat counts as 0).
-/// Returns `OverflowError` if the value exceeds `usize::MAX`.
-fn i64_to_repeat_count(n: i64) -> RunResult<usize> {
-    if n <= 0 {
-        Ok(0)
-    } else {
-        usize::try_from(n).map_err(|_| ExcType::overflow_repeat_count().into())
-    }
-}
-
-/// Converts a `LongInt` repeat count to `usize` for sequence repetition.
-///
-/// Returns 0 for negative values (Python treats negative repeat counts as 0).
-/// Returns `OverflowError` if the value exceeds `usize::MAX`.
-fn longint_to_repeat_count(li: &LongInt) -> RunResult<usize> {
-    if li.is_negative() {
-        Ok(0)
-    } else if let Some(count) = li.to_usize() {
-        Ok(count)
-    } else {
-        Err(ExcType::overflow_repeat_count().into())
+// With `memory-model-checks` enabled, need to manually clean up the heap to avoid the
+// bookkeeping causing panics at shutdown.
+#[cfg(feature = "memory-model-checks")]
+impl<T: ResourceTracker> Drop for Heap<T> {
+    fn drop(&mut self) {
+        for id in 0..self.entries.len() {
+            if let Some(mut entry) = self.entries.entry(HeapId::from_index(id)) {
+                // Mark all `Value::Ref` payloads as `Dereferenced` so they don't panic when dropped
+                py_dec_ref_ids_for_data(entry.get_mut().data.0.get_mut(), &mut Vec::new());
+                entry.free();
+            }
+        }
     }
 }
 
@@ -1050,24 +1444,264 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
                 }
             }
         }
+        HeapData::DateTime(dt) => {
+            // Aware datetimes retain a heap reference to the tzinfo object so that
+            // `dt.tzinfo is tz` identity is preserved across attribute lookups.
+            // GC must follow that reference, otherwise the timezone gets swept
+            // while the datetime still points at the freed slot.
+            if let Some(tz_id) = dt.tzinfo_ref() {
+                work_list.push(tz_id);
+            }
+        }
         // Leaf types with no heap references
         _ => {}
     }
 }
 
-/// Drop implementation for Heap that marks all contained Objects as Dereferenced
-/// before dropping to prevent panics when the `ref-count-panic` feature is enabled.
-#[cfg(feature = "ref-count-panic")]
-impl<T: ResourceTracker> Drop for Heap<T> {
-    fn drop(&mut self) {
-        // Mark all contained Objects as Dereferenced before dropping.
-        // We use py_dec_ref_ids for this since it handles the marking
-        // (we ignore the collected IDs since we're dropping everything anyway).
-        let mut dummy_stack = Vec::new();
-        for value in self.entries.iter_mut().flatten() {
-            if let Some(data) = &mut value.data {
-                data.py_dec_ref_ids(&mut dummy_stack);
+fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
+    match data {
+        HeapData::Str(s) => s.py_dec_ref_ids(stack),
+        HeapData::Bytes(b) => b.py_dec_ref_ids(stack),
+        HeapData::List(l) => l.py_dec_ref_ids(stack),
+        HeapData::Tuple(t) => t.py_dec_ref_ids(stack),
+        HeapData::NamedTuple(nt) => nt.py_dec_ref_ids(stack),
+        HeapData::Dict(d) => d.py_dec_ref_ids(stack),
+        HeapData::DictKeysView(view) => view.py_dec_ref_ids(stack),
+        HeapData::DictItemsView(view) => view.py_dec_ref_ids(stack),
+        HeapData::DictValuesView(view) => view.py_dec_ref_ids(stack),
+        HeapData::Set(s) => s.py_dec_ref_ids(stack),
+        HeapData::FrozenSet(fs) => fs.py_dec_ref_ids(stack),
+        HeapData::Closure(closure) => {
+            // Decrement ref count for captured cells
+            stack.extend(closure.cells.iter().copied());
+            // Decrement ref count for default values that are heap references
+            for default in &mut closure.defaults {
+                default.py_dec_ref_ids(stack);
             }
         }
+        HeapData::FunctionDefaults(fd) => {
+            // Decrement ref count for default values that are heap references
+            for default in &mut fd.defaults {
+                default.py_dec_ref_ids(stack);
+            }
+        }
+        HeapData::Cell(cell) => cell.0.py_dec_ref_ids(stack),
+        HeapData::Dataclass(dc) => dc.py_dec_ref_ids(stack),
+        HeapData::Iter(iter) => iter.py_dec_ref_ids(stack),
+        HeapData::Module(m) => m.py_dec_ref_ids(stack),
+        HeapData::Coroutine(coro) => {
+            // Decrement ref count for namespace values that are heap references
+            for value in &mut coro.namespace {
+                value.py_dec_ref_ids(stack);
+            }
+        }
+        HeapData::GatherFuture(gather) => {
+            // Decrement ref count for coroutine HeapIds
+            for item in &gather.items {
+                if let GatherItem::Coroutine(id) = item {
+                    stack.push(*id);
+                }
+            }
+            // Decrement ref count for result values that are heap references
+            for result in gather.results.iter_mut().flatten() {
+                result.py_dec_ref_ids(stack);
+            }
+        }
+        HeapData::DateTime(dt) => {
+            // Mirror `collect_child_ids`: when an aware datetime is freed we must
+            // also drop the retained tzinfo reference so its refcount is balanced.
+            if let Some(tz_id) = dt.tzinfo_ref() {
+                stack.push(tz_id);
+            }
+        }
+        // other types have no nested heap references
+        _ => {}
+    }
+}
+
+/// Compile-fail soundness tests for [`HeapReader`].
+///
+/// Gated behind `--cfg heap_reader_compile_fail_tests` so they are only compiled
+/// when the integration test harness runs `cargo check` with the appropriate flags.
+#[cfg(heap_reader_compile_fail_tests)]
+#[path = "../tests/heap_reader_compile_fail_cases/cases.rs"]
+mod heap_reader_compile_fail_cases;
+
+/// Cycle-collector unit tests.
+///
+/// These live inside `heap.rs` (rather than under `crates/monty/tests/`)
+/// because they need to manipulate `Heap` state directly — building a cycle
+/// without a VM, peeking at `purple_count`, and rooting an entry only via a
+/// Rust local binding. The integration-test surface only exposes
+/// Python-driven execution and cannot construct any of those scenarios.
+///
+/// In particular, the [`cstack_only_cycle_survives_collection`] test
+/// validates the central correctness property of trial deletion: a heap
+/// entry referenced *only* from the Rust C stack survives a cycle
+/// collection because its non-zero refcount is itself proof of liveness.
+/// That behavior was previously a known soundness gap of the explicit-roots
+/// mark–sweep collector.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{resource::NoLimitTracker, types::List, value::Value};
+
+    /// Returns whether a heap entry is still allocated at `id`.
+    fn is_alive<T: ResourceTracker>(heap: &Heap<T>, id: HeapId) -> bool {
+        heap.entries.iter().any(|(other, _)| other == id)
+    }
+
+    /// Allocates a self-referencing one-element list and returns its id.
+    ///
+    /// The list's items become `[Value::Ref(id)]` and its refcount is bumped
+    /// to 2 to reflect both the caller's ref and the new self-reference.
+    fn alloc_self_cycle(heap: &Heap<NoLimitTracker>) -> HeapId {
+        let id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let entry = heap
+            .entries
+            .iter()
+            .find(|(other, _)| *other == id)
+            .map(|(_, e)| e)
+            .expect("entry just allocated");
+        // SAFETY: no other borrow into this entry's data exists during the test.
+        let data = unsafe { &mut *entry.data.0.get() };
+        match data {
+            HeapData::List(list) => {
+                list.set_contains_refs();
+                list.as_vec_mut().push(Value::Ref(id));
+            }
+            _ => unreachable!(),
+        }
+        // The new self-pointer counts as one more reference into the entry.
+        heap.inc_ref(id);
+        id
+    }
+
+    #[test]
+    fn cstack_only_cycle_survives_collection() {
+        let mut heap = Heap::<NoLimitTracker>::new(16, NoLimitTracker);
+        let id = alloc_self_cycle(&heap);
+
+        // Simulate a Rust-side local `Value::Ref` binding by bumping the
+        // refcount one extra time. Then `dec_ref` it back down to 2 — that
+        // dec_ref is what enrolls the entry as a Purple candidate, mimicking
+        // exactly the situation under the old GC where the local binding
+        // wasn't published in any explicit root set.
+        heap.inc_ref(id); // rc = 3
+        heap.dec_ref(id); // rc = 2, flagged Purple
+        assert_eq!(heap.purple_count, 1);
+
+        // Cycle collection must not free the entry: the local "C-stack" ref
+        // contributes one of its two surviving refcount units, so trial
+        // deletion sees rc > 0 after MarkGray and resurrects the subtree.
+        heap.collect_cycles();
+        assert_eq!(heap.purple_count, 0);
+        assert!(is_alive(&heap, id), "C-stack-rooted cycle was freed");
+        assert!(matches!(heap.get(id), HeapData::List(_)));
+
+        // Drop the simulated Rust local. Now the cycle is genuinely isolated
+        // (rc 1 = self-pointer only). The next collection must reclaim it.
+        heap.dec_ref(id); // rc = 1, re-flagged Purple
+        assert_eq!(heap.purple_count, 1);
+        heap.collect_cycles();
+        assert_eq!(heap.purple_count, 0);
+        assert!(!is_alive(&heap, id), "isolated cycle should have been freed");
+    }
+
+    #[test]
+    fn heap_read_rooted_cycle_survives_collection() {
+        let mut heap = Heap::<NoLimitTracker>::new(16, NoLimitTracker);
+        let id = alloc_self_cycle(&heap);
+
+        // Bump `readers` manually to mimic a live `HeapRead` pointing into
+        // the entry. The borrow checker prevents holding a real `HeapRead`
+        // across `collect_cycles` (which requires `&mut Heap`), so we
+        // splice the same counter that `HeapRead::Drop` decrements.
+        let readers_before = heap.entries.get(id).readers.get();
+        heap.entries.get(id).readers.set(readers_before + 1);
+
+        // Drive the entry into Purple via dec_ref: rc 2 → 1. Without the
+        // `readers > 0` special-case in `Scan`, the resulting cycle would
+        // be condemned to White and freed.
+        heap.dec_ref(id); // rc = 1, flagged Purple
+        assert_eq!(heap.purple_count, 1);
+
+        heap.collect_cycles();
+        assert!(
+            is_alive(&heap, id),
+            "entry with active HeapRead reader was freed by collect_cycles"
+        );
+
+        // Restore the simulated reader so `Heap::drop` can clean up
+        // without tripping the `dec_ref` active-readers assertion.
+        heap.entries.get(id).readers.set(readers_before);
+        // The entry is leaked here on purpose (rc = 1 from the self-ref,
+        // no external root remains, but the collector ran already and the
+        // color is Black — the next dec_ref would try to recurse into the
+        // self-pointer after freeing the entry). `Heap::drop` walks every
+        // slot and tears them down regardless of refcount, so leaking
+        // here is safe for the duration of the test.
+    }
+
+    #[test]
+    fn isolated_simple_cycle_is_collected() {
+        // Sanity check: a self-reference cycle with no external rooting
+        // gets collected on the next `collect_cycles` call.
+        let mut heap = Heap::<NoLimitTracker>::new(16, NoLimitTracker);
+        let id = alloc_self_cycle(&heap);
+        // After alloc_self_cycle: rc = 2 (allocate's 1 + self-ref's 1).
+        // Drop the caller's reference. rc 2 → 1, marks Purple.
+        heap.dec_ref(id);
+        assert_eq!(heap.purple_count, 1);
+        heap.collect_cycles();
+        assert!(!is_alive(&heap, id));
+        assert_eq!(heap.purple_count, 0);
+    }
+
+    #[test]
+    fn empty_tuple_singleton_survives_collection() {
+        // The empty-tuple singleton is no longer rooted explicitly by the
+        // collector. Its refcount stays ≥ 1 forever (initial heap-owned
+        // ref), which is what keeps it alive — verify the collector does
+        // not accidentally free it even after spurious Purple flagging.
+        let mut heap = Heap::<NoLimitTracker>::new(16, NoLimitTracker);
+        // Fake a dec_ref event that would mark the empty tuple Purple.
+        heap.inc_ref(EMPTY_TUPLE_ID);
+        heap.dec_ref(EMPTY_TUPLE_ID);
+        heap.collect_cycles();
+        assert!(
+            is_alive(&heap, EMPTY_TUPLE_ID),
+            "empty tuple singleton must survive collection"
+        );
+    }
+
+    #[test]
+    fn pending_purple_cycle_round_trips_through_serde() {
+        // A snapshot can be taken between any two bytecode instructions, so
+        // entries flagged Purple by `dec_ref` but not yet visited by the
+        // collector must survive serde round-trips. Otherwise a cycle that
+        // becomes garbage just before snapshot would leak permanently after
+        // restore (the post-restore VM would never re-touch it).
+        let mut heap = Heap::<NoLimitTracker>::new(16, NoLimitTracker);
+        let id = alloc_self_cycle(&heap);
+        // Drop the caller's external ref so the entry is genuinely
+        // unreachable except via its self-pointer. dec_ref flags Purple.
+        heap.dec_ref(id); // rc 2 → 1
+        assert_eq!(heap.purple_count, 1);
+        assert_eq!(heap.entries.get(id).color, CcColor::Purple);
+
+        // Round-trip through postcard.
+        let bytes = postcard::to_allocvec(&heap).expect("serialize");
+        let mut restored: Heap<NoLimitTracker> = postcard::from_bytes(&bytes).expect("deserialize");
+
+        // `purple_count` and the per-entry color must round-trip.
+        assert_eq!(restored.purple_count, 1);
+        assert_eq!(restored.entries.get(id).color, CcColor::Purple);
+
+        // Run the collector on the restored heap; the cycle is unreachable
+        // and must be reclaimed.
+        restored.collect_cycles();
+        assert!(!is_alive(&restored, id));
+        assert_eq!(restored.purple_count, 0);
     }
 }

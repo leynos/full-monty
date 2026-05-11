@@ -11,7 +11,7 @@ use crate::{
     value::Value,
 };
 
-impl<T: ResourceTracker> VM<'_, '_, T> {
+impl<T: ResourceTracker> VM<'_, T> {
     /// Pushes a value while emitting a `ValueCreated` event when observation is enabled.
     #[inline]
     pub(crate) fn push_created(&mut self, value: Value) {

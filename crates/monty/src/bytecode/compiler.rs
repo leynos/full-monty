@@ -8,7 +8,7 @@
 //! its body is compiled to bytecode and a `Function` struct is created. All compiled
 //! functions are collected and returned along with the module code.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, mem};
 
 use super::{
     builder::{CodeBuilder, JumpLabel},
@@ -19,15 +19,15 @@ use crate::{
     args::{ArgExprs, CallArg, CallKwarg, Kwarg},
     builtins::Builtins,
     exception_private::ExcType,
-    exception_public::{MontyException, StackFrame},
+    exception_public::{MontyException, SourceMap, StackFrame},
     expressions::{
-        Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, Literal, NameScope, Node, Operator,
-        PreparedFunctionDef, PreparedNode, SequenceItem, UnpackTarget,
+        AssignTarget, Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, Literal, NameScope,
+        Node, Operator, PreparedFunctionDef, PreparedNode, SequenceItem, UnpackTarget,
     },
     fstring::{ConversionFlag, FStringPart, FormatSpec, ParsedFormatSpec, encode_format_spec},
     function::Function,
     intern::{Interns, StringId},
-    modules::BuiltinModule,
+    modules::StandardLib,
     parse::{CodeRange, ExceptHandler, Try},
     value::{EitherStr, Value},
 };
@@ -260,31 +260,9 @@ impl<'a> Compiler<'a> {
                 object,
             } => {
                 self.compile_expr(object)?;
-
-                // Check if there's a starred target
-                let star_idx = targets.iter().position(|t| matches!(t, UnpackTarget::Starred(_)));
-
-                // Set location to targets for proper caret in tracebacks
-                self.code.set_location(*targets_position, None);
-
-                if let Some(star_idx) = star_idx {
-                    // Has starred target - use UnpackEx
-                    let before = u8::try_from(star_idx).expect("too many targets before star");
-                    let after = u8::try_from(targets.len() - star_idx - 1).expect("too many targets after star");
-                    self.code.emit_u8_u8(Opcode::UnpackEx, before, after);
-                } else {
-                    // No starred target - use UnpackSequence
-                    let count = u8::try_from(targets.len()).expect("too many targets in unpack");
-                    self.code.emit_u8(Opcode::UnpackSequence, count);
-                }
-
-                // After UnpackSequence/UnpackEx, values are on stack with first item on top
-                // Store them in order (first target gets first item), handling nesting
-                for target in targets {
-                    self.compile_unpack_target(target);
-                }
+                self.emit_unpack_store(targets, *targets_position);
             }
-            Node::OpAssign { target, op, object } => {
+            Node::OpAssign { target, op, value } => {
                 let Some(opcode) = operator_to_inplace_opcode(op) else {
                     return Err(CompileError::new(
                         "matrix multiplication augmented assignment (@=) is not yet supported",
@@ -292,7 +270,7 @@ impl<'a> Compiler<'a> {
                     ));
                 };
                 self.compile_name(target);
-                self.compile_expr(object)?;
+                self.compile_expr(value)?;
                 self.code.emit(opcode);
                 self.compile_store(target);
             }
@@ -300,7 +278,7 @@ impl<'a> Compiler<'a> {
                 target,
                 index,
                 op,
-                object,
+                value,
                 target_position,
             } => {
                 let Some(opcode) = operator_to_inplace_opcode(op) else {
@@ -309,12 +287,12 @@ impl<'a> Compiler<'a> {
                         *target_position,
                     ));
                 };
-                self.compile_name(target);
+                self.compile_expr(target)?;
                 self.compile_expr(index)?;
                 self.code.emit(Opcode::Dup2);
                 self.code.set_location(*target_position, None);
                 self.code.emit(Opcode::BinarySubscr);
-                self.compile_expr(object)?;
+                self.compile_expr(value)?;
                 self.code.emit(opcode);
                 self.code.emit(Opcode::Rot3);
                 self.code.set_location(*target_position, None);
@@ -326,13 +304,34 @@ impl<'a> Compiler<'a> {
                 value,
                 target_position,
             } => {
-                // Stack order for StoreSubscr: value, obj, index
                 self.compile_expr(value)?;
-                self.compile_name(target);
-                self.compile_expr(index)?;
-                // Set location to the target (e.g., `lst[10]`) for proper caret in tracebacks
+                self.emit_subscript_store(target, index, *target_position)?;
+            }
+            Node::AttrOpAssign {
+                object,
+                attr,
+                op,
+                value,
+                target_position,
+            } => {
+                let Some(opcode) = operator_to_inplace_opcode(op) else {
+                    return Err(CompileError::new(
+                        "matrix multiplication augmented assignment (@=) is not yet supported",
+                        *target_position,
+                    ));
+                };
+                let name_id = attr.string_id().expect("LoadAttr requires interned attr name");
+                let name_idx = u16::try_from(name_id.index()).expect("name index exceeds u16");
+                // Stack: compile object, dup for later store, load attr, apply op, rotate, store
+                self.compile_expr(object)?; // [obj]
+                self.code.emit(Opcode::Dup); // [obj, obj]
                 self.code.set_location(*target_position, None);
-                self.code.emit(Opcode::StoreSubscr);
+                self.code.emit_u16(Opcode::LoadAttr, name_idx); // [obj, attr_val]
+                self.compile_expr(value)?; // [obj, attr_val, rhs]
+                self.code.emit(opcode); // [obj, result]
+                self.code.emit(Opcode::Rot2); // [result, obj]
+                self.code.set_location(*target_position, None);
+                self.code.emit_u16(Opcode::StoreAttr, name_idx); // []
             }
             Node::AttrAssign {
                 object,
@@ -340,16 +339,32 @@ impl<'a> Compiler<'a> {
                 target_position,
                 value,
             } => {
-                // Stack order for StoreAttr: value, obj
                 self.compile_expr(value)?;
+                self.emit_attr_store(object, attr, *target_position)?;
+            }
+            Node::ChainAssign { targets, object } => {
+                // Python evaluates the RHS once, then assigns to each target in
+                // left-to-right source order. We materialise the value on the stack
+                // and, for every target except the last, emit `Dup` to keep a copy
+                // underneath the target-specific store logic. The final target
+                // consumes the remaining copy, leaving the stack balanced.
+                //
+                // The parser only produces `ChainAssign` with `targets.len() >= 2`,
+                // but because `Node` derives `Deserialize`, untrusted snapshot input
+                // could otherwise reach here with 0 or 1 targets. `split_last()`
+                // handles both cases safely without an unsigned underflow, and the
+                // `is_empty` branch pops the leftover RHS value so the operand stack
+                // stays balanced.
                 self.compile_expr(object)?;
-                let name_id = attr.string_id().expect("StoreAttr requires interned attr name");
-                // Set location to the target (e.g., `x.foo`) for proper caret in tracebacks
-                self.code.set_location(*target_position, None);
-                self.code.emit_u16(
-                    Opcode::StoreAttr,
-                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
-                );
+                if let Some((last, rest)) = targets.split_last() {
+                    for target in rest {
+                        self.code.emit(Opcode::Dup);
+                        self.compile_assign_target(target)?;
+                    }
+                    self.compile_assign_target(last)?;
+                } else {
+                    self.code.emit(Opcode::Pop);
+                }
             }
             Node::If { test, body, or_else } => self.compile_if(test, body, or_else)?,
             Node::For {
@@ -370,7 +385,11 @@ impl<'a> Compiler<'a> {
             }
             Node::FunctionDef(func_def) => self.compile_function_def(func_def)?,
             Node::Try(try_block) => self.compile_try(try_block)?,
-            Node::Import { module_name, binding } => self.compile_import(*module_name, binding),
+            Node::Import { names } => {
+                for import_name in names {
+                    self.compile_import(import_name.module_name, &import_name.binding);
+                }
+            }
             Node::ImportFrom {
                 module_name,
                 names,
@@ -410,7 +429,7 @@ impl<'a> Compiler<'a> {
 
         // 1. Compile the function body recursively
         // Take ownership of functions for the recursive compile, then restore
-        let functions = std::mem::take(&mut self.functions);
+        let functions = mem::take(&mut self.functions);
         let namespace_size = u16::try_from(func_def.namespace_size).expect("function namespace size exceeds u16");
         let (body_code, mut functions) =
             Self::compile_function_body(&func_def.body, self.interns, functions, namespace_size)?;
@@ -489,7 +508,7 @@ impl<'a> Compiler<'a> {
         }
 
         // 1. Compile the function body recursively
-        let functions = std::mem::take(&mut self.functions);
+        let functions = mem::take(&mut self.functions);
         let namespace_size = u16::try_from(func_def.namespace_size).expect("function namespace size exceeds u16");
         let (body_code, mut functions) =
             Self::compile_function_body(&func_def.body, self.interns, functions, namespace_size)?;
@@ -553,7 +572,7 @@ impl<'a> Compiler<'a> {
         self.code.set_location(position, None);
 
         // Look up the module by name
-        if let Some(builtin_module) = BuiltinModule::from_string_id(module_name) {
+        if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             // Known module - emit LoadModule
             self.code.emit_u8(Opcode::LoadModule, builtin_module as u8);
             // Store to the binding (respects Local/Global/Cell scope)
@@ -576,7 +595,7 @@ impl<'a> Compiler<'a> {
         self.code.set_location(position, None);
 
         // Look up the module
-        if let Some(builtin_module) = BuiltinModule::from_string_id(module_name) {
+        if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             // Known module - emit LoadModule
             self.code.emit_u8(Opcode::LoadModule, builtin_module as u8);
 
@@ -1392,10 +1411,7 @@ impl<'a> Compiler<'a> {
             ArgExprs::GeneralizedCall { args, kwargs } => {
                 // PEP 448: generalized unpacking — multiple *args or **kwargs.
                 // Callable was already pushed above this match; delegate to the helper.
-                let func_name_id = match callable {
-                    Callable::Name(ident) => u16::try_from(ident.name_id.index()).expect("name index exceeds u16"),
-                    Callable::Builtin(_) => 0xFFFF,
-                };
+                let func_name_id = self.get_callable_name_id(callable);
                 self.compile_generalized_call_body(args, kwargs, func_name_id, call_pos)?;
             }
         }
@@ -1642,11 +1658,9 @@ impl<'a> Compiler<'a> {
         var_kwargs: Option<&ExprLoc>,
         call_pos: CodeRange,
     ) -> Result<(), CompileError> {
-        // Get function name for error messages (0xFFFF for builtins)
-        let func_name_id = match callable {
-            Callable::Name(ident) => u16::try_from(ident.name_id.index()).expect("name index exceeds u16"),
-            Callable::Builtin(_) => 0xFFFF,
-        };
+        // Get function name for error messages. Builtins use their real interned name
+        // so duplicate-kwargs errors from **unpacking match CPython.
+        let func_name_id = self.get_callable_name_id(callable);
 
         // 1. Build args tuple
         // Push regular positional args and build list
@@ -1701,6 +1715,41 @@ impl<'a> Compiler<'a> {
         let flags = u8::from(has_kwargs);
         self.code.emit_u8(Opcode::CallFunctionExtended, flags);
         Ok(())
+    }
+
+    /// Returns the best available function name id for call-site error messages.
+    ///
+    /// This is primarily used by `DictMerge` during `**kwargs` unpacking so
+    /// duplicate-key and non-mapping errors can mention the actual callee name.
+    /// When the callable is not a named local/global, we still try to resolve
+    /// builtin functions, builtin exception constructors, and builtin types to
+    /// their interned public names.
+    fn get_callable_name_id(&self, callable: &Callable) -> u16 {
+        match callable {
+            Callable::Name(ident) => u16::try_from(ident.name_id.index()).expect("name index exceeds u16"),
+            Callable::Builtin(builtin) => self.get_builtin_name_id(*builtin).unwrap_or(0xFFFF),
+        }
+    }
+
+    /// Resolves a builtin callable to its interned public name, if available.
+    ///
+    /// Returning `None` falls back to `<unknown>` in the VM, which is still
+    /// correct but less helpful. In practice these names should already be
+    /// interned during preparation because builtin names are resolved from source.
+    fn get_builtin_name_id(&self, builtin: Builtins) -> Option<u16> {
+        let name_id = match builtin {
+            Builtins::Function(function) => {
+                let name: &'static str = function.into();
+                self.interns.get_string_id_by_name(name)?
+            }
+            Builtins::ExcType(exc_type) => self.interns.get_string_id_by_name(&exc_type.to_string())?,
+            Builtins::Type(type_) => {
+                let name = type_.builtin_name()?;
+                self.interns.get_string_id_by_name(name)?
+            }
+        };
+
+        u16::try_from(name_id.index()).ok()
     }
 
     /// Compiles an attribute call on an object.
@@ -2168,6 +2217,10 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::new("'break' outside loop", position));
         }
 
+        // `break` never falls through, but we still compile following statements in the same
+        // block. Preserve the statement-entry depth for that unreachable compilation so
+        // stack-effect tracking remains stable across dead code.
+        let dead_code_depth = self.code.stack_depth();
         let target_loop_depth = self.loop_stack.len() - 1;
 
         // If inside except handlers, clean up ALL exception states
@@ -2197,11 +2250,7 @@ impl<'a> Compiler<'a> {
                 jump,
                 target_loop_depth,
             });
-            // Set stack depth for unreachable cleanup code (see comment below)
-            if self.except_handler_depth > 0 {
-                self.code
-                    .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
-            }
+            self.code.set_stack_depth(dead_code_depth);
             return Ok(());
         }
 
@@ -2209,13 +2258,7 @@ impl<'a> Compiler<'a> {
         let jump = self.code.emit_jump(Opcode::Jump);
         self.loop_stack[target_loop_depth].break_jumps.push(jump);
 
-        // The code following this break is unreachable at runtime, but the compiler
-        // will still emit cleanup code for each enclosing except handler (ClearException + Pop).
-        // Set stack depth so those unreachable pops don't cause negative stack tracking.
-        if self.except_handler_depth > 0 {
-            self.code
-                .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
-        }
+        self.code.set_stack_depth(dead_code_depth);
 
         Ok(())
     }
@@ -2230,6 +2273,9 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::new("'continue' not properly in loop", position));
         }
 
+        // `continue` never falls through. Preserve the statement-entry stack depth so
+        // subsequent dead statements in this block are compiled with the right abstract stack.
+        let dead_code_depth = self.code.stack_depth();
         let target_loop_depth = self.loop_stack.len() - 1;
 
         // If inside except handlers, clean up ALL exception states
@@ -2252,11 +2298,7 @@ impl<'a> Compiler<'a> {
                 jump,
                 target_loop_depth,
             });
-            // Set stack depth for unreachable cleanup code (see comment below)
-            if self.except_handler_depth > 0 {
-                self.code
-                    .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
-            }
+            self.code.set_stack_depth(dead_code_depth);
             return Ok(());
         }
 
@@ -2264,13 +2306,7 @@ impl<'a> Compiler<'a> {
         let loop_start = self.loop_stack[target_loop_depth].start;
         self.code.emit_jump_to(Opcode::Jump, loop_start);
 
-        // The code following this continue is unreachable at runtime, but the compiler
-        // will still emit cleanup code for each enclosing except handler (ClearException + Pop).
-        // Set stack depth so those unreachable pops don't cause negative stack tracking.
-        if self.except_handler_depth > 0 {
-            self.code
-                .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
-        }
+        self.code.set_stack_depth(dead_code_depth);
 
         Ok(())
     }
@@ -2501,6 +2537,106 @@ impl<'a> Compiler<'a> {
                     self.compile_unpack_target(target);
                 }
             }
+        }
+    }
+
+    /// Compiles a single assignment step, assuming the value to assign is on top of stack.
+    ///
+    /// Central per-shape dispatch for assignment stores. Called once per step of a chained
+    /// assignment, and also by the single-target `Node::SubscriptAssign`/`AttrAssign`/
+    /// `UnpackAssign`/`Assign` handlers (after they push the RHS). Keeping this dispatch
+    /// in one place ensures the store sequences stay in sync across single-target and
+    /// chained forms.
+    fn compile_assign_target(&mut self, target: &AssignTarget) -> Result<(), CompileError> {
+        match target {
+            AssignTarget::Name(ident) => self.compile_store(ident),
+            AssignTarget::Subscript {
+                target,
+                index,
+                target_position,
+            } => self.emit_subscript_store(target, index, *target_position)?,
+            AssignTarget::Attr {
+                object,
+                attr,
+                target_position,
+            } => self.emit_attr_store(object, attr, *target_position)?,
+            AssignTarget::Unpack {
+                targets,
+                targets_position,
+            } => self.emit_unpack_store(targets, *targets_position),
+        }
+        Ok(())
+    }
+
+    /// Emits the bytecode for `container[index] = value`, assuming `value` is on top of stack.
+    ///
+    /// `StoreSubscr` expects the stack to be `[.., value, container, index]` with `index`
+    /// on top, so this evaluates `target` (container) and then `index` above the incoming
+    /// value. Used by both `Node::SubscriptAssign` and chained-assignment subscript steps.
+    fn emit_subscript_store(
+        &mut self,
+        target: &ExprLoc,
+        index: &ExprLoc,
+        target_position: CodeRange,
+    ) -> Result<(), CompileError> {
+        self.compile_expr(target)?;
+        self.compile_expr(index)?;
+        self.code.set_location(target_position, None);
+        self.code.emit(Opcode::StoreSubscr);
+        Ok(())
+    }
+
+    /// Emits the bytecode for `object.attr = value`, assuming `value` is on top of stack.
+    ///
+    /// `StoreAttr` expects `[.., value, object]` with `object` on top, so this evaluates
+    /// `object` above the incoming value. Used by both `Node::AttrAssign` and chained-
+    /// assignment attribute steps.
+    ///
+    /// The parser always stores attribute names as `EitherStr::Interned`, so the hot
+    /// path never hits the `Heap` branch. We still check it explicitly rather than
+    /// panicking because `Node` derives `Deserialize` — an untrusted snapshot could
+    /// carry a `Heap` attribute name, and defense-in-depth says the compiler should
+    /// surface that as a graceful `CompileError` instead of aborting the process.
+    fn emit_attr_store(
+        &mut self,
+        object: &ExprLoc,
+        attr: &EitherStr,
+        target_position: CodeRange,
+    ) -> Result<(), CompileError> {
+        let Some(name_id) = attr.string_id() else {
+            return Err(CompileError::new(
+                "internal error: attribute name in AST must be interned",
+                target_position,
+            ));
+        };
+        self.compile_expr(object)?;
+        self.code.set_location(target_position, None);
+        self.code.emit_u16(
+            Opcode::StoreAttr,
+            u16::try_from(name_id.index()).expect("name index exceeds u16"),
+        );
+        Ok(())
+    }
+
+    /// Emits the bytecode for unpacking assignments (`a, b = value`, `[a, *rest] = value`).
+    ///
+    /// Assumes the iterable is already on top of stack, chooses between `UnpackSequence`
+    /// (no starred target) and `UnpackEx` (exactly one starred target), then stores the
+    /// unpacked values into each sub-target — recursing through nested tuple patterns.
+    /// Shared between `Node::UnpackAssign` and chained-assignment unpack steps.
+    fn emit_unpack_store(&mut self, targets: &[UnpackTarget], targets_position: CodeRange) {
+        let star_idx = targets.iter().position(|t| matches!(t, UnpackTarget::Starred(_)));
+        self.code.set_location(targets_position, None);
+        if let Some(star_idx) = star_idx {
+            let before = u8::try_from(star_idx).expect("too many targets before star");
+            let after = u8::try_from(targets.len() - star_idx - 1).expect("too many targets after star");
+            self.code.emit_u8_u8(Opcode::UnpackEx, before, after);
+        } else {
+            let count = u8::try_from(targets.len()).expect("too many targets in unpack");
+            self.code.emit_u8(Opcode::UnpackSequence, count);
+        }
+        for t in targets {
+            self.compile_unpack_target(t);
         }
     }
 
@@ -3098,11 +3234,12 @@ impl CompileError {
     /// - SyntaxError: hides the `, in <module>` part (CPython's format)
     /// - ModuleNotFoundError: hides caret markers (CPython doesn't show them)
     pub fn into_python_exc(self, filename: &str, source: &str) -> MontyException {
+        let source_map = SourceMap::new(source);
         let mut frame = if self.exc_type == ExcType::SyntaxError {
             // SyntaxError uses different format: no `, in <module>`
-            StackFrame::from_position_syntax_error(self.position, filename, source)
+            StackFrame::from_position_syntax_error(self.position, filename, &source_map)
         } else {
-            StackFrame::from_position(self.position, filename, source)
+            StackFrame::from_position(self.position, filename, &source_map)
         };
         // CPython doesn't show carets for module not found errors
         if self.exc_type == ExcType::ModuleNotFoundError {

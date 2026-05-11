@@ -484,6 +484,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             mut heap,
             observer,
             pending_call_ids,
+            extension_bytes,
         } = self;
 
         let vm_state = HeapReader::with(
@@ -503,7 +504,14 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             },
         );
 
-        Self::new(executor, vm_state, heap, observer, pending_call_ids)
+        Self::new(
+            executor,
+            vm_state,
+            heap,
+            observer,
+            pending_call_ids,
+            extension_bytes.as_ref(),
+        )
     }
 
     /// Resumes execution with results for some or all pending futures.

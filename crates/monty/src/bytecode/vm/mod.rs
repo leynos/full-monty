@@ -33,7 +33,7 @@ use crate::{
     intern::{FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::{StandardLib, json::JsonStringCache},
-    observer::RuntimeObserverHandle,
+    observer::{OpInputIds, RuntimeObserverHandle},
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
@@ -1605,7 +1605,8 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         let value = obj
             .to_value(self)
             .map_err(|e| SimpleException::new(ExcType::RuntimeError, Some(format!("invalid return type: {e}"))))?;
-        self.push(value);
+        self.emit_op_result(&value, OpInputIds::none());
+        self.push_created(value);
         self.run()
     }
 

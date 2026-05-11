@@ -49,6 +49,8 @@ def test_os_call_runtime_ids_survive_snapshot_dump_load():
     assert loaded.is_os_function is True
     assert tuple(loaded.arg_runtime_ids) == expected_arg_runtime_ids
     assert tuple(loaded.kwarg_runtime_ids) == expected_kwarg_runtime_ids
+
+
 def test_path_stat_yields_oscall():
     """Path.stat() yields an OS call."""
     m = pydantic_monty.Monty('from pathlib import Path; Path("/etc/passwd").stat()')
